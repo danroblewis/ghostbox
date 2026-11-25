@@ -48,6 +48,8 @@ class Survey:
         self._lock = threading.Lock()
         self._step = None
         self._asr = None
+        self.previews = {}                   # step index -> power preview while recorded / queued
+        self._preview_live = None
 
     # ---------------- control ----------------
     def start(self, lo_hz, hi_hz, dwell_s):
@@ -111,10 +113,20 @@ class Survey:
         except Exception:
             traceback.print_exc()
 
+    def _on_live_hop(self, eng, cfg, tb):
+        """Live receiver hook while recording: paint the step being recorded (power preview)."""
+        st = self._preview_live
+        if st is not None:
+            with self._lock:
+                self._power(eng, st)
+
     def _on_hop(self, eng, cfg, tb):
         st = self._step
         if st is None:
             return
+        self._power(eng, st)
+
+    def _power(self, eng, st):
         try:
             t_a, t_b = self._window(eng, st)
             for P, ts in zip(eng.spec, eng.spec_t):     # power frames not seen yet
@@ -163,6 +175,7 @@ class Survey:
             self._set(progress=(prog["rec"] + prog["done"]) / (2 * n), steps=n, message=msg)
 
         pending = None
+        eng.on_hop = self._on_live_hop
         try:
             if not ring_was:                               # each step's IQ is recorded in the IQ ring
                 self.apply({"iq_ring": {"enabled": True}})
@@ -186,6 +199,12 @@ class Survey:
                     jobs.put(pending)
                     pending = None
                 session, cfg_i = eng.session(), self.config.get()
+                pv = {"i": i, "lo": s_lo, "hi": s_lo + width, "col_hz": width / per, "ncols": per, "dur": dwell + 1.0,
+                      "t_a": session[1] + 1.5, "t_b": session[1] + 1.5 + dwell, "lag": 0.0,
+                      "pow": np.zeros((ROWS, per)), "pow_n": np.zeros((ROWS, per)), "last_t": -1e18, "bins": None}
+                with self._lock:
+                    self.previews[i] = pv
+                    self._preview_live = pv
                 t_w = time.time()
                 while not self._stop.is_set():             # record this step
                     paths, have = pick_segments(self.root, cfg_i, (dwell + 2) / 60, session)
@@ -195,6 +214,7 @@ class Survey:
                         break
                     time.sleep(0.5)
                 prog["rec"] = i + 1
+                self._preview_live = None
                 if have >= 10:
                     pending = {"i": i, "lo": s_lo, "hi": s_lo + width, "fc": fc, "fs": fs, "paths": paths,
                                "dur": min(have, dwell + 1.0), "per": per}
@@ -202,6 +222,8 @@ class Survey:
             traceback.print_exc()
             self._set(message=str(e))
         finally:
+            eng.on_hop = None
+            self._preview_live = None
             before = eng.session()
             self.apply({"sdr": orig_sdr})                  # back to where you were
             t_w = time.time()                              # the retune closes the last step's segment
@@ -216,6 +238,7 @@ class Survey:
             status("Processing" + self._worker_note(prog, n))
             worker.join(1.0)
         stopped = self._stop.is_set()
+        self.previews = {}
         self._set(state="done", progress=1.0, file=res["file"],
                   message=("Stopped" if stopped else "Done") + f": {len(res['steps'])} of {n} steps.")
         self.ended_at = time.time()
@@ -231,6 +254,8 @@ class Survey:
                 break
             try:
                 res["steps"].append(self._process(job, res, cfg0, name))
+                with self._lock:
+                    self.previews.pop(job["i"], None)
                 res["steps"].sort(key=lambda s: s["lo"])
                 self._save(res, name)
                 self._set(steps_done=len(res["steps"]))
@@ -354,7 +379,25 @@ class Survey:
         for s in res["steps"]:
             views += [v for v in s.get("maps", {}) if v not in views]
         out["views"] = views
+        if res is self.result:
+            with self._lock:
+                out["previews"] = [{"i": p["i"], "lo": p["lo"], "hi": p["hi"], "cols": p["ncols"]} for p in self.previews.values()]
         return out
+
+    def preview_image(self, i):
+        """Power preview of a step still being recorded or processed: uint8 [rows, cols], or None."""
+        with self._lock:
+            p = self.previews.get(i)
+            if p is None:
+                return None
+            n = p["pow_n"].copy()
+            pw = p["pow"].copy()
+        filled = n > 0
+        if not filled.any():
+            return np.zeros_like(pw, np.uint8)
+        db = np.where(filled, pw / np.maximum(n, 1), np.nan)
+        lo, hi = np.nanpercentile(db, 2), np.nanpercentile(db, 99.7)
+        return np.where(filled, np.clip((db - lo) / max(1e-6, hi - lo) * 255, 1, 255), 0).astype(np.uint8)
 
     def image(self, view, file=None):
         """uint8 image [rows, all steps' columns side by side] for one view, or None."""

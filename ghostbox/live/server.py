@@ -395,6 +395,13 @@ def make_app(args):
         return web.Response(body=data, content_type="audio/wav",
                             headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
+    async def survey_preview(request):
+        img = state["survey"].preview_image(int(request.query.get("i", -1)))
+        if img is None:
+            raise web.HTTPNotFound()
+        return web.Response(body=np.ascontiguousarray(img).tobytes(), content_type="application/octet-stream",
+                            headers={"X-Rows": str(img.shape[0]), "X-Cols": str(img.shape[1])})
+
     async def survey_clip(request):
         f, c = request.query.get("file", ""), request.query.get("clip", "")
         if not (SAFE.match(f) and SAFE.match(c)):
@@ -614,6 +621,7 @@ def make_app(args):
     app.router.add_post("/api/survey", start_survey)
     app.router.add_post("/api/survey/stop", stop_survey)
     app.router.add_get("/api/survey/image", survey_image)
+    app.router.add_get("/api/survey/preview", survey_preview)
     app.router.add_get("/api/survey/clip", survey_clip)
     app.router.add_get("/api/detection", get_detection)
     app.router.add_get("/api/iq", get_iq)

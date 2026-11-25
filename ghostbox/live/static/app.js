@@ -952,16 +952,17 @@ async function openSurvey(file) {
   const r = await (await fetch("/api/survey" + (file ? "?file=" + encodeURIComponent(file) : ""))).json();
   if (!r.result) { SV.open = true; SV.meta = null; drawSurvey(); return; }
   const same = SV.meta && SV.file === (file || null) && SV.meta.started === r.result.started;
+  const grew = same && SV.meta.steps.length !== r.result.steps.length;
   SV.meta = r.result; SV.file = file || null; SV.open = true;
   if (!same) { SV.imgs = {}; SV.v0 = r.result.lo; SV.v1 = r.result.hi; SV.sel = null; SV.hl = null; }
-  else if (!SV.file) SV.imgs = {};                         // a running survey grew: refetch images
+  else if (grew) SV.imgs = {};                             // a running survey finished a step: refetch images
   drawSurvey();
 }
 function onSurvey(m) {
   const was = SV.state.state; SV.state = m;
   if (SV.open && !SV.file && (m.steps_done || (m.state !== "running" && was === "running"))) openSurvey();
   if (m.state !== "running" && was === "running") loadSurveyList().then(() => { if ($("#detector").classList.contains("active")) buildDetector(); });
-  const t = $("#svStatus"); if (t) t.textContent = m.state === "running" ? m.message || "" : m.state === "error" ? m.message || "" : "";
+  const t = $("#svStatus"); if (t) t.textContent = t.title = m.state === "running" ? m.message || "" : m.state === "error" ? m.message || "" : "";
   const nb = $("#svNew"); if (nb) nb.textContent = m.state === "running" ? "Stop survey" : "New";
   if (!$("#detector").contains(document.activeElement) && m.state !== "running") buildDetector();
 }
@@ -1006,7 +1007,7 @@ function drawSurvey() {
     const head = el("div", { class: "svhead" },
       el("select", { id: "svPick", class: "sel", title: "Recorded maps", onchange: e => openSurvey(e.target.value || undefined) }),
       el("span", { id: "svInfo", class: "t2" }), el("span", { id: "svStatus", class: "t3" }),
-      el("span", { style: "flex:1" }), el("span", { id: "svSel", class: "num t2" }),
+      el("span", { style: "flex:1 1 0;min-width:0" }), el("span", { id: "svSel", class: "num t2" }),
       el("button", { id: "svTune", class: "btn primary", style: "display:none", onclick: () => SV.sel != null && surveyTune(SV.sel) }, "Tune here"),
       el("button", { id: "svNew", class: "btn", title: "Survey a new range", onclick: () => SV.state.state === "running" ? fetch("/api/survey/stop", { method: "POST" }) : newSurveyDialog() }, "New"),
       el("button", { class: "btn", title: "Show the whole range (or double-click the map)", onclick: () => { if (SV.meta) { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); } } }, "Fit"),
@@ -1027,13 +1028,15 @@ function drawSurvey() {
   if (!m) { $("#svInfo").textContent = "No surveys yet: click New to start one."; for (const id of ["svMap", "svChart"]) { const c = $("#" + id); c.getContext("2d").clearRect(0, 0, c.width, c.height); } $("#svAxis").replaceChildren(); $("#svSamples").replaceChildren(); return; }
   $("#svInfo").textContent = m ? `${fmtFshort(m.lo)} – ${fmtFshort(m.hi)} · ${m.dwell_s} s per step · ${m.source} · ${(m.started || "").replace("T", " ").slice(0, 16)}`
     + (S.view !== surveyView() ? ` · “${(S.views.find(v => v.id === S.view) || {}).label || S.view}” wasn't recorded; showing power` : "") : "";
-  $("#svStatus").textContent = run ? SV.state.message || "" : "";
+  $("#svStatus").textContent = $("#svStatus").title = run ? SV.state.message || "" : "";
+  $("#svInfo").title = $("#svInfo").textContent;
   renderSurvey(); renderSamples();
 }
 async function renderSurvey() {
   const m = SV.meta, map = $("#svMap"); if (!m || !map) return;
   const gen = SV.gen = (SV.gen || 0) + 1;                  // only the newest render draws (images load async)
-  const parts = await surveyImage(surveyView()); if (!parts || !$("#svMap") || gen !== SV.gen) return;
+  const parts = (m.steps.length ? await surveyImage(surveyView()) : null) || [];
+  if (!$("#svMap") || gen !== SV.gen) return;
   const dpr = devicePixelRatio || 1, W = map.clientWidth;
   map.width = W * dpr; map.height = map.clientHeight * dpr;
   const g = map.getContext("2d"), span = SV.v1 - SV.v0, X = f => (f - SV.v0) / span * map.width;
@@ -1045,8 +1048,16 @@ async function renderSurvey() {
     g.imageSmoothingEnabled = (X(b) - X(a)) / sw < 3;      // crisp columns when zoomed in
     g.drawImage(c, sx, 0, Math.max(0.5, sw), c.height, X(a), 0, X(b) - X(a), map.height);
   }
+  for (const pv of m.previews || []) {                     // steps still being recorded or processed
+    const a = Math.max(pv.lo, SV.v0), b = Math.min(pv.hi, SV.v1); if (b <= a) continue;
+    const c = await surveyPreview(pv.i, pv.cols); if (!c || gen !== SV.gen) continue;
+    const sx = (a - pv.lo) / (pv.hi - pv.lo) * pv.cols, sw = (b - a) / (pv.hi - pv.lo) * pv.cols;
+    g.imageSmoothingEnabled = (X(b) - X(a)) / sw < 3;
+    g.drawImage(c, sx, 0, Math.max(0.5, sw), c.height, X(a), 0, X(b) - X(a), map.height);
+  }
+  if (gen !== SV.gen) return;
   g.strokeStyle = "rgba(255,255,255,.14)"; g.lineWidth = dpr;
-  for (const st of m.steps) { const x = X(st.lo); if (x > 0 && x < map.width) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, map.height); g.stroke(); } }
+  for (const st of [...m.steps, ...(m.previews || [])]) { const x = X(st.lo); if (x > 0 && x < map.width) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, map.height); g.stroke(); } }
   // detector picks as boxes, filtered by Min confidence
   const pad = 1500;
   for (const t of svTracks()) {
@@ -1079,6 +1090,22 @@ async function renderSurvey() {
   $("#svSel").textContent = SV.sel != null ? fmtF(SV.sel) : "";
   $("#svTune").style.display = SV.sel != null ? "" : "none";
 }
+async function surveyPreview(i, cols) {
+  try {
+    const r = await fetch("/api/survey/preview?i=" + i); if (!r.ok) return null;
+    const bytes = new Uint8Array(await r.arrayBuffer()), rows = +r.headers.get("X-Rows"), w = +r.headers.get("X-Cols");
+    const c = document.createElement("canvas"); c.width = w; c.height = rows;
+    const g = c.getContext("2d"), img = g.createImageData(w, rows), lut = makeColLUT(), bg = getComputedStyle(document.documentElement).getPropertyValue("--wf-bg");
+    for (let k = 0; k < bytes.length; k++) {
+      const v = bytes[k], o = k * 4;
+      if (!v) { img.data[o + 3] = 0; continue; }                // not recorded yet: leave the background
+      img.data[o] = lut[v * 4]; img.data[o + 1] = lut[v * 4 + 1]; img.data[o + 2] = lut[v * 4 + 2]; img.data[o + 3] = 255;
+    }
+    g.putImageData(img, 0, 0); return c;
+  } catch (e) { return null; }
+}
+// while a survey runs and its map is open: refresh every 2 s (the step being recorded fills in)
+setInterval(() => { if (SV.open && !SV.file && SV.state.state === "running") openSurvey(); }, 2000);
 function surveyInteract(c) {
   let drag = null;
   const fAt = e => { const r = c.getBoundingClientRect(); return SV.v0 + (e.clientX - r.left) / r.width * (SV.v1 - SV.v0); };
