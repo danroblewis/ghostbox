@@ -18,7 +18,7 @@ import numpy as np
 
 from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
-from .engine import Engine
+from .engine import Engine, iq_cut_wav
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
 from .survey import Survey
@@ -263,6 +263,53 @@ def make_app(args):
         return web.Response(body=np.ascontiguousarray(img, np.uint8).tobytes(), content_type="application/octet-stream",
                             headers={"X-Rows": str(img.shape[0]), "X-Cols": str(img.shape[1])})
 
+    async def get_detection(request):
+        meta = await asyncio.get_running_loop().run_in_executor(None, state["engine"].detail, request.query.get("key", ""))
+        if meta is None:
+            raise web.HTTPNotFound()
+        meta = {k: v for k, v in meta.items() if k not in ("checks", "detect")}
+        return web.json_response(meta, dumps=lambda o: json.dumps(o, default=float))
+
+    async def get_iq(request):
+        """IQ around a detection (?key=) or a survey sample (?survey=&track=), as a stereo I/Q WAV."""
+        q, eng = request.query, state["engine"]
+        pad = min(5.0, max(0.0, float(q.get("pad", 1.0))))
+        rate = int(q.get("rate", 48000))
+        loop = asyncio.get_running_loop()
+        if q.get("survey"):
+            f = q["survey"]
+            if not SAFE.match(f):
+                raise web.HTTPNotFound()
+            st, t = state["survey"].track(f, int(q.get("track", -1)))
+            if t is None or "iq_t" not in t:
+                raise web.HTTPNotFound(text="no IQ recorded for this sample")
+            ring = ROOT / config.get()["iq_ring"]["dir"]
+            segs = []
+            for name in st.get("iq_files", []):
+                p = ring / name
+                if p.exists() and p.with_suffix(".json").exists():
+                    segs.append((json.loads(p.with_suffix(".json").read_text()), p))
+            if not segs:
+                raise web.HTTPNotFound(text="this sample's IQ is no longer in the IQ ring")
+            base = segs[0][0]["t0"]
+            t0, t1, fcen, utc = base + t["iq_t"][0] - pad, base + t["iq_t"][1] + pad, t["f"], None
+        else:
+            meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
+            if meta is None:
+                raise web.HTTPNotFound()
+            t0, t1 = meta["stream_t0"] - pad, meta["stream_t1"] + pad
+            fcen, utc = meta["freq_hz"]["mean"], meta.get("utc_start")
+            segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
+            if not segs:
+                raise web.HTTPNotFound(text="this detection's IQ is no longer in the IQ ring")
+        data, _ = await loop.run_in_executor(None, iq_cut_wav, segs, t0, t1, fcen, rate)
+        if data is None:
+            raise web.HTTPNotFound(text="no IQ in that time range")
+        stamp = (utc or "")[:19].replace("-", "").replace(":", "").replace("T", "-")
+        name = f"iq_{fcen / 1e6:.4f}MHz_{stamp or 'survey'}_{rate // 1000}k.wav"
+        return web.Response(body=data, content_type="audio/wav",
+                            headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
     async def survey_clip(request):
         f, c = request.query.get("file", ""), request.query.get("clip", "")
         if not (SAFE.match(f) and SAFE.match(c)):
@@ -483,6 +530,8 @@ def make_app(args):
     app.router.add_post("/api/survey/stop", stop_survey)
     app.router.add_get("/api/survey/image", survey_image)
     app.router.add_get("/api/survey/clip", survey_clip)
+    app.router.add_get("/api/detection", get_detection)
+    app.router.add_get("/api/iq", get_iq)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)

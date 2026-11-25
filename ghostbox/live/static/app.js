@@ -59,7 +59,7 @@ function setTheme(name) {
   if (name === "nightvision" && S.cmap !== "red") { lsSet("gb_cmap_day", S.cmap); setCmap("red"); }
   else if (name !== "nightvision" && S.cmap === "red") setCmap(lsGet("gb_cmap_day", "magma"));
 }
-function setCmap(name) { S.cmap = name; lsSet("gb_cmap", name); $("#cmap").value = name; repaintAll(); if (SV.open) drawSurvey(); }
+function setCmap(name) { S.cmap = name; lsSet("gb_cmap", name); $("#cmap").value = name; repaintAll(); SCOPE.repaint = true; if (SV.open) drawSurvey(); if (DT.open) drawDetailSpec(); }
 
 // ---------------- colour maps ----------------
 const CMAPS = {
@@ -67,6 +67,15 @@ const CMAPS = {
   viridis: [[0, 68, 1, 84], [0.25, 59, 82, 139], [0.5, 33, 145, 140], [0.75, 94, 201, 98], [1, 253, 231, 37]],
   gray: [[0, 0, 0, 0], [1, 235, 235, 235]],
   red: [[0, 0, 0, 0], [0.45, 90, 6, 3], [0.8, 200, 30, 20], [1, 255, 70, 50]],
+  // Classic SDR# rainbow: dark blue, cyan, green, yellow, red, white
+  rainbow: [[0, 0, 0, 30], [0.14, 0, 0, 150], [0.3, 0, 170, 255], [0.45, 0, 215, 70], [0.62, 250, 240, 0], [0.8, 255, 40, 0], [1, 255, 255, 255]],
+  // Turbo / jet: black-navy, blue, cyan, yellow, deep red
+  turbo: [[0, 20, 10, 50], [0.12, 50, 60, 190], [0.27, 40, 150, 250], [0.4, 30, 225, 210], [0.53, 110, 250, 100], [0.66, 225, 225, 50], [0.8, 250, 140, 30], [0.92, 205, 45, 10], [1, 125, 5, 5]],
+  // Inferno: black, deep purple, crimson, orange, pale yellow (noise floor near true black)
+  inferno: [[0, 0, 0, 4], [0.2, 40, 11, 84], [0.4, 101, 21, 110], [0.55, 159, 42, 99], [0.7, 212, 72, 66], [0.85, 245, 125, 21], [1, 252, 255, 164]],
+  // Monochrome phosphor
+  amber: [[0, 0, 0, 0], [0.45, 95, 52, 0], [0.8, 220, 140, 10], [1, 255, 205, 110]],
+  green: [[0, 0, 0, 0], [0.45, 10, 80, 20], [0.8, 50, 200, 70], [1, 170, 255, 170]],
 };
 function makeLUT() {
   const stops = CMAPS[S.cmap] || CMAPS.magma, base = new Uint8ClampedArray(256 * 4);
@@ -374,7 +383,7 @@ window.addEventListener("keydown", startAudioOnce, true);
 $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) master.gain.value = +e.target.value; });
 
 // ---------------- audio scope: a lane per voice + log-frequency spectrogram of the mix ----------------
-const SCOPE = { an: null, img: null, lo: -100, hi: -40 };
+const SCOPE = { an: null, img: null, lo: -100, hi: -40, cols: [], repaint: false };
 const scv = $("#scope"), sctx = scv.getContext("2d");
 const confOf = d => Math.max(d.box.conf_max ?? 0, d.box.conf ?? 0);
 const audible = d => confOf(d) >= S.minConf;
@@ -394,6 +403,15 @@ function playingVoices() {
   return out.sort((a, b) => b.box.conf - a.box.conf).slice(0, 4);
 }
 const F_LO = 80, F_HI = 4000;
+function scopeCol(img, q, H) {                              // one 2-px column of the audio spectrogram
+  const cm = makeColLUT();
+  for (let y = 0; y < H; y++) {
+    const v = q ? q[y] * 4 : -1;
+    for (let x = 0; x < 2; x++) { const o = (y * 2 + x) * 4;
+      if (v < 0) { img.data[o] = img.data[o + 1] = img.data[o + 2] = 0; } else { img.data[o] = cm[v]; img.data[o + 1] = cm[v + 1]; img.data[o + 2] = cm[v + 2]; }
+      img.data[o + 3] = 255; }
+  }
+}
 function drawScope() {
   const dpr = devicePixelRatio, W = scv.clientWidth * dpr, H = scv.clientHeight * dpr;
   if (!W || !H) return;
@@ -421,6 +439,7 @@ function drawScope() {
   if (!SCOPE.img || SCOPE.img.width !== Math.max(1, Math.round(specW)) || SCOPE.img.height !== H) {
     SCOPE.img = document.createElement("canvas"); SCOPE.img.width = Math.max(1, Math.round(specW)); SCOPE.img.height = H;
     const c = SCOPE.img.getContext("2d"); c.fillStyle = TH.bg; c.fillRect(0, 0, SCOPE.img.width, H);
+    SCOPE.repaint = true;
   }
   const ic = SCOPE.img.getContext("2d");
   ic.drawImage(SCOPE.img, -2, 0);                          // scroll left 2 px per frame
@@ -438,13 +457,15 @@ function drawScope() {
       SCOPE.lo += 0.03 * (p20 - SCOPE.lo);
       SCOPE.hi += (p99 > SCOPE.hi ? 0.2 : 0.02) * (p99 - SCOPE.hi);
     }
-    const span = Math.max(12, SCOPE.hi - SCOPE.lo), cm = makeColLUT();
-    for (let y = 0; y < H; y++) {
-      const v = Math.max(0, Math.min(255, Math.round((colVals[y] - SCOPE.lo) / span * 255))) * 4;
-      for (let x = 0; x < 2; x++) { const o = (y * 2 + x) * 4; col.data[o] = cm[v]; col.data[o + 1] = cm[v + 1]; col.data[o + 2] = cm[v + 2]; col.data[o + 3] = 255; }
-    }
-  } else for (let i = 0; i < col.data.length; i += 4) { col.data[i] = col.data[i + 1] = col.data[i + 2] = 0; col.data[i + 3] = 255; }
-  ic.putImageData(col, SCOPE.img.width - 2, 0);
+    const span = Math.max(12, SCOPE.hi - SCOPE.lo), q = new Uint8Array(H);
+    for (let y = 0; y < H; y++) q[y] = Math.max(0, Math.min(255, Math.round((colVals[y] - SCOPE.lo) / span * 255)));
+    scopeCol(col, q, H); SCOPE.cols.push(q);
+  } else { scopeCol(col, null, H); SCOPE.cols.push(null); }
+  const keep = Math.ceil(SCOPE.img.width / 2) + 1; if (SCOPE.cols.length > keep) SCOPE.cols.splice(0, SCOPE.cols.length - keep);
+  if (SCOPE.repaint) {                                     // palette changed or resized: recolour all of it
+    SCOPE.repaint = false; const one = ic.createImageData(2, H);
+    SCOPE.cols.forEach((q, i) => { scopeCol(one, q, H); ic.putImageData(one, SCOPE.img.width - 2 * (SCOPE.cols.length - i), 0); });
+  } else ic.putImageData(col, SCOPE.img.width - 2, 0);
   sctx.drawImage(SCOPE.img, specX, 0);
   sctx.fillStyle = TH.text;
   for (const [f, lab] of [[100, "100"], [300, "300"], [1000, "1k"], [3000, "3k"]]) {
@@ -589,14 +610,14 @@ function confStyle(row, conf) {
 }
 const ICON_SAVE = '<svg viewBox="0 0 10 10"><path d="M1 1h6.5L9 2.5V9H1zM2.5 1v3h4.5V1M2.5 9V6h5v3" fill="none" stroke="currentColor" stroke-width="1"/></svg>';
 const ICON_SAVED = '<svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.5 2.4" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
-function rowFor({ key, f, t, conf, tx, pending, live, onJump, onPlay, saved, onSave }) {
+function rowFor({ key, f, t, conf, tx, pending, live, onOpen, onPlay, saved, onSave }) {
   const playing = S.playing && S.playing.key === key;
   let text = "", cls = "x none";
   if (tx) { if (tx.text && tx.no_speech_prob <= 0.6) { text = `“${tx.text}”`; cls = "x"; } else if (tx.text) { text = `“${tx.text}”`; cls = "x doubt"; } else text = "No words"; }
   else if (pending) text = "Transcribing…";
   const btn = el("button", { class: "play" + (playing ? " on" : ""), title: playing ? "Pause" : "Play", onclick: e => { e.stopPropagation(); onPlay(); } });
   btn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
-  const row = el("div", { class: "det", "data-key": key, title: live ? "Live — click to show on the waterfall" : "Click to show on the waterfall", onclick: onJump },
+  const row = el("div", { class: "det", "data-key": key, title: (live ? "Live — " : "") + "click for details", onclick: onOpen },
     btn, el("span", { class: "f" }, fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
     el("span", { class: "c" }, (conf * 100).toFixed(0)), saveCell(saved, onSave),
     live ? el("i", { class: "live", title: "Live" }) : null);
@@ -626,7 +647,7 @@ function recRow(r) {
   const recent = Date.now() - new Date(r.utc_start).getTime() < 180e3;
   return rowFor({ key: recKey(r), f: r.freq_hz.mean, t: hms(new Date(r.utc_start)), conf: r.confidence.max, tx: r.transcript,
     pending: recent && !r.transcript && r.confidence.max >= minConf && S.cfg && S.cfg.whisper.enabled,
-    onJump: () => { if (sameSession) jumpTo(r.stream_t1); }, onPlay: () => togglePlay(recKey(r), null, r),
+    onOpen: () => openDetail({ key: r.key }), onPlay: () => togglePlay(recKey(r), null, r),
     saved: r.saved !== false, onSave: () => saveDetection(r) });
 }
 let liveTimer = null;
@@ -638,7 +659,7 @@ function renderLive() {
     $("#liveList").replaceChildren(...ds.map(d => {
       const b = d.box;
       return rowFor({ key: detKey(d), f: (b.fmin + b.fmax) / 2, t: clockTime(b.t0), conf: b.conf, tx: S.tx.get(b.id), live: true,
-        onJump: () => jumpTo(b.t1), onPlay: () => togglePlay(detKey(d), d) });
+        onOpen: () => openDetail({ live: d }), onPlay: () => togglePlay(detKey(d), d) });
     }));
     updateCount(ds.length);
   }, 200);
@@ -1092,8 +1113,8 @@ function renderSamples() {
   if (!best.length) { box.replaceChildren(el("div", { class: "note" }, `No recorded detections at or above ${Math.round(S.minConf * 100)}% confidence.`)); return; }
   box.replaceChildren(...best.map(t => {
     const key = "sv:" + t.id, tx = S.tx.get(t.id);
-    return el("div", { class: "svrow det", "data-key": key, title: "Show it on the map",
-      onclick: () => { SV.hl = t.id; SV.sel = t.f; const w = 60e3; SV.v0 = Math.max(SV.meta.lo, t.f - w); SV.v1 = Math.min(SV.meta.hi, t.f + w); renderSurvey(); } },
+    return el("div", { class: "svrow det", "data-key": key, title: "Click for details",
+      onclick: () => { SV.hl = t.id; renderSurvey(); openDetail({ survey: { file: SV.file || SV.meta.file, step: SV.meta.steps[t.step], stepIndex: t.step, track: t } }); } },
       (() => { const b = el("button", { class: "play", title: "Play", onclick: e => { e.stopPropagation(); togglePlay(key, null, { clip: t.clips[0] }); } }); b.innerHTML = ICON_PLAY; return b; })(),
       el("span", { class: "num" }, fmtF(t.f)),
       el("span", { class: "t2" }, t.text ? `“${t.text}”` : tx && tx.text ? `“${tx.text}”` : `step ${t.step + 1} · ${t.t0.toFixed(1)} s`),
@@ -1365,3 +1386,203 @@ fillRange($("#vol"));
 connect();
 requestAnimationFrame(draw);
 $("#mapBtn").addEventListener("click", openMap);
+
+// ---------------- detection detail dialog ----------------
+// Opens from a detection row or a survey sample: full transcript, playback with waveform and
+// spectrogram (both downloadable), downloads (audio WAV, narrowband IQ), and everything measured.
+var DT = { open: false, buf: null, src: null, t0: 0, off: 0, raf: 0, spec: null };
+function fftInPlace(re, im) {                             // iterative radix-2
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) { let b = n >> 1; for (; j & b; b >>= 1) j ^= b; j ^= b; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+  for (let len = 2; len <= n; len <<= 1) {
+    const a = -2 * Math.PI / len, wr = Math.cos(a), wi = Math.sin(a);
+    for (let i = 0; i < n; i += len) { let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const ur = re[i + k], ui = im[i + k], vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k] = ur + vr; im[i + k] = ui + vi; re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      } }
+  }
+}
+function specOf(x, rate) {                                // dB STFT, 0-4 kHz: [cols][bins]
+  const N = 512, hop = 128, win = new Float32Array(N).map((_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N));
+  const bins = Math.min(N / 2, Math.round(4000 / (rate / N))), cols = [];
+  for (let s = 0; s + N <= x.length; s += hop) {
+    const re = new Float32Array(N), im = new Float32Array(N);
+    for (let i = 0; i < N; i++) re[i] = x[s + i] * win[i];
+    fftInPlace(re, im);
+    const c = new Float32Array(bins); for (let k = 0; k < bins; k++) c[k] = 10 * Math.log10(re[k] * re[k] + im[k] * im[k] + 1e-12);
+    cols.push(c);
+  }
+  const all = []; for (let i = 0; i < cols.length; i += 3) for (let k = 0; k < bins; k += 3) all.push(cols[i][k]);
+  all.sort((a, b) => a - b);
+  return { cols, bins, lo: all[Math.floor(all.length * 0.2)] || -100, hi: all[Math.floor(all.length * 0.998)] || 0, hop, rate };
+}
+const labelOf = id => ((S.checks || []).find(c => c.id === id) || {}).label || id;
+function closeDetail() {
+  dtStop(); DT.open = false; const m = $("#detail"); if (m) m.remove();
+  document.removeEventListener("keydown", dtKey, true);
+}
+function dtKey(e) { if (e.key === "Escape") { e.stopPropagation(); closeDetail(); } else if (e.key === " " && DT.open) { e.preventDefault(); e.stopPropagation(); dtToggle(); } }
+// opts: { key } for a detection (memory or saved), { live: d } for one still running, { survey: { file, step, track } }
+async function openDetail(opts) {
+  closeDetail(); ensureAudio();
+  DT.open = true; DT.buf = null; DT.off = 0;
+  const box = el("div", { class: "dlg", role: "dialog", "aria-modal": "true" });
+  const wrap = el("div", { id: "detail", onclick: e => { if (e.target === wrap) closeDetail(); } }, box);
+  document.body.append(wrap); document.addEventListener("keydown", dtKey, true);
+  box.append(el("div", { class: "dlghead" }, el("strong", {}, "Loading…"), el("span", { style: "flex:1" }), el("button", { class: "btn", onclick: closeDetail }, "Close")));
+  // ---- gather what we know
+  let info = {}, clip = null, iqUrl = null, jump = null, tx = null;
+  if (opts.survey) {
+    const { file, step: st, track: t } = opts.survey;
+    info = { f: t.f, fmin: t.fmin, fmax: t.fmax, dur: t.dur ?? (t.t1 - t.t0), conf: t.conf, scores: t.scores || { vad: t.vad }, info: t.info || {},
+      when: `Survey ${file ? file.replace(/\.json$/, "").replace(/_/g, " ") : ""} · step ${opts.survey.stepIndex + 1} at ${t.t0.toFixed(1)} s`,
+      extra: st.calibration ? [["Step calibration", `${st.calibration.candidates} candidates, ${st.calibration.voice_like} speech-like${st.calibration.kept_checks ? " (kept current checks)" : ""}`]] : [],
+      rx: { center: st.fc, rate: st.fs } };
+    tx = t.text ? { text: t.text } : null;
+    clip = t.clips && t.clips[0];
+    iqUrl = `/api/iq?survey=${encodeURIComponent(file || SV.meta.file)}&track=${t.id}`;
+  } else {
+    const key = opts.key || (opts.live && (opts.live.box.clips || [])[0] || "").split("key=")[1];
+    let meta = null;
+    if (key) { try { const r = await fetch("/api/detection?key=" + encodeURIComponent(decodeURIComponent(key))); if (r.ok) meta = await r.json(); } catch (e) {} }
+    const b = opts.live ? opts.live.box : null;
+    if (meta) {
+      info = { f: meta.freq_hz.mean, fmin: meta.freq_hz.min, fmax: meta.freq_hz.max, dur: meta.duration_s, conf: meta.confidence.max, confFinal: meta.confidence.final,
+        scores: meta.scores || {}, info: meta.info || {}, when: new Date(meta.utc_start).toLocaleString(), utc: meta.utc_start,
+        hist: meta.confidence.history, rx: { center: meta.fc, rate: meta.fs, gain: meta.sdr && meta.sdr.gain_db, amp: meta.sdr && meta.sdr.amp, source: meta.sdr && meta.sdr.source },
+        extra: [["Chain / segment", `${meta.chain} / ${meta.segment}`], ["Saved", meta.saved === false ? "In memory only" : "On disk"]] };
+      tx = meta.transcript || S.tx.get(meta.id) || null;
+      clip = meta.clip || (meta.files && meta.files.wav ? "/rec/" + meta.files.wav : null);
+      iqUrl = "/api/iq?key=" + encodeURIComponent(meta.key);
+      if (meta.epoch && Math.abs(meta.epoch - S.epoch) < 1e-3) jump = meta.stream_t1;
+    } else if (b) {
+      info = { f: (b.fmin + b.fmax) / 2, fmin: b.fmin, fmax: b.fmax, dur: b.t1 - b.t0, conf: b.conf, scores: b.scores || {}, info: b.info || {}, when: clockTime(b.t0) + " (still live)" };
+      tx = S.tx.get(b.id) || null; jump = b.t1;
+    }
+  }
+  if (!DT.open) return;
+  // ---- header, transcript
+  box.replaceChildren();
+  box.append(el("div", { class: "dlghead" },
+    el("strong", { class: "num" }, fmtF(info.f || 0)), el("span", { class: "t2" }, info.when || ""),
+    el("span", { class: "t2 num" }, `${(info.dur || 0).toFixed(1)} s · ${Math.round((info.conf || 0) * 100)}%`),
+    el("span", { style: "flex:1" }), el("button", { class: "btn", title: "Close (Esc)", onclick: closeDetail }, "Close")));
+  const txText = tx && tx.text ? tx.text : null;
+  box.append(el("div", { class: "dlgtx" + (txText ? "" : " t3") }, txText ? `“${txText}”` : tx ? "No words" : "No transcript"),
+    tx && tx.filtered && tx.filtered !== tx.text && /\p{L}/u.test(tx.filtered) ? el("div", { class: "note", style: "margin:2px 0 0" }, `Before filtering: “${tx.filtered}”`) : "");
+  // ---- player: waveform + spectrogram with a playhead; click to seek
+  const wave = el("canvas", { class: "dlgwave" }), spec = el("canvas", { class: "dlgspec" }), head = el("div", { class: "dlgplayhead" });
+  const playBtn = el("button", { class: "btn primary", id: "dtPlay", onclick: dtToggle, disabled: !clip }, "Play");
+  const time = el("span", { class: "num t2", id: "dtTime" }, "");
+  const pl = el("div", { class: "dlgplot" }, wave, spec, head);
+  pl.addEventListener("click", e => { if (!DT.buf) return; const r = pl.getBoundingClientRect(); dtSeek((e.clientX - r.left) / r.width * DT.buf.duration); });
+  box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
+    el("span", { style: "flex:1" }), el("span", { class: "t3", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl));
+  // ---- downloads and actions
+  const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
+  const dl = (label, href, name, title) => el("a", { class: "btn", href, download: name, title }, label);
+  const pngBtn = (label, cv, suffix) => el("button", { class: "btn", onclick: () => cv.toBlob(b => { const a = el("a", { href: URL.createObjectURL(b), download: `${fname}_${suffix}.png` }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); }) }, label);
+  box.append(el("div", { class: "dlgacts" },
+    clip ? dl("Audio WAV", clip, `${fname}_audio.wav`, "Demodulated audio, 16 kHz") : null,
+    iqUrl ? dl("IQ WAV", iqUrl, `${fname}_iq48k.wav`, "Raw IQ around this detection (±1 s), shifted to its frequency, 48 kHz stereo I/Q — opens in SDR#, SDR++ and similar") : null,
+    pngBtn("Spectrogram PNG", spec, "spectrogram"), pngBtn("Waveform PNG", wave, "waveform"),
+    el("span", { style: "flex:1" }),
+    jump != null ? el("button", { class: "btn", onclick: () => { closeDetail(); if (SV.open) closeSurvey(); jumpTo(jump); } }, "Show on waterfall") : null,
+    opts.survey ? el("button", { class: "btn", onclick: () => { const t = opts.survey.track; closeDetail(); SV.hl = t.id; SV.sel = t.f; SV.v0 = Math.max(SV.meta.lo, t.f - 60e3); SV.v1 = Math.min(SV.meta.hi, t.f + 60e3); renderSurvey(); } }, "Show on map") : null,
+    el("button", { class: "btn", title: "Move the receiver here", onclick: () => { closeDetail(); if (SV.open) surveyTune(info.f); else { const step = S.cfg.sdr.sample_rate * 0.8; patch({ sdr: { center_hz: Math.round(info.f), fmin_hz: Math.round(info.f - step / 2), fmax_hz: Math.round(info.f + step / 2) } }, 50); } } }, "Tune here")));
+  // ---- the numbers
+  const kv = [];
+  const fmtMode = m => m === 1 ? "USB" : m === -1 ? "LSB" : m === 0 ? "AM" : null;
+  kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
+  if (info.confFinal != null) kv.push(["Confidence", `max ${Math.round(info.conf * 100)}%, final ${Math.round(info.confFinal * 100)}%`]);
+  const I = info.info || {};
+  if (fmtMode(I.mode) || I.mode_name) kv.push(["Modulation", I.mode_name || fmtMode(I.mode)]);
+  if (I.f0_median_hz) kv.push(["Pitch", `${Math.round(I.f0_median_hz)} Hz`]);
+  if (I.voiced_frac != null) kv.push(["Voiced", `${Math.round(I.voiced_frac * 100)}% of frames`]);
+  if (I.am_phase_z != null) kv.push(["AM cross-term", `z = ${I.am_phase_z.toFixed(1)}`]);
+  if (info.rx) kv.push(["Receiver", [info.rx.source, info.rx.center ? `${fmtF(info.rx.center)} centre` : "", info.rx.rate ? `${(info.rx.rate / 1e6).toFixed(1)} MS/s` : "", info.rx.gain != null ? `gain ${info.rx.gain} dB` : "", info.rx.amp ? "amp on" : ""].filter(Boolean).join(" · ")]);
+  for (const e of info.extra || []) kv.push(e);
+  const scores = Object.entries(info.scores || {}).filter(([, v]) => v != null).sort((a, b) => b[1] - a[1]);
+  box.append(el("div", { class: "dlggrid" },
+    el("div", {}, el("h3", {}, "Details"), ...kv.map(([k, v]) => el("div", { class: "kv" }, el("span", { class: "t3" }, k), el("span", {}, v)))),
+    el("div", {}, el("h3", {}, "Check scores"), ...(scores.length ? scores.map(([k, v]) => el("div", { class: "kv sc" }, el("span", { class: "t2" }, k === "vad" ? "ML voice detector" : labelOf(k)),
+      el("span", { class: "bar" }, el("i", { style: `width:${Math.round(v * 100)}%` })), el("span", { class: "num" }, Math.round(v * 100)))) : [el("div", { class: "note" }, "None recorded.")]),
+      info.hist && info.hist.length > 2 ? el("h3", { style: "margin-top:12px" }, "Confidence over time") : "", info.hist && info.hist.length > 2 ? confSpark(info.hist) : "")));
+  // ---- load and draw the audio
+  if (clip) {
+    try {
+      const r = await fetch(clip); if (!r.ok) throw new Error("gone");
+      DT.buf = await AC.decodeAudioData(await r.arrayBuffer());
+    } catch (e) { playBtn.disabled = true; time.textContent = "Audio no longer available"; }
+  } else time.textContent = "No audio recorded";
+  if (!DT.open) return;
+  if (DT.buf) {
+    DT.spec = specOf(DT.buf.getChannelData(0), DT.buf.sampleRate);
+    time.textContent = `0.0 / ${DT.buf.duration.toFixed(1)} s`;
+  }
+  requestAnimationFrame(() => { drawDetailWave(); drawDetailSpec(); });
+}
+function confSpark(hist) {
+  const c = el("canvas", { class: "dlgspark" });
+  requestAnimationFrame(() => {
+    const dpr = devicePixelRatio || 1, W = c.clientWidth * dpr, H = c.clientHeight * dpr; c.width = W; c.height = H;
+    const g = c.getContext("2d"), t0 = hist[0][0], t1 = hist[hist.length - 1][0] || t0 + 1;
+    g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--mark"); g.lineWidth = 1.5 * dpr; g.beginPath();
+    hist.forEach(([t, v], i) => { const x = (t - t0) / Math.max(1e-6, t1 - t0) * W, y = H - v * (H - 2 * dpr) - dpr; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  });
+  return c;
+}
+function drawDetailWave() {
+  const c = $("#detail .dlgwave"); if (!c) return;
+  const dpr = devicePixelRatio || 1, W = c.clientWidth * dpr, H = c.clientHeight * dpr; c.width = W; c.height = H;
+  const g = c.getContext("2d"), cs = getComputedStyle(document.documentElement);
+  g.fillStyle = cs.getPropertyValue("--wf-bg"); g.fillRect(0, 0, W, H);
+  if (!DT.buf) return;
+  const x = DT.buf.getChannelData(0), per = Math.max(1, Math.floor(x.length / W));
+  g.fillStyle = cs.getPropertyValue("--mark");
+  for (let i = 0; i < W; i++) {
+    let lo = 1, hi = -1; for (let k = i * per; k < Math.min(x.length, (i + 1) * per); k++) { if (x[k] < lo) lo = x[k]; if (x[k] > hi) hi = x[k]; }
+    if (hi < lo) continue; g.fillRect(i, H / 2 - hi * H * 0.46, 1, Math.max(1, (hi - lo) * H * 0.46));
+  }
+}
+function drawDetailSpec() {
+  const c = $("#detail .dlgspec"); if (!c) return;
+  const dpr = devicePixelRatio || 1, W = c.clientWidth * dpr, H = c.clientHeight * dpr; c.width = W; c.height = H;
+  const g = c.getContext("2d");
+  if (!DT.spec) { g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--wf-bg"); g.fillRect(0, 0, W, H); return; }
+  const { cols, bins, lo, hi } = DT.spec, lut = makeColLUT(), img = g.createImageData(cols.length, bins), span = Math.max(10, hi - lo);
+  for (let x = 0; x < cols.length; x++) for (let k = 0; k < bins; k++) {
+    const v = Math.max(0, Math.min(255, Math.round((cols[x][k] - lo) / span * 255))) * 4, o = ((bins - 1 - k) * cols.length + x) * 4;
+    img.data[o] = lut[v]; img.data[o + 1] = lut[v + 1]; img.data[o + 2] = lut[v + 2]; img.data[o + 3] = 255;
+  }
+  const off = document.createElement("canvas"); off.width = cols.length; off.height = bins; off.getContext("2d").putImageData(img, 0, 0);
+  g.imageSmoothingEnabled = true; g.drawImage(off, 0, 0, W, H);
+  g.fillStyle = "rgba(255,255,255,.6)"; g.font = `${10 * dpr}px ${TH.mono}`;
+  for (const f of [1000, 2000, 3000]) { const y = H * (1 - f / 4000); g.fillText(f / 1000 + "k", 4 * dpr, y + 3 * dpr); }
+}
+function dtStop() {
+  if (DT.src) { try { DT.src.onended = null; DT.src.stop(); } catch (e) {} DT.off = Math.min(DT.buf ? DT.buf.duration : 0, DT.off + AC.currentTime - DT.t0); }
+  DT.src = null; cancelAnimationFrame(DT.raf); if (PB.gain) PB.gain.gain.value = 1;
+  const b = $("#dtPlay"); if (b) b.textContent = "Play";
+}
+function dtToggle() {
+  if (!DT.buf) return;
+  if (DT.src) { dtStop(); return; }
+  if (S.playing) togglePlay(S.playing.key);                // one clip at a time
+  if (DT.off >= DT.buf.duration - 0.02) DT.off = 0;
+  const src = AC.createBufferSource(); src.buffer = DT.buf; src.connect(master); src.start(0, DT.off);
+  DT.src = src; DT.t0 = AC.currentTime; if (PB.gain) PB.gain.gain.value = 0;   // the clip has the floor
+  src.onended = () => { if (DT.src === src) { DT.src = null; DT.off = DT.buf.duration; dtTick(); const b = $("#dtPlay"); if (b) b.textContent = "Play"; if (PB.gain) PB.gain.gain.value = 1; } };
+  $("#dtPlay").textContent = "Pause";
+  const loop = () => { dtTick(); if (DT.src) DT.raf = requestAnimationFrame(loop); }; loop();
+}
+function dtSeek(t) { const was = !!DT.src; if (was) dtStop(); DT.off = Math.max(0, Math.min(DT.buf.duration, t)); dtTick(); if (was) dtToggle(); }
+function dtTick() {
+  if (!DT.buf) return;
+  const t = DT.src ? DT.off + AC.currentTime - DT.t0 : DT.off, h = $("#detail .dlgplayhead"), tm = $("#dtTime");
+  if (h) h.style.left = (Math.min(1, t / DT.buf.duration) * 100) + "%";
+  if (tm) tm.textContent = `${t.toFixed(1)} / ${DT.buf.duration.toFixed(1)} s`;
+}

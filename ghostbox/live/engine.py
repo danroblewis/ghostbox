@@ -81,6 +81,35 @@ def _ssb_taps(bw_hz, side):
     return _SSB[key]
 
 
+def iq_cut_wav(segs, t0, t1, f_center, rate=48000):
+    """Narrowband IQ around f_center from IQ-ring segments [(segment json, path)] for times [t0, t1]
+    (the segments' own timeline), shifted to 0 Hz and resampled to `rate`: a stereo (I, Q) 16-bit WAV
+    that SDR programs open as IQ. Returns (bytes, actual start time) or (None, None)."""
+    import io
+    from math import gcd
+    from scipy.signal import resample_poly
+    parts, start, fs, fc = [], None, None, None
+    for sj, p in segs:
+        fs, fc = sj["fs"], sj["fc"]
+        raw = np.memmap(p, dtype=np.int8, mode="r")
+        a = max(0, int((t0 - sj["t0"]) * fs))
+        b = min(len(raw) // 2, int((t1 - sj["t0"]) * fs))
+        if b > a:
+            start = sj["t0"] + a / fs if start is None else start
+            parts.append(np.asarray(raw[2 * a:2 * b]))
+    if not parts:
+        return None, None
+    x = _to_complex(np.concatenate(parts), True)
+    x = x * np.exp(-2j * np.pi * (f_center - fc) / fs * np.arange(len(x)))
+    g = gcd(int(rate), int(fs))
+    y = resample_poly(x, int(rate) // g, int(fs) // g)
+    y = y / (np.abs(y).max() + 1e-12) * 0.9
+    st = (np.stack([y.real, y.imag], axis=1) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    wavfile.write(buf, int(rate), st)
+    return buf.getvalue(), start
+
+
 def demod(x, fs, f_offset, bw_hz, mode=0):
     """Mix x (complex, at fs) down by f_offset (scalar or per-sample Hz), decimate to 16 kHz.
     mode 0: AM (envelope). +1/-1: upper/lower single sideband (product detector: keep one side,
@@ -1006,6 +1035,32 @@ class Engine:
         audio = sosfilt(hp, env - env[:200].mean())
         audio = np.clip(render_clip(audio, cfg["audio"]), -1, 1)
         return (audio * 32767).astype(np.int16)
+
+    def detail(self, key):
+        """Full metadata of one detection (in memory or saved), for the detail dialog."""
+        cfg = self.config.get()
+        if key.startswith("wav:"):
+            p = (self.root / cfg["record"]["dir"] / key[4:]).with_suffix(".json")
+            return json.loads(p.read_text()) if p.is_file() else None
+        with self.lock:
+            v = self.mem.get(key)
+        return dict(v["meta"]) if v else None
+
+    def ring_segments(self, epoch, t0, t1):
+        """IQ-ring segments [(segment json, path)] of one session overlapping stream times [t0, t1]."""
+        d = self.root / self.config.get()["iq_ring"]["dir"]
+        out = []
+        for j in sorted(d.glob("*.json")) if d.exists() else []:
+            try:
+                sj = json.loads(j.read_text())
+            except Exception:
+                continue
+            p = j.with_suffix(".cs8")
+            if abs(sj.get("epoch", 0) - epoch) > 1e-3 or not p.exists():
+                continue
+            if sj["t0"] < t1 and sj["t0"] + p.stat().st_size / 2 / sj["fs"] > t0:
+                out.append((sj, p))
+        return out
 
     # ---------------- continuous IQ ring + size limits ----------------
     def _close_iq(self):

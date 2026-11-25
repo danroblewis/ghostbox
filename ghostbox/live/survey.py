@@ -172,7 +172,11 @@ class Survey:
                 s_lo = lo + i * width
                 fc = s_lo + width / 2
                 before = eng.session()
-                self.apply({"sdr": {"center_hz": fc, "fmin_hz": s_lo, "fmax_hz": s_lo + width}})
+                target = {"center_hz": fc, "fmin_hz": s_lo, "fmax_hz": s_lo + width}
+                if all(self.config.get()["sdr"].get(k) == v for k, v in target.items()):
+                    eng.request_restart()                  # already there: restart anyway (a fresh session)
+                else:
+                    self.apply({"sdr": target})
                 t_w = time.time()
                 while eng.session() == before and time.time() - t_w < 15 and not self._stop.is_set():
                     time.sleep(0.2)
@@ -267,6 +271,7 @@ class Survey:
                 checks[k] = {**checks[k], "enabled": w > 0, "weight": w}
             show = cal["show_threshold"]
         t_a = st["t_a"] or 0.0
+        sess0 = t_a - 1.0                                  # the replay's timeline starts with the first file
         tracks = []
         for b in boxes:
             conf = rescore(b, checks) if cal else float(b.get("conf_max", b.get("conf", 0)))
@@ -275,7 +280,10 @@ class Survey:
             tracks.append({"id": b["id"], "f": float(np.mean([p[1] for p in b["path"]])) if b.get("path") else (b["fmin"] + b["fmax"]) / 2,
                            "fmin": b["fmin"], "fmax": b["fmax"],
                            "t0": round(max(0.0, b["t0"] - t_a), 2), "t1": round(max(0.0, b["t1"] - t_a), 2),
-                           "conf": round(conf, 3), "vad": b["scores"].get("vad"), "clips": [], "text": None})
+                           "conf": round(conf, 3), "vad": b["scores"].get("vad"), "clips": [], "text": None,
+                           "iq_t": [round(b["t0"] - sess0, 3), round(b["t1"] - sess0, 3)],
+                           "scores": {k: round(float(v), 3) for k, v in b["scores"].items()},
+                           "info": b.get("info", {}), "dur": round(b["t1"] - b["t0"], 2)})
         # keep (and transcribe) the clips of what the calibrated detector shows
         shown = sorted([t for t in tracks if t["conf"] >= show and st["clips"].get(t["id"])], key=lambda t: -t["conf"])[:MAX_CLIPS]
         cdir = self.dir / name
@@ -312,7 +320,8 @@ class Survey:
         if cal:
             summary = {"candidates": len(boxes), "voice_like": cal["voice_like"], "kept_checks": bool(cal.get("kept_checks")),
                        "show_threshold": show, "weights": {k: w for k, w in cal["weights"].items() if w > 0}}
-        return {"lo": job["lo"], "hi": job["hi"], "cols": job["per"], "floor_db": floor, "pow": pw.astype(np.float32),
+        return {"lo": job["lo"], "hi": job["hi"], "cols": job["per"], "fc": job["fc"], "fs": job["fs"],
+                "iq_files": [Path(p).name for p in job["paths"]], "floor_db": floor, "pow": pw.astype(np.float32),
                 "maps": maps, "tracks": sorted(tracks, key=lambda t: t["t0"]), "calibration": summary,
                 "dwell_s": round((st["t_b"] or 0) - (st["t_a"] or 0), 2)}
 
@@ -367,6 +376,15 @@ class Survey:
         m = self.meta(res)
         np.savez_compressed(self.dir / (name + ".npz"), **{v: self.image(v) for v in m["views"]})
         (self.dir / (name + ".json")).write_text(json.dumps(m, default=float))
+
+    def track(self, file, track_id):
+        """(step, track) of a saved or the current survey."""
+        m = self.load(file) if file else self.meta()
+        for st in (m or {}).get("steps", []):
+            for t in st["tracks"]:
+                if t["id"] == track_id:
+                    return st, t
+        return None, None
 
     def clip_path(self, file, clip):
         p = self.dir / file[:-5] / clip
