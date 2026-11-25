@@ -75,7 +75,7 @@ function makeLUT() {
     for (let c = 0; c < 3; c++) base[i * 4 + c] = a[c + 1] + (b[c + 1] - a[c + 1]) * t;
     base[i * 4 + 3] = 255;
   }
-  const out = new Uint8ClampedArray(256 * 4), span = Math.max(1, S.smax - S.smin);
+  const out = new Uint8ClampedArray(256 * 4), span = Math.max(1, S.smax - S.smin);   // smin/smax may be fractional (auto)
   for (let v = 0; v < 256; v++) {
     const i = Math.max(0, Math.min(255, Math.round((v - S.smin) / span * 255)));
     out.set(base.subarray(i * 4, i * 4 + 4), v * 4);
@@ -94,16 +94,30 @@ function paintChunk(c) {
   }
   c.ctx.putImageData(img, 0, 0);
 }
+// Chunks are painted with the current colour scale; when the scale changes, visible chunks are
+// repainted lazily while drawing (a few per frame), so continuous auto-scaling stays cheap.
+S.lutVer = 0; S.autoScale = lsGet("gb_autoscale", "1") === "1"; S.visible = [];
 function addChunk(m) {
   if ((m.mode || "power") !== S.view) return;
   const key = m.t0.toFixed(3);
   if (S.chunks.has(key)) return;
   const c = { t0: m.t0, dt: m.dt, n: m.n, w: m.w, fmin: m.fmin, fmax: m.fmax, vals: b64bytes(m.rows) };
   c.cv = document.createElement("canvas"); c.cv.width = c.w; c.cv.height = c.n; c.ctx = c.cv.getContext("2d");
-  paintChunk(c);
+  paintChunk(c); c.ver = S.lutVer;
   S.chunks.set(key, c);
 }
-function repaintAll() { LUT = makeLUT(); for (const c of S.chunks.values()) paintChunk(c); }
+function repaintAll() { LUT = makeLUT(); S.lutVer++; }
+function autoScale() {                                     // follow what's on screen: noise floor (20th pct) .. peaks (99.8th)
+  if (!S.autoScale || !S.visible.length) return;
+  const v = [];
+  for (const c of S.visible) for (let i = 0; i < c.vals.length; i += 23) v.push(c.vals[i]);
+  if (v.length < 200) return;
+  v.sort((a, b) => a - b);
+  const lo = v[Math.floor(v.length * 0.20)], hi = Math.max(lo + 8, v[Math.floor(v.length * 0.998)]);
+  const nlo = S.smin + 0.35 * (lo - S.smin), nhi = S.smax + 0.35 * (hi - S.smax);
+  if (Math.abs(nlo - S.smin) >= 0.75 || Math.abs(nhi - S.smax) >= 0.75) { S.smin = nlo; S.smax = nhi; repaintAll(); }
+}
+setInterval(autoScale, 400);
 function evictChunks(top) {
   const keepFrom = top - 15 * 60, keepTo = top + 120;
   for (const [k, c] of S.chunks) if (c.t0 < keepFrom || c.t0 > keepTo) S.chunks.delete(k);
@@ -160,9 +174,12 @@ function draw() {
   const top = topTime(); if (top === null) return;
   const pps = S.pps * dpr, span = H / pps;
   ctx.imageSmoothingEnabled = false;
+  S.visible = []; let repaints = 0;
   for (const c of S.chunks.values()) {
     const tEnd = c.t0 + c.n * c.dt;
     if (tEnd < top - span || c.t0 > top) continue;
+    S.visible.push(c);
+    if (c.ver !== S.lutVer && repaints < 16) { paintChunk(c); c.ver = S.lutVer; repaints++; }
     const x0 = xOf(c.fmin), x1 = xOf(c.fmax);
     ctx.drawImage(c.cv, x0, (top - tEnd) * pps, x1 - x0, c.n * c.dt * pps + 0.6);
   }
@@ -356,55 +373,83 @@ $("#audioBtn").addEventListener("click", () => {
 });
 $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) master.gain.value = +e.target.value; });
 
-// ---------------- audio scope: waveform + scrolling spectrogram of what is playing ----------------
-const SCOPE = { an: null, img: null, col: 0 };
+// ---------------- audio scope: a lane per voice + log-frequency spectrogram of the mix ----------------
+const SCOPE = { an: null, img: null, lo: -100, hi: -40 };
 const scv = $("#scope"), sctx = scv.getContext("2d");
-function nowPlaying() {
-  const now = nowS(); let best = null;
-  for (const d of S.dets.values()) if (d.playing.some(([a, z]) => now >= a && now <= z) && (!best || d.box.conf > best.box.conf)) best = d;
-  return best;
+function playingVoices() {
+  const now = nowS(), out = [];
+  for (const d of S.dets.values()) if (d.playing.some(([a, z]) => now >= a && now <= z)) out.push(d);
+  return out.sort((a, b) => b.box.conf - a.box.conf).slice(0, 4);
 }
+const F_LO = 80, F_HI = 4000;
 function drawScope() {
-  if (!$("#scopeWrap").offsetParent) return;
   const dpr = devicePixelRatio, W = scv.clientWidth * dpr, H = scv.clientHeight * dpr;
+  if (!W || !H) return;
   if (scv.width !== W || scv.height !== H) { scv.width = W; scv.height = H; SCOPE.img = null; }
-  const waveW = Math.round(W * 0.28), specX = waveW + 8 * dpr, specW = W - specX;
+  const laneW = Math.round(W * 0.4), specX = laneW + 8 * dpr, specW = W - specX;
   const live = AC && AC.state === "running" && SCOPE.an;
-  // waveform
-  sctx.fillStyle = TH.bg; sctx.fillRect(0, 0, waveW, H);
-  sctx.strokeStyle = TH.grid; sctx.beginPath(); sctx.moveTo(0, H / 2); sctx.lineTo(waveW, H / 2); sctx.stroke();
-  if (live) {
-    const buf = new Float32Array(SCOPE.an.fftSize); SCOPE.an.getFloatTimeDomainData(buf);
-    sctx.strokeStyle = TH.mark; sctx.lineWidth = 1.2 * dpr; sctx.beginPath();
-    for (let i = 0; i < buf.length; i++) { const x = i / buf.length * waveW, y = H / 2 - buf[i] * H * 0.45; i ? sctx.lineTo(x, y) : sctx.moveTo(x, y); }
-    sctx.stroke();
-  }
-  // scrolling spectrogram, 0-4 kHz (the voice band), newest at the right
+  const voices = live ? playingVoices() : [];
+  // lanes: one waveform per voice that is playing right now
+  sctx.fillStyle = TH.bg; sctx.fillRect(0, 0, laneW, H);
+  sctx.font = `${10.5 * dpr}px ${TH.mono}`;
+  if (!voices.length) { sctx.strokeStyle = TH.grid; sctx.beginPath(); sctx.moveTo(0, H / 2); sctx.lineTo(laneW, H / 2); sctx.stroke(); }
+  const lh = H / Math.max(1, voices.length), buf = new Float32Array(1024);
+  voices.forEach((d, i) => {
+    const y0 = i * lh, mid = y0 + lh / 2;
+    if (i) { sctx.strokeStyle = TH.grid; sctx.beginPath(); sctx.moveTo(0, y0); sctx.lineTo(laneW, y0); sctx.stroke(); }
+    if (d.an) {
+      d.an.getFloatTimeDomainData(buf);
+      sctx.save(); sctx.globalAlpha = 0.45 + 0.55 * clamp01(d.box.conf); sctx.strokeStyle = TH.mark; sctx.lineWidth = 1.1 * dpr; sctx.beginPath();
+      for (let k = 0; k < buf.length; k++) { const x = k / buf.length * laneW, y = mid - buf[k] * lh * 0.42; k ? sctx.lineTo(x, y) : sctx.moveTo(x, y); }
+      sctx.stroke(); sctx.restore();
+    }
+    sctx.fillStyle = TH.text; sctx.fillText(`${fmtFshort((d.box.fmin + d.box.fmax) / 2)}  ${Math.round(d.box.conf * 100)}%`, 6 * dpr, y0 + 12 * dpr);
+  });
+  // spectrogram of the mix: log frequency axis (80 Hz-4 kHz), dB, automatic colour scaling
   if (!SCOPE.img || SCOPE.img.width !== Math.max(1, Math.round(specW)) || SCOPE.img.height !== H) {
     SCOPE.img = document.createElement("canvas"); SCOPE.img.width = Math.max(1, Math.round(specW)); SCOPE.img.height = H;
     const c = SCOPE.img.getContext("2d"); c.fillStyle = TH.bg; c.fillRect(0, 0, SCOPE.img.width, H);
   }
   const ic = SCOPE.img.getContext("2d");
-  ic.drawImage(SCOPE.img, -2, 0);                          // scroll left by 2 px per frame
+  ic.drawImage(SCOPE.img, -2, 0);                          // scroll left 2 px per frame
   const col = ic.createImageData(2, H);
   if (live) {
-    const bins = new Uint8Array(SCOPE.an.frequencyBinCount); SCOPE.an.getByteFrequencyData(bins);
-    const hzPerBin = AC.sampleRate / SCOPE.an.fftSize, maxBin = Math.min(bins.length - 1, Math.round(4000 / hzPerBin));
+    const db = new Float32Array(SCOPE.an.frequencyBinCount); SCOPE.an.getFloatFrequencyData(db);
+    const hz = AC.sampleRate / SCOPE.an.fftSize, colVals = new Float32Array(H);
     for (let y = 0; y < H; y++) {
-      const v = bins[Math.round((1 - y / H) * maxBin)] * 4;
-      for (let x = 0; x < 2; x++) { const o = (y * 2 + x) * 4; col.data[o] = LUT[v]; col.data[o + 1] = LUT[v + 1]; col.data[o + 2] = LUT[v + 2]; col.data[o + 3] = 255; }
+      const f = F_LO * Math.pow(F_HI / F_LO, 1 - y / H);
+      colVals[y] = db[Math.min(db.length - 1, Math.round(f / hz))];
+    }
+    const sorted = Array.from(colVals).filter(Number.isFinite).sort((a, b) => a - b);
+    if (sorted.length && sorted[sorted.length - 1] > -140) {   // adapt the colour range to the signal, slowly
+      const p20 = sorted[Math.floor(sorted.length * 0.2)], p99 = sorted[Math.floor(sorted.length * 0.99)];
+      SCOPE.lo += 0.03 * (p20 - SCOPE.lo);
+      SCOPE.hi += (p99 > SCOPE.hi ? 0.2 : 0.02) * (p99 - SCOPE.hi);
+    }
+    const span = Math.max(12, SCOPE.hi - SCOPE.lo), cm = makeColLUT();
+    for (let y = 0; y < H; y++) {
+      const v = Math.max(0, Math.min(255, Math.round((colVals[y] - SCOPE.lo) / span * 255))) * 4;
+      for (let x = 0; x < 2; x++) { const o = (y * 2 + x) * 4; col.data[o] = cm[v]; col.data[o + 1] = cm[v + 1]; col.data[o + 2] = cm[v + 2]; col.data[o + 3] = 255; }
     }
   } else for (let i = 0; i < col.data.length; i += 4) { col.data[i] = col.data[i + 1] = col.data[i + 2] = 0; col.data[i + 3] = 255; }
   ic.putImageData(col, SCOPE.img.width - 2, 0);
   sctx.drawImage(SCOPE.img, specX, 0);
-  sctx.font = `${10.5 * dpr}px ${TH.mono}`; sctx.fillStyle = TH.text;
-  for (const k of [1, 2, 3]) { const y = H - k / 4 * H; sctx.fillText(k + " kHz", specX + 4 * dpr, y + 4 * dpr); }
-  // caption
-  const d = nowPlaying(), cap = $("#scopeCap");
-  const text = !live ? "Audio is off. Enable audio to hear and see playback." :
-    d ? `${fmtFshort((d.box.fmin + d.box.fmax) / 2)} · ${clockTime(d.box.t0)} · ${Math.round(d.box.conf * 100)}%${S.tx.get(d.box.id) && S.tx.get(d.box.id).text ? " · “" + S.tx.get(d.box.id).text + "”" : ""}`
-      : S.paused ? "Paused" : "Silence";
+  sctx.fillStyle = TH.text;
+  for (const [f, lab] of [[100, "100"], [300, "300"], [1000, "1k"], [3000, "3k"]]) {
+    const y = H * (1 - Math.log(f / F_LO) / Math.log(F_HI / F_LO));
+    sctx.fillText(lab, specX + 4 * dpr, y + 4 * dpr);
+  }
+  // caption: only when it says something
+  const d = voices[0], cap = $("#scopeCap");
+  const text = !AC || AC.state !== "running" ? "Audio is off. Enable audio to hear and see playback."
+    : d && S.tx.get(d.box.id) && S.tx.get(d.box.id).text ? `“${S.tx.get(d.box.id).text}”` : S.paused ? "Paused" : "";
   if (cap.textContent !== text) cap.textContent = text;
+}
+let COLLUT = null, COLLUT_KEY = "";
+function makeColLUT() {                                    // the colour map at full range (the scope scales itself)
+  if (COLLUT_KEY === S.cmap) return COLLUT;
+  const keep = [S.smin, S.smax]; S.smin = 0; S.smax = 255; COLLUT = makeLUT(); [S.smin, S.smax] = keep; COLLUT_KEY = S.cmap;
+  return COLLUT;
 }
 
 // Playback scheduler: every detection plays when the playhead reaches it. Audio comes from the
@@ -431,7 +476,11 @@ function playAt(d, buf, tStart, rate) {                     // buf: AudioBuffer 
   d.playing.push([Math.max(when, now), when + dur]); if (d.playing.length > 300) d.playing.shift();
   if (!AC || AC.state !== "running") return;
   const src = AC.createBufferSource(); src.buffer = buf.duration !== undefined ? buf : pcmBuffer(buf, rate);
-  src.connect(streamOut()); src.start(AC.currentTime + Math.max(0, when - now), skip);
+  if (!d.vnode) {                                          // one analyser per voice, so each can be drawn on its own
+    d.vnode = AC.createGain(); d.an = AC.createAnalyser(); d.an.fftSize = 1024;
+    d.vnode.connect(d.an); d.an.connect(streamOut());
+  }
+  src.connect(d.vnode); src.start(AC.currentTime + Math.max(0, when - now), skip);
   PB.sources.push(src); src.onended = () => { const i = PB.sources.indexOf(src); if (i >= 0) PB.sources.splice(i, 1); };
 }
 function restartPlayback() {
@@ -671,7 +720,9 @@ function buildTop() {
   if (document.activeElement !== $("#freq")) $("#freq").value = (sdr.center_hz / 1e6).toFixed(4);
   const rates = RATES[src].length ? [...RATES[src]] : [sdr.sample_rate];
   if (!rates.includes(sdr.sample_rate)) rates.push(sdr.sample_rate);
-  $("#rate").replaceChildren(...rates.map(r => el("option", { value: r }, `${+(r / 1e6).toFixed(3)} MS/s`)));
+  $("#rate").replaceChildren(...rates.map(r => el("option", { value: r }, `${+(r / 1e6).toFixed(3)} MHz span`)));
+  const lo = sdr.fmin_hz ?? sdr.center_hz - sdr.sample_rate / 2, hi = sdr.fmax_hz ?? sdr.center_hz + sdr.sample_rate / 2;
+  $("#range").textContent = `${(Math.max(0, lo) / 1e6).toFixed(3)} – ${(hi / 1e6).toFixed(3)} MHz`;
   $("#rate").value = sdr.sample_rate; $("#rate").disabled = src === "file";
   const g = $("#gain");
   g.max = src === "rtlsdr" ? 49.6 : 102; g.step = src === "rtlsdr" ? 0.1 : 2; g.value = sdr.gain_db ?? 36; g.disabled = src === "file"; fillRange(g);
@@ -715,10 +766,7 @@ $("#rate").addEventListener("change", e => { patch({ sdr: { sample_rate: +e.targ
 $("#gain").addEventListener("input", e => { fillRange(e.target); gainLabel(); });
 $("#gain").addEventListener("change", e => patch({ sdr: { gain_db: +e.target.value } }, 50));
 $("#amp").addEventListener("click", () => { patch({ sdr: { amp: !S.cfg.sdr.amp } }, 50); buildTop(); });
-$("#preset").addEventListener("change", async e => {
-  const name = e.target.value; e.target.value = ""; if (!name) return;
-  await fetch("/api/preset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-});
+
 
 // ---------------- detector tab ----------------
 function buildDetector() {
@@ -841,9 +889,29 @@ async function buildSDR() {
   });
   const themeSel = el("select", { class: "sel" }, ...THEMES.map(([k, l]) => el("option", { value: k }, l)));
   { const t = lsGet("gb_theme", "instrument"); themeSel.value = THEMES.some(([k]) => k === t) ? t : "instrument"; } themeSel.addEventListener("change", () => setTheme(themeSel.value));
+  const presetSel = el("select", { class: "sel" }, el("option", { value: "" }, "Choose…"), ...Object.entries(S.presets).map(([k, v]) => el("option", { value: k }, v)));
+  presetSel.addEventListener("change", async () => {
+    const name = presetSel.value; if (!name) return;
+    await fetch("/api/preset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    presetSel.value = "";
+  });
+  const mkScale = (label, key, init) => {
+    const out = el("output", {}, String(Math.round(init)));
+    const inp = el("input", { type: "range", min: 0, max: 255, step: 1, value: Math.round(init), disabled: S.autoScale }); fillRange(inp);
+    inp.addEventListener("input", () => { fillRange(inp); out.textContent = inp.value;
+      if (key === "min") S.smin = Math.min(+inp.value, S.smax - 1); else S.smax = Math.max(+inp.value, S.smin + 1);
+      saveScale(); repaintAll(); });
+    return el("div", { class: "row" }, el("label", {}, label), inp, out);
+  };
   root.append(
+    el("h2", {}, "Presets"),
+    rowW("Band preset", presetSel),
     el("h2", {}, "Appearance"),
     rowW("Theme (this browser)", themeSel),
+    el("div", { class: "row wide" }, el("label", {}, "Automatic waterfall brightness"), toggle(S.autoScale, v => {
+      S.autoScale = v; lsSet("gb_autoscale", v ? "1" : "0"); if (!v) loadScale(); repaintAll(); buildSDR(); })),
+    mkScale("Waterfall minimum", "min", S.smin),
+    mkScale("Waterfall maximum", "max", S.smax),
     el("h2", {}, "Analysis range"),
     rowW("From (MHz, blank = whole capture)", fmin), rowW("To (MHz, blank = whole capture)", fmax),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { fmin_hz: fmin.value === "" ? null : +fmin.value * 1e6, fmax_hz: fmax.value === "" ? null : +fmax.value * 1e6 } }) }, "Apply range")),
@@ -880,17 +948,9 @@ async function buildSDR() {
 // ---------------- waterfall toolbar ----------------
 function loadScale() {
   const sc = JSON.parse(lsGet("gb_scale_" + S.view, "null") || "null") || { min: 0, max: 255 };
-  S.smin = sc.min; S.smax = sc.max; $("#smin").value = S.smin; $("#smax").value = S.smax; fillRange($("#smin")); fillRange($("#smax"));
+  S.smin = sc.min; S.smax = sc.max;
 }
 const saveScale = () => lsSet("gb_scale_" + S.view, JSON.stringify({ min: S.smin, max: S.smax }));
-$("#smin").addEventListener("input", e => { fillRange(e.target); S.smin = Math.min(+e.target.value, S.smax - 1); saveScale(); repaintAll(); });
-$("#smax").addEventListener("input", e => { fillRange(e.target); S.smax = Math.max(+e.target.value, S.smin + 1); saveScale(); repaintAll(); });
-$("#sreset").addEventListener("click", () => {
-  const v = []; for (const c of S.chunks.values()) for (let i = 0; i < c.vals.length; i += 13) v.push(c.vals[i]);
-  if (!v.length) return; v.sort((a, b) => a - b);
-  S.smin = v[Math.floor(v.length * 0.02)]; S.smax = Math.max(S.smin + 1, v[Math.floor(v.length * 0.998)]);
-  $("#smin").value = S.smin; $("#smax").value = S.smax; fillRange($("#smin")); fillRange($("#smax")); saveScale(); repaintAll();
-});
 $("#cmap").value = S.cmap;
 $("#cmap").addEventListener("change", e => setCmap(e.target.value));
 $("#minConf").value = Math.round(S.minConf * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(S.minConf * 100) + "%";
@@ -902,8 +962,7 @@ function setMinConf(v) {
 }
 $("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
 $("#caps").checked = lsGet("gb_caps", "1") === "1";
-$("#scopeOn").checked = lsGet("gb_scope", "1") === "1"; $("#scopeWrap").style.display = $("#scopeOn").checked ? "" : "none";
-$("#scopeOn").addEventListener("change", e => { lsSet("gb_scope", e.target.checked ? "1" : "0"); $("#scopeWrap").style.display = e.target.checked ? "" : "none"; });
+
 $("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
 let WS = null;
 function setView(mode) {
@@ -955,7 +1014,7 @@ function connect() {
         $("#view").replaceChildren(...m.views.map(v => el("option", { value: v.id }, v.label)));
         if (!m.views.some(v => v.id === S.view)) S.view = "power";
         $("#view").value = S.view; loadScale(); LUT = makeLUT();
-        $("#preset").replaceChildren(el("option", { value: "" }, "Presets…"), ...Object.entries(m.presets).map(([k, v]) => el("option", { value: k }, v)));
+
         setStatus(m.status || {});
         for (const b of m.detections) S.dets.set(b.id, { box: b, ended: false, playing: [], pcm: [] });
         buildTop(); buildDetector(); loadPage(true);

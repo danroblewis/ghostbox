@@ -163,12 +163,11 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
       <button id="fright" class="icon" title="Up two window widths"><svg viewBox="0 0 12 10"><path d="M1 1l5 4-5 4zM6 1l5 4-5 4z"/></svg></button>
     </div>
   </div>
-  <div class="grp"><select id="rate" class="sel" title="Sample rate (= bandwidth)"></select></div>
+  <div class="grp"><select id="rate" class="sel" title="Span: how wide a slice of spectrum is captured (= sample rate)"></select><span id="range" class="num t2"></span></div>
   <div class="grp">
     <label for="gain">Gain</label><input id="gain" type="range" min="0" max="102" step="2" style="width:100px"><span id="gainVal" class="gainval"></span>
     <button id="amp" class="btn" title="HackRF RF amplifier (+14 dB)">Amp</button>
   </div>
-  <div class="grp"><select id="preset" class="sel" style="width:140px"><option value="">Presets</option></select></div>
   <span id="status">Connecting…</span>
   <div class="grp">
     <button id="pp" class="btn icon" title="Pause playback (Space)"><svg viewBox="0 0 8 8"><path d="M1.2 1h2v6h-2zM4.8 1h2v6h-2z"/></svg></button>
@@ -179,15 +178,10 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
 <main>
   <section id="left">
     <div id="wfbar">
-      <span class="lbl">View</span><select id="view" class="sel"></select>
-      <span class="lbl">Colour map</span>
-      <select id="cmap" class="sel"><option value="magma">Magma</option><option value="viridis">Viridis</option><option value="gray">Greyscale</option><option value="red">Red (night)</option></select>
-      <span class="lbl">Min</span><input id="smin" type="range" min="0" max="254" step="1" value="0">
-      <span class="lbl">Max</span><input id="smax" type="range" min="1" max="255" step="1" value="255">
-      <button id="sreset" class="btn">Auto</button>
+      <select id="view" class="sel" title="What the waterfall shows"></select>
+      <select id="cmap" class="sel" title="Colour map"><option value="magma">Magma</option><option value="viridis">Viridis</option><option value="gray">Greyscale</option><option value="red">Red (night)</option></select>
       <span class="lbl" style="margin-left:6px">Min confidence</span><input id="minConf" type="range" min="0" max="100" step="1" style="width:120px"><span id="minConfOut" class="num t2" style="min-width:34px"></span>
       <label class="lbl" style="display:flex;align-items:center;gap:6px"><span class="switch"><input id="caps" type="checkbox" checked><span></span></span>Captions</label>
-      <label class="lbl" style="display:flex;align-items:center;gap:6px"><span class="switch"><input id="scopeOn" type="checkbox" checked><span></span></span>Audio scope</label>
     </div>
     <div id="wfwrap">
       <canvas id="wf"></canvas><div id="tip"></div>
