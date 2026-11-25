@@ -1036,6 +1036,9 @@ async function renderSurvey() {
   const m = SV.meta, map = $("#svMap"); if (!m || !map) return;
   const gen = SV.gen = (SV.gen || 0) + 1;                  // only the newest render draws (images load async)
   const parts = (m.steps.length ? await surveyImage(surveyView()) : null) || [];
+  // fetch the previews before touching the canvas: clearing first and drawing after the downloads
+  // shows an empty frame (a flash) on every refresh
+  const pvs = await Promise.all((m.previews || []).map(async pv => ({ pv, c: await surveyPreview(pv.i, pv.cols) })));
   if (!$("#svMap") || gen !== SV.gen) return;
   const dpr = devicePixelRatio || 1, W = map.clientWidth;
   map.width = W * dpr; map.height = map.clientHeight * dpr;
@@ -1048,14 +1051,12 @@ async function renderSurvey() {
     g.imageSmoothingEnabled = (X(b) - X(a)) / sw < 3;      // crisp columns when zoomed in
     g.drawImage(c, sx, 0, Math.max(0.5, sw), c.height, X(a), 0, X(b) - X(a), map.height);
   }
-  for (const pv of m.previews || []) {                     // steps still being recorded or processed
-    const a = Math.max(pv.lo, SV.v0), b = Math.min(pv.hi, SV.v1); if (b <= a) continue;
-    const c = await surveyPreview(pv.i, pv.cols); if (!c || gen !== SV.gen) continue;
+  for (const { pv, c } of pvs) {                           // steps still being recorded or processed
+    const a = Math.max(pv.lo, SV.v0), b = Math.min(pv.hi, SV.v1); if (b <= a || !c) continue;
     const sx = (a - pv.lo) / (pv.hi - pv.lo) * pv.cols, sw = (b - a) / (pv.hi - pv.lo) * pv.cols;
     g.imageSmoothingEnabled = (X(b) - X(a)) / sw < 3;
     g.drawImage(c, sx, 0, Math.max(0.5, sw), c.height, X(a), 0, X(b) - X(a), map.height);
   }
-  if (gen !== SV.gen) return;
   g.strokeStyle = "rgba(255,255,255,.14)"; g.lineWidth = dpr;
   for (const st of [...m.steps, ...(m.previews || [])]) { const x = X(st.lo); if (x > 0 && x < map.width) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, map.height); g.stroke(); } }
   // detector picks as boxes, filtered by Min confidence
