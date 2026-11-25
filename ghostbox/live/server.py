@@ -18,6 +18,7 @@ from aiohttp import WSMsgType, web
 from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
 from .engine import Engine
+from .transcribe import strip_stock
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = Path(__file__).parent / "static"
@@ -290,6 +291,13 @@ def make_app(args):
             m["confidence"] = {k: v for k, v in m["confidence"].items() if k != "history"}
             metas.append(m)
         metas.sort(key=lambda m: m.get("utc_start", ""), reverse=True)
+        for m in metas:                                    # older saves: drop Whisper's stock phrases too
+            for f in ("transcript", "chain_transcript"):
+                t = m.get(f)
+                if t and t.get("text") and "filtered" not in t:
+                    clean = strip_stock(t["text"])
+                    if clean != t["text"]:
+                        m[f] = {**t, "text": clean, "filtered": t["text"], **({"no_speech_prob": 1.0} if not clean else {})}
         q = q.strip().lower()
         out, matched = [], 0
         for m in metas:

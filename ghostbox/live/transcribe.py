@@ -35,11 +35,18 @@ STOCK = {"you", "thank you", "thanks", "thank you very much", "thanks for watchi
          "subtitles by the amara.org community", "thanks for watching and see you next time", "see you next time"}
 
 
+def strip_stock(text):
+    """Remove stock sentences ("The end.", "Thank you.") wherever they appear; keep the rest."""
+    parts = re.split(r"(?<=[.!?…])\s+", text.strip())
+    keep = [p for p in parts if p and not is_stock_phrase(p)]
+    return " ".join(keep).strip()
+
+
 def is_stock_phrase(text):
     t = re.sub(r"[^a-z' .]+", " ", text.lower()).replace(".", " ")
     t = " ".join(t.split())
-    if not t:
-        return True
+    if not t:                                              # no Latin words: filler only if it has no letters
+        return not any(ch.isalpha() for ch in text)       # at all ("...", "100,000"); other scripts are kept
     words = t.split()
     if len(set(words)) == 1 and len(words) > 1:            # "you you you", "the the the"
         return True
@@ -170,11 +177,12 @@ class Transcriber:
         out = []
         for i in range(len(items)):
             probs = [p for p in nsp[i] if p is not None]
-            text = " ".join(texts[i]).strip()
+            raw = " ".join(texts[i]).strip()
+            text = strip_stock(raw)                        # Whisper's training-data filler is dropped
             nsp_i = float(np.mean(probs)) if probs else (0.5 if texts[i] else 1.0)
-            if is_stock_phrase(text):                      # Whisper's training-data filler: shown dimmed
-                nsp_i = max(nsp_i, 0.95)
-            out.append({"text": text, "no_speech_prob": nsp_i,
+            if not text:
+                nsp_i = 1.0
+            out.append({"text": text, "no_speech_prob": nsp_i, **({"filtered": raw} if raw != text else {}),
                         "language": info.language, "model": cfg["model"]})
         return out
 
