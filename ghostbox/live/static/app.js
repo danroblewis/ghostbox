@@ -362,7 +362,7 @@ async function loadRecs() {
 function recCard(m) {
   const f = m.freq_hz || {};
   return el("div", { class: "card" },
-    el("h3", {}, el("span", {}, `#${m.id}${m.segment ? "." + m.segment : ""} · ${fmtF(f.mean || 0)}`), el("span", { class: "mono muted" }, (m.utc_start || "").replace("T", " ").slice(0, 19))),
+    el("h3", {}, el("span", {}, `#${m.id}${m.segment ? "." + m.segment : ""} · ${fmtF(f.mean || 0)}`, m.demo ? el("span", { class: "stage", title: m.demo, style: "margin-left:6px" }, "demo") : ""), el("span", { class: "mono muted" }, (m.utc_start || "").replace("T", " ").slice(0, 19))),
     el("div", { class: "muted mono" }, `${m.duration_s}s · conf max ${(m.confidence.max * 100).toFixed(0)}% · final ${(m.confidence.final * 100).toFixed(0)}%${f.max - f.min > 500 ? ` · slid ${((f.max - f.min) / 1e3).toFixed(1)} kHz` : ""}${m.chain !== m.id ? ` · hop-chain #${m.chain}` : ""}`),
     el("audio", { controls: "", preload: "none", src: "/rec/" + m.files.wav }),
     el("div", { class: "row" }, el("a", { href: "/rec/" + m.files.wav, download: "" }, "wav"), " ",
