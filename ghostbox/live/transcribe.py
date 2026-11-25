@@ -1,4 +1,4 @@
-"""Local Whisper transcription (faster-whisper) for finished detections and hop chains.
+"""Local speech recognition for finished detections and hop chains (engines: see asr.py).
 
 One model is loaded once, in-process, and kept resident (reloaded only if the model name or
 thread settings change). A small pool of worker threads shares it; each worker transcribes a
@@ -23,8 +23,9 @@ import re
 
 import numpy as np
 
+from . import asr
+
 FS = 16000
-GAP = np.zeros(FS // 2, np.float32)
 
 
 
@@ -117,12 +118,10 @@ class Transcriber:
         key = (cfg["model"], int(cfg.get("cpu_threads", 8)), int(cfg.get("workers", 2)))
         with self._model_lock:
             if self._model_key != key:
-                from faster_whisper import BatchedInferencePipeline, WhisperModel
-                self.model = WhisperModel(cfg["model"], device="cpu", compute_type="int8",
-                                          cpu_threads=key[1], num_workers=key[2])
-                self.pipe = BatchedInferencePipeline(model=self.model)
+                self.model = None                           # free the old one before loading the next
+                self.model = asr.load(cfg["model"], cpu_threads=key[1], workers=key[2])
                 self.model_name, self._model_key = cfg["model"], key
-            return self.pipe
+            return self.model
 
     # ---------------- workers ----------------
     def _run(self, idx):
@@ -156,34 +155,14 @@ class Transcriber:
                 self.busy -= 1
 
     def _transcribe(self, items, cfg):
-        pipe = self._load(cfg)
+        eng = self._load(cfg)
         lang = None if cfg["language"] in ("", "auto") else cfg["language"]
-        parts, spans, t = [], [], 0.0
-        for it in items:                                   # each clip gets its own 30 s window
-            a = it["audio"].astype(np.float32)
-            a = a / (np.abs(a).max() + 1e-9) * 0.9
-            spans.append((t, t + len(a) / FS))
-            parts += [a, GAP]
-            t += len(a) / FS + len(GAP) / FS
-        segs, info = pipe.transcribe(np.concatenate(parts), batch_size=max(1, len(items)), beam_size=1,
-                                     language=lang, without_timestamps=True,
-                                     clip_timestamps=[{"start": a, "end": b} for a, b in spans])
-        texts, nsp = [[] for _ in items], [[] for _ in items]
-        for s in segs:
-            i = min(range(len(spans)), key=lambda k: abs(spans[k][0] - s.start))
-            if s.text.strip():
-                texts[i].append(s.text.strip())
-            nsp[i].append(getattr(s, "no_speech_prob", None))
         out = []
-        for i in range(len(items)):
-            probs = [p for p in nsp[i] if p is not None]
-            raw = " ".join(texts[i]).strip()
-            text = strip_stock(raw)                        # Whisper's training-data filler is dropped
-            nsp_i = float(np.mean(probs)) if probs else (0.5 if texts[i] else 1.0)
-            if not text:
-                nsp_i = 1.0
-            out.append({"text": text, "no_speech_prob": nsp_i, **({"filtered": raw} if raw != text else {}),
-                        "language": info.language, "model": cfg["model"]})
+        for it, (raw, doubt) in zip(items, eng.transcribe([it["audio"] for it in items], lang)):
+            text = strip_stock(raw)                        # training-data filler ("The end.") is dropped
+            out.append({"text": text, "no_speech_prob": 1.0 if not text else float(doubt),
+                        **({"filtered": raw} if raw != text else {}),
+                        "language": eng.language, "model": cfg["model"]})
         return out
 
     def _deliver(self, item, res):

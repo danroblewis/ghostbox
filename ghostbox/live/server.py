@@ -19,6 +19,7 @@ from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
 from .engine import Engine
 from .transcribe import strip_stock
+from .asr import MODELS as ASR_MODELS
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = Path(__file__).parent / "static"
@@ -140,6 +141,7 @@ def make_app(args):
         eng = state["engine"]
         await sock.send_str(json.dumps({
             "type": "hello", "config": config.get(), "checks": CHECKS, "views": VIEWS,
+            "asr_models": [[k, v[2]] for k, v in ASR_MODELS.items()],
             "presets": {k: v["label"] for k, v in PRESETS.items()},
             "sensitivity": SENSITIVITY, "epoch": eng.t_origin,
             "status": eng.status, "detections": eng.snapshot(),

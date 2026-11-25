@@ -153,7 +153,7 @@ DEFAULT = {
     "display": {"width": 1200, "dyn_range_db": 60.0, "history_min": 20},
     "whisper": {
         "enabled": True,
-        "model": "base",                    # tiny | base | small | medium
+        "model": "base",                    # an id from asr.MODELS (Whisper, Moonshine, wav2vec2, Vosk)
         "language": "auto",                 # auto or an ISO code (en, es, ...)
         "min_confidence": 0.55,             # only transcribe detections that reached this confidence
         "chains": True,                     # also transcribe a whole hop chain stitched together

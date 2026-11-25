@@ -813,10 +813,9 @@ function buildDetector() {
   const w = c.whisper, ws = S.status.whisper || {};
   root.append(el("h2", {}, "Transcription"),
     el("div", { class: "card" + (w.enabled ? "" : " off") },
-      el("div", { class: "hd" }, toggle(w.enabled, v => { patch({ whisper: { enabled: v } }); buildDetector(); }), "Whisper (local)", el("span", { class: "tag" }, ws.model ? `loaded ${ws.model}` : "loads on first use")),
-      el("div", { class: "desc" }, "Transcribes each finished detection. Whisper invents words from noise; doubtful ones are shown dimmed."),
-      selectRow("Model", ["tiny", "base", "small", "medium"], w.model, v => patch({ whisper: { model: v } })),
-      selectRow("Language", ["auto", "en", "es", "fr", "de", "it", "pt", "ja", "zh"], w.language, v => patch({ whisper: { language: v } })),
+      el("div", { class: "hd" }, toggle(w.enabled, v => { patch({ whisper: { enabled: v } }); buildDetector(); }), "Speech recognition (local)", el("span", { class: "tag" }, ws.model ? `loaded ${ws.model}` : "loads on first use")),
+      selectRow("Model", S.asrModels || [[w.model, w.model]], w.model, v => patch({ whisper: { model: v } })),
+      ...(/^(tiny|base|small|medium|large)/.test(w.model) ? [selectRow("Language", ["auto", "en", "es", "fr", "de", "it", "pt", "ja", "zh"], w.language, v => patch({ whisper: { language: v } }))] : []),
       slider("Only above confidence", ["whisper", "min_confidence"], 0, 1, 0.01, v => v.toFixed(2)),
       el("div", { class: "row wide" }, el("label", {}, "Also transcribe whole hop chains"), toggle(w.chains, v => patch({ whisper: { chains: v } }))),
       slider("Workers (share one loaded model)", ["whisper", "workers"], 1, 4, 1),
@@ -1099,7 +1098,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello": {
-        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch;
+        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models;
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
         if (m.reset && m.reset.fmax) { S.fmin = m.reset.fmin; S.fmax = m.reset.fmax; }
