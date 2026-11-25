@@ -198,6 +198,70 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .err{color:var(--alarm);font-size:12px}
 @media (max-width:980px){main{grid-template-columns:1fr;grid-template-rows:58vh auto}#side{border-left:0;border-top:1px solid var(--line);min-height:70vh}
   #top,#wfbar{height:auto;min-height:46px;flex-wrap:wrap;padding:6px 12px}#status{flex-basis:100% !important;text-align:left}}
+
+/* ---------- phone ("field") layout: body.field ---------- */
+.fieldonly{display:none}
+body.field .fieldonly{display:flex}
+body.field #top{height:48px;min-height:48px;flex-wrap:nowrap;padding:0 8px;gap:6px}
+body.field #top #grpRate,body.field #top #grpGain,body.field #top #fleft,body.field #top #fright,
+body.field #top #status,body.field #top #pp,body.field #top #vol,body.field #top #helpBtn{display:none}
+body.field #top .freq{width:96px;font-size:15px}
+body.field #top #menuBtn{margin-left:auto;width:40px;height:36px}
+body.field #top #menuBtn svg{width:16px;height:16px}
+body.field main{display:block;overflow-y:auto;-webkit-overflow-scrolling:touch}
+body.field #left #wfbar,body.field #scopeWrap{display:none}
+body.field #wfwrap{height:34vh;min-height:190px;flex:none}
+body.field #side{border:0;min-height:0}
+body.field #side .tabs{display:none}
+body.field #side .tab{overflow:visible}
+#fieldNow{flex-direction:column;gap:8px;padding:12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--panel)}
+#leds{display:grid;grid-template-columns:repeat(12,1fr);gap:4px;height:18px}
+#leds i{border-radius:2px;opacity:.13;transition:opacity .12s}
+#leds i.on{opacity:1}
+#nowLine{display:flex;justify-content:space-between;align-items:baseline;font-size:15px}
+#nowConf{color:var(--mark);font-size:15px}
+#nowText{min-height:2.6em;font-size:19px;line-height:1.3;overflow-wrap:anywhere}
+#nowText .prev{display:block;font-size:13px;color:var(--text-3);line-height:1.35}
+#nowText .doubt{color:var(--text-3)}
+#fieldCtl{display:flex;gap:10px;align-items:center}
+.btn.big{height:44px;padding:0 18px;font-size:15px}
+#fieldCtl input{flex:1;min-width:60px}
+#fMark.flash{border-color:var(--mark);color:var(--mark)}
+body.field .det{height:44px}
+/* sheets: the Detector / Settings tab full-screen */
+.sheethead{display:none}
+body.field.sheet #side{position:fixed;inset:0;z-index:45}
+body.field.sheet .sheethead{display:flex;align-items:center;gap:10px;height:48px;padding:0 12px;border-bottom:1px solid var(--line);flex:none}
+body.field.sheet #side .tab.active{overflow-y:auto}
+body.field #survey{position:fixed;inset:0;z-index:40}
+body.field .svhead{flex-wrap:wrap;height:auto;row-gap:6px}
+/* menu */
+#fieldMenu{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center}
+#fieldMenu .dlg{width:100%;max-width:560px;border-radius:10px 10px 0 0;max-height:88vh;overflow-y:auto}
+#fieldMenu h3{font-size:12px;font-weight:600;color:var(--text-2);margin:14px 0 6px}
+#fieldMenu .mrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+#fieldMenu .mrow .grp{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#fieldMenu #wfbar{display:flex;flex-wrap:wrap;height:auto;gap:8px;padding:0;border:0;background:none;white-space:normal}
+#fieldMenu .mbtns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
+#fieldMenu .mbtns .btn{height:44px;justify-content:center}
+#fieldMenu #wfbar{overflow:visible}
+#fieldMenu #wfbar>*{max-width:100%}
+#fieldMenu .mrow>*{min-width:0;max-width:100%}
+#fieldMenu #wfbar{flex:1 1 100%}
+#fieldMenu #view{flex:1 1 100%;min-width:0}
+#fieldMenu #minConf{flex:1;min-width:120px}
+#fieldMenu #mapBtn{display:none}
+body.field .kbdhint{display:none}
+body.field .abseg{flex-wrap:wrap}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;background:var(--panel);border:1px solid var(--line-strong);padding:8px 14px;border-radius:var(--radius);font-size:14px}
+/* dialogs fill a phone screen */
+@media (max-width:760px){
+  #detail,#helpWrap,#newSurvey{padding:0;align-items:stretch}
+  #detail .dlg,#helpWrap .dlg{min-height:100%;border:0;border-radius:0;padding:10px 12px 20px}
+  #detail .dlghead,#helpWrap .dlghead{position:sticky;top:0;background:var(--panel);z-index:2;padding:6px 0}
+  .dlgspec{height:130px}
+  .dlgacts .btn,.abrow .btn{height:36px}
+}
 </style>
 <link id="themeCss" rel="stylesheet" href="/static/themes/instrument.css">
 <script>
@@ -222,8 +286,8 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
       <button id="fright" class="icon" title="Up two window widths"><svg viewBox="0 0 12 10"><path d="M1 1l5 4-5 4zM6 1l5 4-5 4z"/></svg></button>
     </div>
   </div>
-  <div class="grp"><select id="rate" class="sel" title="Span: how wide a slice of spectrum is captured (= sample rate)"></select><span id="range" class="num t2"></span></div>
-  <div class="grp">
+  <div class="grp" id="grpRate"><select id="rate" class="sel" title="Span: how wide a slice of spectrum is captured (= sample rate)"></select><span id="range" class="num t2"></span></div>
+  <div class="grp" id="grpGain">
     <label for="gain">Gain</label><input id="gain" type="range" min="0" max="102" step="2" style="width:100px"><span id="gainVal" class="gainval"></span>
     <button id="amp" class="btn" title="HackRF RF amplifier (+14 dB)">Amp</button>
     <button id="mapBtn" class="btn" title="Survey map: the ranges you surveyed and what the detector found there">Map</button>
@@ -233,6 +297,7 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
     <button id="pp" class="btn icon" title="Pause playback (Space)"><svg viewBox="0 0 8 8"><path d="M1.2 1h2v6h-2zM4.8 1h2v6h-2z"/></svg></button>
     <input id="vol" type="range" min="0" max="1.5" step="0.05" value="0.9" style="width:72px" title="Volume">
     <button id="helpBtn" class="btn icon" title="How to use this">?</button>
+    <button id="menuBtn" class="btn icon fieldonly" title="Menu"><svg viewBox="0 0 10 10"><path d="M1 2h8M1 5h8M1 8h8" stroke="currentColor" stroke-width="1.2" fill="none"/></svg></button>
   </div>
 </header>
 <main>
@@ -250,12 +315,23 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
         <button id="liveBtn" class="btn primary" style="display:none">Return to live</button>
       </div>
     </div>
+    <div id="fieldNow" class="fieldonly">
+      <div id="leds" title="Confidence of what's being heard"></div>
+      <div id="nowLine"><span id="nowFreq" class="num">Listening…</span><span id="nowConf" class="num"></span></div>
+      <div id="nowText"></div>
+      <div id="fieldCtl">
+        <button id="fPause" class="btn big">Pause</button>
+        <button id="fMark" class="btn big" title="Bookmark this moment">Mark</button>
+        <input id="fVol" type="range" min="0" max="1.5" step="0.05" title="Volume">
+      </div>
+    </div>
     <div id="scopeWrap">
       <div id="scopeCap"></div>
       <canvas id="scope"></canvas>
     </div>
   </section>
   <aside id="side">
+    <div class="sheethead"><strong id="sheetTitle"></strong><span style="flex:1"></span><button class="btn" id="sheetClose">Done</button></div>
     <div class="tabs">
       <button data-tab="dets" class="active">Detections</button>
       <button data-tab="detector">Detector</button>

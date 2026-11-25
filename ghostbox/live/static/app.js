@@ -201,11 +201,19 @@ function draw() {
     const y = (top - t) * pps; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
     if (y > 30 * dpr) ctx.fillText(clockTime(t), 6 * dpr, y - 4 * dpr);
   }
-  const step = niceStep((S.fmax - S.fmin) / 7);
+  const step = niceStep((S.fmax - S.fmin) / Math.max(2, Math.min(7, cv.clientWidth / 120)));   // fewer labels on narrow screens
   for (let f = Math.ceil(S.fmin / step) * step; f <= S.fmax; f += step) {
     const x = xOf(f); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
     ctx.fillText(fmtFshort(f), x + 4 * dpr, 14 * dpr);
   }
+  // marks: moments someone bookmarked
+  ctx.save(); ctx.setLineDash([6 * dpr, 4 * dpr]); ctx.strokeStyle = TH.text; ctx.fillStyle = TH.text; ctx.globalAlpha = 0.8; ctx.lineWidth = dpr;
+  for (const m of S.marks || []) {
+    const y = (top - m.t) * pps; if (y < 0 || y > H) continue;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.fillText("Mark " + clockTime(m.t), W - 110 * dpr, y - 4 * dpr);
+  }
+  ctx.restore();
   // detections
   const now = nowS(), chains = new Map();
   for (const d of S.dets.values()) {
@@ -708,6 +716,7 @@ function replaceRecRow(r) {
 function onTranscript(m) {
   const res = { text: m.text, no_speech_prob: m.no_speech_prob, language: m.language, model: m.model };
   const keys = m.keys || [];
+  if (m.kind === "track" && res.text) { (S.txLog = S.txLog || []).push({ text: res.text, doubt: res.no_speech_prob > 0.6, at: Date.now() }); if (S.txLog.length > 20) S.txLog.shift(); }
   if (m.kind === "track") { S.tx.set(m.id, res); for (const r of S.recs) if (keys.includes(r.key)) { r.transcript = res; replaceRecRow(r); } }
   else { S.chainTx.set(m.chain, res); for (const r of S.recs) if (keys.includes(r.key)) { r.chain_transcript = res; replaceRecRow(r); } }
   renderLive();
@@ -1116,9 +1125,26 @@ function surveyInteract(c) {
     const r = (f - SV.v0) / (SV.v1 - SV.v0);
     SV.v0 = Math.max(m.lo, Math.min(m.hi - span, f - r * span)); SV.v1 = SV.v0 + span; renderSurvey();
   }, { passive: false });
-  c.addEventListener("pointerdown", e => { drag = { x: e.clientX, v0: SV.v0, v1: SV.v1, moved: false }; c.setPointerCapture(e.pointerId); });
+  const pts = new Map();                                    // touch: two fingers pinch-zoom the frequency axis
+  let pinch = null;
+  c.addEventListener("pointerdown", e => {
+    pts.set(e.pointerId, e.clientX); c.setPointerCapture(e.pointerId);
+    if (pts.size === 2) {
+      const [a, b] = [...pts.values()], r = c.getBoundingClientRect();
+      pinch = { d: Math.abs(a - b) || 1, mid: SV.v0 + ((a + b) / 2 - r.left) / r.width * (SV.v1 - SV.v0), v0: SV.v0, v1: SV.v1 }; drag = null; return;
+    }
+    drag = { x: e.clientX, v0: SV.v0, v1: SV.v1, moved: false };
+  });
+  const endPt = e => { pts.delete(e.pointerId); if (pts.size < 2) pinch = null; };
+  c.addEventListener("pointercancel", endPt);
   c.addEventListener("pointermove", e => {
     const tip = $("#svTip"), m = SV.meta; if (!m) return;
+    if (pts.has(e.pointerId)) pts.set(e.pointerId, e.clientX);
+    if (pinch && pts.size === 2) {
+      const [a, b] = [...pts.values()], k = pinch.d / (Math.abs(a - b) || 1);
+      const span = Math.min(m.hi - m.lo, Math.max(5e3, (pinch.v1 - pinch.v0) * k)), r = (pinch.mid - pinch.v0) / (pinch.v1 - pinch.v0);
+      SV.v0 = Math.max(m.lo, Math.min(m.hi - span, pinch.mid - r * span)); SV.v1 = SV.v0 + span; renderSurvey(); return;
+    }
     if (drag) {
       const dx = e.clientX - drag.x; if (Math.abs(dx) > 3) drag.moved = true;
       if (drag.moved) { const span = drag.v1 - drag.v0, df = -dx / c.getBoundingClientRect().width * span;
@@ -1131,7 +1157,7 @@ function surveyInteract(c) {
     tip.textContent = fmtF(f) + (B && b >= 0 && b < B.nb ? ` · ${(B.all[b] / B.mins).toFixed(1)}/min tracked · ${(B.shown[b] / B.mins).toFixed(1)}/min ≥ ${Math.round(S.minConf * 100)}%` : "")
       + (cal ? ` · step calibrated on ${cal.candidates} candidates, ${cal.voice_like} speech-like` : st ? " · step too quiet to calibrate" : "");
   });
-  c.addEventListener("pointerup", e => { if (drag && !drag.moved) { SV.sel = fAt(e); renderSurvey(); } drag = null; });
+  c.addEventListener("pointerup", e => { const was = pinch; endPt(e); if (!was && drag && !drag.moved) { SV.sel = fAt(e); renderSurvey(); } drag = null; });
   c.addEventListener("pointerleave", () => { $("#svTip").style.display = "none"; });
   c.addEventListener("dblclick", () => { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); });
 }
@@ -1260,6 +1286,8 @@ async function buildSDR() {
     savedList,
     el("h2", {}, "Appearance"),
     rowW("Theme (this browser)", themeSel),
+    rowW("Layout (this browser)", (() => { const l = el("select", { class: "sel" }, el("option", { value: "auto" }, "Automatic (phone on narrow screens)"), el("option", { value: "phone" }, "Phone"), el("option", { value: "desktop" }, "Desktop"));
+      l.value = lsGet("gb_layout", "auto"); l.addEventListener("change", () => setLayoutPref(l.value)); return l; })()),
     el("div", { class: "row wide" }, el("label", {}, "Automatic waterfall brightness"), toggle(S.autoScale, v => {
       S.autoScale = v; lsSet("gb_autoscale", v ? "1" : "0"); if (!v) loadScale(); repaintAll(); buildSDR(); })),
     mkScale("Waterfall minimum", "min", S.smin),
@@ -1384,6 +1412,7 @@ function connect() {
     switch (m.type) {
       case "hello": {
         S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
+        fetch("/api/marks").then(r => r.json()).then(x => { S.marks = x; }).catch(() => {});
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
         if (m.reset && m.reset.fmax) { S.fmin = m.reset.fmin; S.fmax = m.reset.fmax; }
@@ -1413,6 +1442,7 @@ function connect() {
       case "saved": onSaved(m); break;
       case "autotune": onTune(m); break;
       case "survey": onSurvey(m); break;
+      case "mark": (S.marks = S.marks || []).push(m); break;
       case "transcript": onTranscript(m); break;
     }
   };
@@ -1517,7 +1547,7 @@ async function openDetail(opts) {
   const pl = el("div", { class: "dlgplot" }, wave, spec, head);
   pl.addEventListener("click", e => { if (!DT.buf) return; const r = pl.getBoundingClientRect(); dtSeek((e.clientX - r.left) / r.width * DT.buf.duration); });
   box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
-    el("span", { style: "flex:1" }), el("span", { class: "t3", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
+    el("span", { style: "flex:1" }), el("span", { class: "t3 kbdhint", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
     renderBase ? abControls(renderBase, clip) : el("div", { class: "note" }, "A/B listening needs this detection's IQ, which isn't available.")));
   // ---- downloads and actions
   const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
@@ -1761,3 +1791,78 @@ function openHelp() {
   document.body.append(wrap); document.addEventListener("keydown", key, true);
 }
 $("#helpBtn").addEventListener("click", openHelp);
+
+// ---------------- phone ("field") layout ----------------
+// Same app, rearranged: waterfall, a "now" panel (K2-style confidence LEDs, frequency, live
+// transcript), big Pause / Mark / volume, and the detections list. Everything else lives in a menu
+// that borrows the real controls (so they behave exactly as on the desktop) and in full-screen sheets.
+const FIELD = { on: false };
+function wantField() { const p = lsGet("gb_layout", "auto"); return p === "phone" || (p === "auto" && innerWidth <= 760); }
+function applyLayout() {
+  const on = wantField(); if (on === FIELD.on) return;
+  FIELD.on = on; document.body.classList.toggle("field", on);
+  if (!on) { closeSheet(); closeFieldMenu(); }
+  if (on && !$("#leds").children.length)
+    for (let i = 0; i < 12; i++) $("#leds").append(el("i", { style: `background:var(${i < 5 ? "--ok" : i < 9 ? "--mark" : "--alarm"})` }));
+}
+addEventListener("resize", applyLayout);
+function setLayoutPref(v) { lsSet("gb_layout", v); applyLayout(); }
+// the "now" panel
+setInterval(() => {
+  if (!FIELD.on) return;
+  const voices = playingVoices();
+  let d = voices[0];
+  if (!d) for (const x of S.dets.values()) if (!x.ended && audible(x) && (!d || x.box.conf > d.box.conf)) d = x;
+  const conf = d ? d.box.conf : 0, lit = Math.round(conf * 12);
+  [...$("#leds").children].forEach((e, i) => e.classList.toggle("on", i < lit));
+  $("#nowFreq").textContent = d ? fmtF((d.box.fmin + d.box.fmax) / 2) : S.paused ? "Paused" : (!AC || AC.state !== "running") ? "Tap to start audio" : "Listening…";
+  $("#nowConf").textContent = d ? Math.round(conf * 100) + "%" : "";
+  const log = (S.txLog || []).slice(-3), box = $("#nowText");
+  const key = log.map(x => x.at).join();
+  if (box.dataset.k !== key) {
+    box.dataset.k = key;
+    box.replaceChildren(...log.slice(0, -1).map(x => el("span", { class: "prev" }, `“${x.text}”`)),
+      ...log.slice(-1).map(x => el("span", { class: x.doubt ? "doubt" : "" }, `“${x.text}”`)));
+  }
+  $("#fPause").textContent = S.paused ? "Resume" : "Pause";
+}, 150);
+$("#fPause").addEventListener("click", () => { ensureAudio(); setPaused(!S.paused); });
+$("#fVol").value = $("#vol").value;
+$("#fVol").addEventListener("input", e => { $("#vol").value = e.target.value; $("#vol").dispatchEvent(new Event("input")); });
+function toast(text) { const t = $("#toast") || document.body.appendChild(el("div", { id: "toast" })); t.textContent = text; t.style.display = ""; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2200); }
+$("#fMark").addEventListener("click", async () => {
+  const t = S.offset === null ? undefined : playheadTime();
+  try { const m = await (await fetch("/api/mark", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ t }) })).json(); toast(`Marked ${clockTime(m.t)}`); } catch (e) { toast("Couldn't save the mark"); }
+  const b = $("#fMark"); b.classList.add("flash"); setTimeout(() => b.classList.remove("flash"), 600);
+});
+// full-screen sheets for the Detector and Settings tabs
+function openSheet(tab, title) { closeFieldMenu(); document.body.classList.add("sheet"); $("#sheetTitle").textContent = title; switchTab(tab); }
+function closeSheet() { if (!document.body.classList.contains("sheet")) return; document.body.classList.remove("sheet"); switchTab("dets"); }
+$("#sheetClose").addEventListener("click", closeSheet);
+// the menu: borrows the header's span / gain / map controls and the waterfall toolbar
+const BORROW = ["#grpRate", "#grpGain", "#wfbar"];
+function closeFieldMenu() {
+  const m = $("#fieldMenu"); if (!m) return;
+  for (const b of FIELD.borrowed || []) b.parent.insertBefore(b.node, b.next);
+  FIELD.borrowed = []; m.remove();
+}
+function openFieldMenu() {
+  if ($("#fieldMenu")) return closeFieldMenu();
+  FIELD.borrowed = BORROW.map(q => { const n = $(q); return { node: n, parent: n.parentNode, next: n.nextSibling }; });
+  const [rate, gain, bar] = FIELD.borrowed.map(b => b.node);
+  const go = (label, fn) => el("button", { class: "btn", onclick: fn }, label);
+  const box = el("div", { class: "dlg" },
+    el("div", { class: "dlghead" }, el("strong", {}, "Ghostbox"), el("span", { class: "t2 num", style: "font-size:12px" }, $("#status").textContent), el("span", { style: "flex:1" }), go("Close", closeFieldMenu)),
+    el("h3", {}, "Receiver"), el("div", { class: "mrow" }, rate), el("div", { class: "mrow" }, gain),
+    el("h3", {}, "Display"), el("div", { class: "mrow" }, bar),
+    el("div", { class: "mbtns" },
+      go("Map", () => { closeFieldMenu(); openMap(); }),
+      go("Detector", () => openSheet("detector", "Detector")),
+      go("Settings", () => openSheet("sdr", "Settings")),
+      go("Help", () => { closeFieldMenu(); openHelp(); }),
+      go("Desktop layout", () => { closeFieldMenu(); setLayoutPref("desktop"); })));
+  const wrap = el("div", { id: "fieldMenu", onclick: e => { if (e.target === wrap) closeFieldMenu(); } }, box);
+  document.body.append(wrap);
+}
+$("#menuBtn").addEventListener("click", openFieldMenu);
+applyLayout();

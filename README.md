@@ -114,6 +114,21 @@ there is no TLS, so only do that on a network you trust.
 The original way to start it still works from a source checkout:
 `python3 -m ghostbox.live.server --port 8765` (data goes to the checkout folder).
 
+
+## On a phone (field use)
+
+Open the same page on a phone and it switches to a field layout: the waterfall, a confidence meter,
+the live transcript in large text, big Pause / **Mark** / volume controls, and the detections list
+(tap one for its details). Tuning, the display options, the map, the detector and settings are in the
+menu. **Mark** bookmarks the moment you're hearing (saved to `live_data/marks.jsonl` and drawn on the
+waterfall), so recordings can be lined up with what happened in the room afterwards. Settings ›
+Appearance can force the phone or desktop layout.
+
+To keep radio quiet around other people's instruments (EMF meters react to phones), connect the phone
+by cable rather than Wi-Fi: phone in airplane mode, a USB-C Ethernet adapter to the computer's Ethernet
+port, and open the computer's address with `--host 0.0.0.0`. Turn the computer's own Wi-Fi and
+Bluetooth off too, and keep the antenna a few metres from both on its coax.
+
 ## Command-line options
 
 | option | |

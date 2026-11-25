@@ -264,6 +264,33 @@ def make_app(args):
         return web.Response(body=np.ascontiguousarray(img, np.uint8).tobytes(), content_type="application/octet-stream",
                             headers={"X-Rows": str(img.shape[0]), "X-Cols": str(img.shape[1])})
 
+    MARKS = ROOT / "live_data" / "marks.jsonl"
+
+    async def post_mark(request):
+        """Bookmark a moment ("something just happened"): stream time being heard, wall clock, tuning."""
+        b = await request.json()
+        eng, c = state["engine"], config.get()
+        t = float(b.get("t", eng.n_samples / eng.fs))
+        m = {"t": round(t, 3), "epoch": eng.t_origin, "utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(eng.t_origin + t)),
+             "center_hz": c["sdr"]["center_hz"], "sample_rate": c["sdr"]["sample_rate"], "note": str(b.get("note", ""))[:200]}
+        MARKS.parent.mkdir(parents=True, exist_ok=True)
+        with MARKS.open("a") as f:
+            f.write(json.dumps(m) + "\n")
+        state["hub"].emit({"type": "mark", **m})
+        return web.json_response(m)
+
+    async def get_marks(request):
+        eng, out = state["engine"], []
+        if MARKS.exists():
+            for line in MARKS.read_text().splitlines()[-500:]:
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                if abs(m.get("epoch", 0) - eng.t_origin) < 1e-3:
+                    out.append(m)
+        return web.json_response(out)
+
     async def get_devices(request):
         from .sources import list_devices
         return web.json_response(await asyncio.get_running_loop().run_in_executor(None, list_devices))
@@ -651,6 +678,8 @@ def make_app(args):
     app.router.add_get("/api/survey/clip", survey_clip)
     app.router.add_get("/api/detection", get_detection)
     app.router.add_get("/api/devices", get_devices)
+    app.router.add_post("/api/mark", post_mark)
+    app.router.add_get("/api/marks", get_marks)
     app.router.add_post("/api/sdr/test", sdr_test)
     app.router.add_get("/api/iq", get_iq)
     app.router.add_get("/api/render", render)
