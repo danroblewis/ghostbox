@@ -60,7 +60,7 @@ need the DVB kernel driver blacklisted (`dvb_usb_rtl28xxu`) and the udev rules s
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-git clone <repository URL> spiritbox-sdr
+git clone https://github.com/danroblewis/spiritbox-sdr.git
 cd spiritbox-sdr
 uv sync --extra recommended
 ```
@@ -81,7 +81,7 @@ Extras (all optional; the detector and web app run on numpy, scipy and aiohttp a
 `vad` extra the ML voice check scores nothing and calibration is much weaker; without a
 transcription engine, transcripts are simply missing.
 
-Alternatively, without cloning: `uv tool install "ghostbox[recommended] @ git+<repository URL>"`;
+Alternatively, without cloning: `uv tool install "ghostbox[recommended] @ git+https://github.com/danroblewis/spiritbox-sdr"`;
 then choose where data goes with `--data-dir` (see below).
 
 ## Quick start
@@ -236,3 +236,7 @@ Common filler phrases that Whisper produces from noise are filtered out.
   defaults), `static/` (web page).
 - `ghostbox/cli.py` - the `ghostbox` command.
 - `ghostbox/*.py` - the offline prototype tools (IQ loading, analysis, voice injection for tests).
+
+## License
+
+MIT; see [LICENSE](LICENSE).

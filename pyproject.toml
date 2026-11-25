@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.21"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "SDR-native spirit box: finds human-voice-like AM/SSB signals across a whole band of IQ from a HackRF or RTL-SDR, with a live web UI."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["sdr", "hackrf", "rtl-sdr", "spirit box", "iq", "voice detection", "am", "ssb"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -46,5 +48,5 @@ ghostbox = "ghostbox.cli:main"
 packages = ["ghostbox"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/ghostbox", "/README.md", "/pyproject.toml"]
+include = ["/ghostbox", "/README.md", "/pyproject.toml", "/LICENSE"]
 exclude = ["__pycache__", "*.pyc"]
