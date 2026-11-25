@@ -1616,11 +1616,10 @@ async function abLoad(base, clip) {
     const r = await fetch(url); if (!r.ok) throw new Error(await r.text());
     const buf = await AC.decodeAudioData(await r.arrayBuffer());
     if (gen !== DT.abGen || !DT.open) return;
-    const playing = !!DT.src, at = DT.src ? DT.off + AC.currentTime - DT.t0 : DT.off;
-    if (playing) dtStop();
-    DT.buf = buf; DT.spec = specOf(buf.getChannelData(0), buf.sampleRate); DT.off = Math.min(at, buf.duration);
+    if (DT.src) dtStop();
+    DT.buf = buf; DT.spec = specOf(buf.getChannelData(0), buf.sampleRate); DT.off = 0;   // a new setting: from the top
     drawDetailWave(); drawDetailSpec(); dtTick();
-    if (playing) dtToggle();
+    dtToggle();
     if (note) note.textContent = "";
   } catch (e) { if (note && gen === DT.abGen) note.textContent = String(e.message || e).slice(0, 80); }
 }
