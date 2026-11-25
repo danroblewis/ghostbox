@@ -16,6 +16,7 @@ waterfall.
 """
 import base64
 import collections
+import io
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +36,7 @@ from scipy.signal import butter, firwin, resample_poly, sosfilt, sosfilt_zi
 from ..maps import power_frames
 from . import stage1, stage2
 from .config import CHECKS
-from .sources import make_source
+from .sources import _to_complex, make_source
 from .transcribe import Transcriber
 
 AUDIO_FS = 16000
@@ -104,6 +105,7 @@ class Track:
         self.seg_start = t               # recording segment start
         self.seg_index = 0
         self.wavs = []                   # recording files for click-to-play
+        self.clips = []                  # playable URLs (saved WAV or in-memory clip)
 
     def add(self, t, f, score, checks):
         self.t_last = t
@@ -126,14 +128,19 @@ class Track:
                 "path": [[round(t, 3), fc + f] for t, f in self.path[-200:]],
                 "conf": round(self.conf, 3),
                 "scores": {k: round(v, 3) for k, v in self.scores.items()},
-                "info": self.info, "wavs": list(self.wavs), "detected": self.detected}
+                "info": self.info, "wavs": list(self.wavs), "clips": list(self.clips), "detected": self.detected}
 
 
 class Engine:
-    def __init__(self, config, emit, root):
+    def __init__(self, config, emit, root, source=None, oneshot=False, transcribe=True):
+        """source/oneshot: run once over a given source (auto-tune) without housekeeping or disk writes."""
         self.config = config
         self.emit = emit
         self.root = Path(root)
+        self.source_override, self.oneshot = source, oneshot
+        self.done = threading.Event()
+        self.mem = collections.OrderedDict()        # key -> {"meta", "pcm"}: detections kept in memory, not on disk
+        self.mem_bytes = 0
         self._restart = threading.Event()
         self._stop = threading.Event()
         self.status = {"state": "starting"}
@@ -145,9 +152,9 @@ class Engine:
         self._last_prune = 0.0
         self.storage = {"paused": False, "free_gb": None}   # disk guard state
         self.chains = {}                            # hop chain id -> finished member clips
-        self.transcriber = Transcriber(config, emit)
+        self.transcriber = Transcriber(config, emit, on_result=self._on_transcript) if transcribe else None
         self.pool = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()                # re-entrant: _finish runs inside locked analysis
         threading.Thread(target=self._run, daemon=True).start()
 
     # ---------------- control ----------------
@@ -224,14 +231,20 @@ class Engine:
                         fc_f, fs_f = parse_name(cfg["sdr"]["file"]["path"])
                         if fc_f:
                             cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = fc_f, fs_f
+                    if self.source_override:
+                        cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = self.source_override.fc, self.source_override.fs
                     self._reset(cfg)
-                    src = make_source(cfg["sdr"])
+                    src = self.source_override or make_source(cfg["sdr"])
                     misses = 0
                 cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = self.fc, self.fs
                 n = int(self.fs * cfg["analysis"]["hop_s"]) // self.frame_len * self.frame_len
                 t_wait = time.time()
                 x = src.read(n, timeout=3.0)
                 t_got = time.time()
+                if x is None and self.oneshot:                 # end of the recording: finish every track
+                    with self.lock:
+                        self._tracks_audio_and_stage2(cfg, self.analyzed_until, self.analyzed_until + 1e6)
+                    break
                 if x is None:
                     misses += 1
                     self.status = {"state": "no data", "source": cfg["sdr"]["source"],
@@ -256,8 +269,9 @@ class Engine:
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
                                "tracks": len(self.tracks), "vad": stage2.vad_available(),
                                "storage": self.storage,
+                               "progress": (src.sent / src.total) if getattr(src, "total", None) else None,
                                "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
-                                           "queue": self.transcriber.q.qsize()}}
+                                           "queue": self.transcriber.q.qsize()} if self.transcriber else {}}
                 self.emit({"type": "status", **self.status})
             except Exception as e:
                 self.status = {"state": "error", "error": f"{type(e).__name__}: {e}"}
@@ -266,6 +280,7 @@ class Engine:
                 time.sleep(1)
         if src:
             src.stop()
+        self.done.set()
 
     # ---------------- ingest: raw ring + spectrogram + waterfall ----------------
     def _ingest(self, x, cfg):
@@ -277,7 +292,7 @@ class Engine:
         t_start = self.n_samples / self.fs
         self.n_samples += n
         self._write_iq(x, t_start, cfg)
-        if time.time() - self._last_prune > 5:
+        if not self.oneshot and time.time() - self._last_prune > 5:
             self._last_prune = time.time()
             self._prune(cfg)
         x = x - x.mean()
@@ -486,14 +501,15 @@ class Engine:
             if cid in live or tb - ch["last_end"] < cfg["detect"]["link_hops_s"] + 0.5:
                 continue
             del self.chains[cid]
-            if len(ch["members"]) < 2 or not (w["enabled"] and w["chains"]):
+            if len(ch["members"]) < 2 or not (w["enabled"] and w["chains"]) or not self.transcriber:
                 continue
             parts = []
             for _, audio, _, _ in sorted(ch["members"], key=lambda m: m[0]):
                 parts += [audio, np.zeros(int(0.12 * AUDIO_FS), np.float32)]
             self.transcriber.submit({"kind": "chain", "id": cid, "chain": cid, "audio": np.concatenate(parts),
                                      "members": [m[2] for m in ch["members"]],
-                                     "meta_paths": [m[3] for m in ch["members"]]})
+                                     "keys": [m[4] for m in ch["members"]],
+                                     "meta_paths": [m[3] for m in ch["members"] if m[3]]})
 
     @staticmethod
     def _recent(chunks, secs):
@@ -548,49 +564,172 @@ class Engine:
             keep_from = tr.seg_start - 3.0                  # stage 2 still needs recent audio
             tr.audio = [(t, a) for t, a in tr.audio if t >= keep_from]
             tr.iq = [(t, a) for t, a in tr.iq if t >= keep_from]
-        if not rec["enabled"] or not audio:
+        if not audio:
             return
         a = np.concatenate([x for _, x in audio])
         if len(a) < AUDIO_FS // 4:
             return
-        out = self.root / rec["dir"]
-        out.mkdir(parents=True, exist_ok=True)
         utc = datetime.fromtimestamp(self.utc0 + seg_t0, timezone.utc)
         fr = [p[1] for p in tr.path]
         f_mean = self.fc + float(np.mean([fr_[1] for fr_ in tr.frames if fr_[0] >= seg_t0] or fr))
-        stem = f"{utc:%Y%m%d-%H%M%S}_det{tr.id}{'_' + str(tr.seg_index) if tr.seg_index or not final else ''}_{f_mean / 1e3:.1f}kHz"
         pcm = np.clip(a / (4 * (np.sqrt(np.mean(a ** 2)) + 1e-9)), -1, 1)
-        wavfile.write(out / f"{stem}.wav", AUDIO_FS, (pcm * 32767).astype(np.int16))
-        files = {"wav": f"{stem}.wav"}
-        tr.wavs.append(files["wav"])
-        if rec.get("save_iq") and iq:
-            np.save(out / f"{stem}_iq16k.npy", np.concatenate([x for _, x in iq]))
-            files["iq"] = f"{stem}_iq16k.npy"
+        conf_max = max([c for _, c in tr.conf_hist] or [0])
         meta = {
             "id": tr.id, "chain": tr.chain, "segment": tr.seg_index, "epoch": self.t_origin,
             "utc_start": utc.isoformat(), "stream_t0": seg_t0, "stream_t1": tr.t_last,
             "duration_s": round(len(a) / AUDIO_FS, 2),
             "freq_hz": {"mean": f_mean, "min": self.fc + min(fr), "max": self.fc + max(fr)},
             "path": [[round(t - seg_t0, 3), self.fc + f] for t, f in tr.path if t >= seg_t0 - 0.5],
-            "confidence": {"final": tr.conf, "max": max([c for _, c in tr.conf_hist] or [0]),
-                           "history": tr.conf_hist[-600:]},
-            "scores": tr.scores, "info": tr.info,
+            "confidence": {"final": tr.conf, "max": conf_max, "history": tr.conf_hist[-600:]},
+            "scores": tr.scores, "info": tr.info, "fc": self.fc, "fs": self.fs,
             "sdr": cfg["sdr"], "checks": cfg["checks"], "detect": cfg["detect"],
-            "files": files,
         }
         if cfg["sdr"]["source"] == "file":
             meta["demo"] = f"Replay of {Path(cfg['sdr']['file']['path']).name} (not a live detection)"
-        meta_path = out / f"{stem}.json"
-        meta_path.write_text(json.dumps(meta, indent=1, default=float))
-        self.emit({"type": "recording", "meta": meta})
+        # Everything detected is kept in memory; only detections above the save threshold go to disk.
+        save = (rec["enabled"] and not self.oneshot and conf_max >= rec.get("min_save_conf", 0.7))
+        pcm16 = (pcm * 32767).astype(np.int16)
+        meta_path = None
+        if save:
+            meta_path = self._write_recording(meta, pcm16, np.concatenate([x for _, x in iq]) if iq and rec.get("save_iq") else None,
+                                              f"{utc:%Y%m%d-%H%M%S}_det{tr.id}{'_' + str(tr.seg_index) if tr.seg_index or not final else ''}_{f_mean / 1e3:.1f}kHz", cfg)
+            tr.wavs.append(meta["files"]["wav"])
+        else:
+            meta.update(saved=False, key=f"mem:{int(self.t_origin)}:{tr.id}:{tr.seg_index}", files={})
+            meta["clip"] = "/api/clip?key=" + meta["key"]
+            if not self.oneshot:
+                self._mem_put(meta, pcm16, cfg)
+        tr.clips.append(meta["clip"])
+        self.emit({"type": "recording", "meta": {k: v for k, v in meta.items() if k not in ("checks", "detect", "sdr")}})
         w = cfg["whisper"]
-        if w["enabled"] and meta["confidence"]["max"] >= w["min_confidence"]:
+        if self.transcriber and w["enabled"] and conf_max >= w["min_confidence"]:
             self.transcriber.submit({"kind": "track", "id": tr.id, "chain": tr.chain, "audio": pcm.astype(np.float32),
-                                     "wav": files["wav"], "meta_paths": [meta_path]})
+                                     "wav": meta["files"].get("wav"), "keys": [meta["key"]],
+                                     "meta_paths": [meta_path] if meta_path else []})
         if final:
             ch = self.chains.setdefault(tr.chain, {"members": [], "last_end": tr.t_last})
-            ch["members"].append((seg_t0, pcm.astype(np.float32), tr.id, meta_path))
+            ch["members"].append((seg_t0, pcm.astype(np.float32), tr.id, meta_path, meta["key"]))
             ch["last_end"] = max(ch["last_end"], tr.t_last)
+
+    def _write_recording(self, meta, pcm16, iq, stem, cfg):
+        out = self.root / cfg["record"]["dir"]
+        out.mkdir(parents=True, exist_ok=True)
+        wavfile.write(out / f"{stem}.wav", AUDIO_FS, pcm16)
+        files = {"wav": f"{stem}.wav"}
+        if iq is not None:
+            np.save(out / f"{stem}_iq16k.npy", iq)
+            files["iq"] = f"{stem}_iq16k.npy"
+        meta.update(files=files, saved=True, key="wav:" + files["wav"], clip="/rec/" + files["wav"])
+        path = out / f"{stem}.json"
+        path.write_text(json.dumps(meta, indent=1, default=float))
+        return path
+
+    # ---------------- in-memory detections ----------------
+    def _mem_put(self, meta, pcm16, cfg):
+        with self.lock:
+            self.mem[meta["key"]] = {"meta": meta, "pcm": pcm16}
+            self.mem_bytes += pcm16.nbytes
+            cap = cfg["record"].get("memory_mb", 300) * 1e6
+            for v in self.mem.values():                 # over budget: drop the oldest audio, keep the listing
+                if self.mem_bytes <= cap:
+                    break
+                if v["pcm"] is not None:
+                    self.mem_bytes -= v["pcm"].nbytes
+                    v["pcm"] = None
+            while len(self.mem) > 50000:
+                _, v = self.mem.popitem(last=False)
+                if v["pcm"] is not None:
+                    self.mem_bytes -= v["pcm"].nbytes
+
+    def mem_list(self):
+        with self.lock:
+            return [dict(v["meta"], in_memory=v["pcm"] is not None) for v in self.mem.values()]
+
+    def _on_transcript(self, keys, field, res):
+        with self.lock:
+            for k in keys:
+                if k in self.mem:
+                    self.mem[k]["meta"][field] = res
+
+    def clip(self, key):
+        """WAV bytes for a detection: from memory, from disk, or rebuilt from the IQ ring."""
+        cfg = self.config.get()
+        if key.startswith("wav:"):
+            p = self.root / cfg["record"]["dir"] / key[4:]
+            return p.read_bytes() if p.is_file() else None
+        with self.lock:
+            v = self.mem.get(key)
+            pcm, meta = (v["pcm"], v["meta"]) if v else (None, None)
+        if meta is None:
+            return None
+        if pcm is None:
+            pcm = self._clip_from_iq(meta, cfg)
+        if pcm is None:
+            return None
+        buf = io.BytesIO()
+        wavfile.write(buf, AUDIO_FS, pcm)
+        return buf.getvalue()
+
+    def save(self, key):
+        """Write an in-memory detection to disk (audio from memory or the IQ ring)."""
+        cfg = self.config.get()
+        with self.lock:
+            v = self.mem.get(key)
+        if not v:
+            return None
+        pcm = v["pcm"] if v["pcm"] is not None else self._clip_from_iq(v["meta"], cfg)
+        if pcm is None:
+            return None
+        meta = dict(v["meta"])
+        utc = datetime.fromisoformat(meta["utc_start"])
+        self._write_recording(meta, pcm, None, f"{utc:%Y%m%d-%H%M%S}_det{meta['id']}_{meta['freq_hz']['mean'] / 1e3:.1f}kHz", cfg)
+        with self.lock:
+            old = self.mem.pop(key, None)
+            if old and old["pcm"] is not None:
+                self.mem_bytes -= old["pcm"].nbytes
+        self.emit({"type": "saved", "old_key": key, "meta": {k: x for k, x in meta.items() if k not in ("checks", "detect", "sdr")}})
+        return meta
+
+    def _clip_from_iq(self, meta, cfg):
+        """Re-demodulate a detection from the continuous IQ ring (if those segments still exist)."""
+        d = self.root / cfg["iq_ring"]["dir"]
+        if not d.exists():
+            return None
+        t0, t1 = meta["stream_t0"] - 0.05, meta["stream_t1"] + 0.1
+        segs = []
+        for j in sorted(d.glob("*.json")):
+            try:
+                sj = json.loads(j.read_text())
+            except Exception:
+                continue
+            p = j.with_suffix(".cs8")
+            if abs(sj.get("epoch", 0) - meta["epoch"]) > 1e-3 or not p.exists():
+                continue
+            dur = p.stat().st_size / 2 / sj["fs"]
+            if sj["t0"] < t1 and sj["t0"] + dur > t0:
+                segs.append((sj, p))
+        if not segs:
+            return None
+        fs, fc = segs[0][0]["fs"], segs[0][0]["fc"]
+        parts, start = [], None
+        for sj, p in segs:
+            raw = np.memmap(p, dtype=np.int8, mode="r")
+            a = max(0, int((t0 - sj["t0"]) * fs))
+            b = min(len(raw) // 2, int((t1 - sj["t0"]) * fs))
+            if b > a:
+                start = sj["t0"] + a / fs if start is None else start
+                parts.append(np.asarray(raw[2 * a:2 * b]))
+        if not parts:
+            return None
+        x = _to_complex(np.concatenate(parts), True)
+        pts = np.array([[meta["stream_t0"] + r, f - fc] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"] - fc]])
+        ts = start + np.arange(len(x)) / fs
+        f_off = pts[np.clip(np.searchsorted(pts[:, 0], ts, side="right") - 1, 0, len(pts) - 1), 1]
+        _, env = demod(x, fs, f_off, cfg["audio"]["bandwidth_hz"])
+        hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
+        audio = sosfilt(hp, env - env[:200].mean())
+        audio = np.clip(audio / (4 * (np.sqrt(np.mean(audio ** 2)) + 1e-9)), -1, 1)
+        return (audio * 32767).astype(np.int16)
 
     # ---------------- continuous IQ ring + size limits ----------------
     def _close_iq(self):

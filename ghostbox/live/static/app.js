@@ -37,6 +37,7 @@ const S = {
   follow: true, viewTop: 0,
   smin: 0, smax: 255, cmap: lsGet("gb_cmap", "magma"),
   playing: null,                                        // {key, src, start, dur}
+  minConf: +lsGet("gb_minconf", 0.55),                  // display filter: waterfall boxes and the list
 };
 const cv = $("#wf"), ctx = cv.getContext("2d");
 const TH = {};                                          // canvas colours, read from the active theme
@@ -173,6 +174,7 @@ function draw() {
   // detections
   const now = nowS(), chains = new Map();
   for (const d of S.dets.values()) {
+    if (d.box.conf < S.minConf && !d.playing.some(([a, z]) => now >= a && now <= z)) { d.box._rect = null; continue; }
     const b = d.box; const y0 = (top - b.t1) * pps, y1 = (top - b.t0) * pps;
     if (y1 < -20 || y0 > H + 20) { d.box._rect = null; continue; }
     const pad = Math.max(5 * dpr, xOf(b.fmin + 3400) - xOf(b.fmin));
@@ -344,9 +346,9 @@ function pcmBuffer(pcm, rate) {
   for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
   return buf;
 }
-async function decodeWavs(wavs) {
+async function decodeClips(urls) {
   const parts = [];
-  for (const w of wavs) { try { parts.push(await AC.decodeAudioData(await (await fetch("/rec/" + w)).arrayBuffer())); } catch (e) {} }
+  for (const u of urls) { try { const r = await fetch(u); if (r.ok) parts.push(await AC.decodeAudioData(await r.arrayBuffer())); } catch (e) {} }
   if (!parts.length) return null;
   const n = parts.reduce((a, p) => a + p.length, 0), buf = AC.createBuffer(1, n, parts[0].sampleRate);
   let o = 0; for (const p of parts) { buf.getChannelData(0).set(p.getChannelData(0), o); o += p.length; }
@@ -376,7 +378,7 @@ function schedulePlayback() {
     const b = d.box;
     if (b.t1 < ph - 0.5 || b.t0 > horizon) continue;
     const chunks = d.chunks || [], whole = chunks.length && chunks[0].t <= b.t0 + 0.5;
-    const wavs = b.wavs && b.wavs.length;
+    const wavs = b.clips && b.clips.length;
     if (whole || (chunks.length && !wavs)) {
       for (const c of chunks) {
         const key = c.t.toFixed(3);
@@ -388,7 +390,7 @@ function schedulePlayback() {
       if (!AC) {                                           // no audio yet: still light the box as the playhead passes
         const when = b.t0 + S.offset + S.delay; d.playing.push([when, when + (b.t1 - b.t0)]); continue;
       }
-      (d.wavBuf ? Promise.resolve(d.wavBuf) : (AC ? decodeWavs(b.wavs) : Promise.resolve(null))).then(buf => {
+      (d.wavBuf ? Promise.resolve(d.wavBuf) : (AC ? decodeClips(b.clips) : Promise.resolve(null))).then(buf => {
         if (buf) d.wavBuf = buf;
         if (gen === PB.gen && buf) playAt(d, buf, b.t0);
       });
@@ -408,28 +410,21 @@ function onAudio(m) {                                      // live chunk: keep i
 }
 
 // click-to-play: a detection (live PCM or its recording) or a saved recording
-const detKey = d => d.box.wavs && d.box.wavs.length ? "wav:" + d.box.wavs[0] : "det:" + d.box.id;
-const recKey = r => "wav:" + r.files.wav;
+const detKey = d => d.box.clips && d.box.clips.length ? "clip:" + d.box.clips[0] : "det:" + d.box.id;
+const recKey = r => "clip:" + r.clip;
 async function togglePlay(key, det, rec) {
   ensureAudio();
   if (S.playing) { const old = S.playing.key; try { S.playing.src.stop(); } catch (e) {} S.playing = null; setPlayingUI(old, false); if (PB.gain) PB.gain.gain.value = 1; if (old === key) return; }
   let buf = null;
-  const wavs = rec ? [rec.files.wav] : (det && det.box.wavs) || [];
-  if (wavs.length) {
-    const parts = [];
-    for (const w of wavs) { try { parts.push(await AC.decodeAudioData(await (await fetch("/rec/" + w)).arrayBuffer())); } catch (e) {} }
-    if (parts.length) {
-      const n = parts.reduce((a, p) => a + p.length, 0); buf = AC.createBuffer(1, n, parts[0].sampleRate);
-      let o = 0; for (const p of parts) { buf.getChannelData(0).set(p.getChannelData(0), o); o += p.length; }
-    }
-  }
+  const urls = rec ? [rec.clip] : (det && det.box.clips) || [];
+  if (urls.length) buf = await decodeClips(urls);
   if (!buf && det && det.pcm.length) {
     const n = det.pcm.reduce((a, p) => a + p.length, 0); buf = AC.createBuffer(1, n, 16000);
     const ch = buf.getChannelData(0); let o = 0; for (const p of det.pcm) { for (let i = 0; i < p.length; i++) ch[o + i] = p[i] / 32768; o += p.length; }
   }
   if (!buf) return;
   const src = AC.createBufferSource(); src.buffer = buf; src.connect(master); src.start();
-  if (!det && rec) det = [...S.dets.values()].find(d => (d.box.wavs || []).includes(rec.files.wav));
+  if (!det && rec) det = [...S.dets.values()].find(d => (d.box.clips || []).includes(rec.clip));
   S.playing = { key, src, start: AC.currentTime, dur: buf.duration, det };
   if (det) det.playing.push([nowS(), nowS() + buf.duration]);
   src.onended = () => { if (S.playing && S.playing.src === src) { S.playing = null; setPlayingUI(key, false); if (PB.gain) PB.gain.gain.value = 1; } };
@@ -458,7 +453,9 @@ function confStyle(row, conf) {
   row.style.setProperty("--cb", (1 + 12 * k * k).toFixed(1) + "%");
   row.classList.toggle("hi", k >= 0.9);
 }
-function rowFor({ key, f, t, conf, tx, pending, live, onJump, onPlay }) {
+const ICON_SAVE = '<svg viewBox="0 0 10 10"><path d="M1 1h6.5L9 2.5V9H1zM2.5 1v3h4.5V1M2.5 9V6h5v3" fill="none" stroke="currentColor" stroke-width="1"/></svg>';
+const ICON_SAVED = '<svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.5 2.4" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
+function rowFor({ key, f, t, conf, tx, pending, live, onJump, onPlay, saved, onSave }) {
   const playing = S.playing && S.playing.key === key;
   let text = "", cls = "x none";
   if (tx) { if (tx.text && tx.no_speech_prob <= 0.6) { text = `“${tx.text}”`; cls = "x"; } else if (tx.text) { text = `“${tx.text}”`; cls = "x doubt"; } else text = "No words"; }
@@ -467,10 +464,27 @@ function rowFor({ key, f, t, conf, tx, pending, live, onJump, onPlay }) {
   btn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
   const row = el("div", { class: "det", "data-key": key, title: live ? "Live — click to show on the waterfall" : "Click to show on the waterfall", onclick: onJump },
     btn, el("span", { class: "f" }, fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
-    el("span", { class: "c" }, (conf * 100).toFixed(0)),
+    el("span", { class: "c" }, (conf * 100).toFixed(0)), saveCell(saved, onSave),
     live ? el("i", { class: "live", title: "Live" }) : null);
   confStyle(row, conf);
   return row;
+}
+function saveCell(saved, onSave) {
+  if (saved === undefined) return el("span");
+  const b = el("button", { class: "sv" + (saved ? " done" : ""), title: saved ? "Saved to disk" : "Keep: save to disk",
+    onclick: e => { e.stopPropagation(); if (!saved && onSave) { b.disabled = true; onSave(); } } });
+  b.innerHTML = saved ? ICON_SAVED : ICON_SAVE;
+  return b;
+}
+async function saveDetection(r) {
+  const res = await fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: r.key }) });
+  if (!res.ok) alert("This detection's audio is no longer available (dropped from memory and not in the IQ recording).");
+}
+function onSaved(m) {
+  const i = S.recs.findIndex(r => r.key === m.old_key); if (i < 0) return;
+  const oldKey = recKey(S.recs[i]); S.recs[i] = { ...S.recs[i], ...m.meta };
+  const row = $(`#savedList .det[data-key="${CSS.escape(oldKey)}"]`); if (row) row.replaceWith(recRow(S.recs[i]));
+  for (const d of S.dets.values()) if (d.box.clips) d.box.clips = d.box.clips.map(u => u === "/api/clip?key=" + m.old_key ? m.meta.clip : u);
 }
 function recRow(r) {
   const sameSession = r.epoch && Math.abs(r.epoch - S.epoch) < 1e-3;
@@ -478,14 +492,15 @@ function recRow(r) {
   const recent = Date.now() - new Date(r.utc_start).getTime() < 180e3;
   return rowFor({ key: recKey(r), f: r.freq_hz.mean, t: hms(new Date(r.utc_start)), conf: r.confidence.max, tx: r.transcript,
     pending: recent && !r.transcript && r.confidence.max >= minConf && S.cfg && S.cfg.whisper.enabled,
-    onJump: () => { if (sameSession) jumpTo(r.stream_t1); }, onPlay: () => togglePlay(recKey(r), null, r) });
+    onJump: () => { if (sameSession) jumpTo(r.stream_t1); }, onPlay: () => togglePlay(recKey(r), null, r),
+    saved: r.saved !== false, onSave: () => saveDetection(r) });
 }
 let liveTimer = null;
 function renderLive() {
   if (liveTimer) return;
   liveTimer = setTimeout(() => {
     liveTimer = null;
-    const ds = [...S.dets.values()].filter(d => !d.ended && d.box.detected !== false).sort((a, b) => b.box.t0 - a.box.t0);
+    const ds = [...S.dets.values()].filter(d => !d.ended && d.box.detected !== false && d.box.conf >= S.minConf).sort((a, b) => b.box.t0 - a.box.t0);
     $("#liveList").replaceChildren(...ds.map(d => {
       const b = d.box;
       return rowFor({ key: detKey(d), f: (b.fmin + b.fmax) / 2, t: clockTime(b.t0), conf: b.conf, tx: S.tx.get(b.id), live: true,
@@ -504,7 +519,7 @@ async function loadPage(reset) {
   if (L.loading || L.done) return;
   const gen = L.gen; L.loading = true;
   try {
-    const r = await (await fetch(`/api/recordings?offset=${S.recs.length}&limit=${PAGE}&q=${encodeURIComponent(L.q)}`)).json();
+    const r = await (await fetch(`/api/detections?offset=${S.recs.length}&limit=${PAGE}&q=${encodeURIComponent(L.q)}&min_conf=${S.minConf}`)).json();
     if (gen !== L.gen) return;
     L.total = r.total; S.recs.push(...r.items);
     $("#savedList").append(...r.items.map(recRow));
@@ -518,12 +533,13 @@ $("#dets").addEventListener("scroll", e => { const t = e.target; if (t.scrollTop
 let searchTimer = null;
 $("#search").addEventListener("input", e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { L.q = e.target.value.trim(); loadPage(true); }, 250); });
 function matchesSearch(m) {
+  if (m.confidence.max < S.minConf) return false;
   if (!L.q) return true;
   const f = m.freq_hz.mean, hay = [(m.transcript || {}).text, (m.chain_transcript || {}).text, (f / 1e6).toFixed(4), (f / 1e3).toFixed(1)].join(" ").toLowerCase();
   return hay.includes(L.q.toLowerCase());
 }
 function onRecording(meta) {
-  const d = S.dets.get(meta.id); if (d && d.box.wavs && !d.box.wavs.includes(meta.files.wav)) d.box.wavs.push(meta.files.wav);
+  const d = S.dets.get(meta.id); if (d && !(d.box.clips || []).includes(meta.clip)) (d.box.clips = d.box.clips || []).push(meta.clip);
   if (matchesSearch(meta)) {
     S.recs.unshift(meta); L.total++; $("#savedList").prepend(recRow(meta));
     if (S.recs.length > MAX_ROWS) { S.recs.pop(); $("#savedList").lastElementChild.remove(); }
@@ -536,8 +552,9 @@ function replaceRecRow(r) {
 }
 function onTranscript(m) {
   const res = { text: m.text, no_speech_prob: m.no_speech_prob, language: m.language, model: m.model };
-  if (m.kind === "track") { S.tx.set(m.id, res); const r = S.recs.find(r => r.files && r.files.wav === m.wav); if (r) { r.transcript = res; replaceRecRow(r); } }
-  else { S.chainTx.set(m.chain, res); for (const r of S.recs) if ((m.members || []).includes(r.id)) { r.chain_transcript = res; replaceRecRow(r); } }
+  const keys = m.keys || [];
+  if (m.kind === "track") { S.tx.set(m.id, res); for (const r of S.recs) if (keys.includes(r.key)) { r.transcript = res; replaceRecRow(r); } }
+  else { S.chainTx.set(m.chain, res); for (const r of S.recs) if (keys.includes(r.key)) { r.chain_transcript = res; replaceRecRow(r); } }
   renderLive();
 }
 function setPlayingUI(key, on) {
@@ -644,11 +661,12 @@ function buildDetector() {
       S.cfg = await r.json(); buildDetector();
     }
   }, v.label)));
+  root.append(tuneCard());
   root.append(el("h2", {}, "Sensitivity"), seg,
     el("div", { class: "note" }, "Sets thresholds, tracking limits and the voice-check weights in one click. Ghost hunter and Everything let far more human-ish fragments through (expect more false alarms). Checks you switched off stay off."));
   root.append(el("h2", {}, "Thresholds & tracking"),
     slider("Candidate threshold", ["detect", "candidate_threshold"], 0, 1, 0.01, v => v.toFixed(2)),
-    slider("Detection threshold", ["detect", "threshold"], 0, 1, 0.01, v => v.toFixed(2)),
+    slider("Capture floor (kept in memory)", ["detect", "threshold"], 0, 1, 0.01, v => v.toFixed(2)),
     slider("Novelty strength", ["detect", "novelty"], 0, 1.5, 0.05, v => v.toFixed(2)),
     slider("Novelty memory", ["detect", "novelty_tau_s"], 2, 120, 1, v => v + " s"),
     slider("Prominence strength", ["detect", "prominence"], 0, 1.5, 0.05, v => v.toFixed(2)),
@@ -685,6 +703,43 @@ function buildDetector() {
     }
   }
   root.append(el("div", { style: "margin:14px 0 20px" }, el("button", { class: "btn", onclick: async () => { if (confirm("Reset every setting to its default?")) await fetch("/api/reset", { method: "POST" }); } }, "Reset all settings")));
+}
+
+// ---------------- auto-tune ----------------
+const TUNE = { state: { state: "idle" }, minutes: +lsGet("gb_tune_min", 2), perMin: +lsGet("gb_tune_rate", 6) };
+function tuneCard() {
+  const st = TUNE.state, running = st.state === "running";
+  const mins = el("select", { class: "sel" }, ...[1, 2, 5, 10].map(m => el("option", { value: m }, m + " min")));
+  mins.value = TUNE.minutes; mins.addEventListener("change", () => { TUNE.minutes = +mins.value; lsSet("gb_tune_min", TUNE.minutes); });
+  const rate = el("input", { type: "range", min: 1, max: 30, step: 1, value: TUNE.perMin }); fillRange(rate);
+  const rateOut = el("output", {}, TUNE.perMin + " / min");
+  rate.addEventListener("input", () => { fillRange(rate); TUNE.perMin = +rate.value; rateOut.textContent = rate.value + " / min"; lsSet("gb_tune_rate", rate.value); });
+  const go = el("button", { class: "btn primary", disabled: running, onclick: async () => {
+    await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: TUNE.minutes, per_min: TUNE.perMin }) });
+  } }, running ? "Analysing…" : "Auto-tune for this band");
+  const out = el("div", { class: "note", style: "margin:8px 0 0" });
+  if (running) out.textContent = `${st.message || ""}${st.progress != null ? ` (${Math.round(st.progress * 100)}%)` : ""}`;
+  else if (st.state === "error") { out.className = "err"; out.textContent = st.message; }
+  else if (st.state === "done" && st.result) {
+    const r = st.result, pct = v => Math.round(v * 100) + "%";
+    out.style.color = "var(--text-2)";
+    out.textContent = `Analysed ${r.minutes} min: ${r.candidates} candidate signals (${r.candidates_per_min}/min). `
+      + `At ${r.per_min}/min, the most speech-like detections now score ${pct(r.score_after)} on the voice detector (was ${pct(r.score_before)}). `
+      + `Showing detections ≥ ${pct(r.show_threshold)}; keeping ≥ ${pct(r.capture_threshold)} in memory.`;
+  } else if (st.state === "reverted") out.textContent = st.message;
+  return el("div", { class: "card", style: "border-top:0;padding-top:0" },
+    el("h2", { style: "margin-top:12px" }, "Auto-tune"),
+    el("div", { class: "desc" }, "Calibrates the checks to this band from recently recorded IQ: finds the weights whose top detections sound most like speech, then sets the thresholds to give about the rate you choose. Needs Record raw IQ on."),
+    el("div", { class: "row wide" }, el("label", {}, "Analyse the last"), mins),
+    el("div", { class: "row" }, el("label", {}, "Target detections"), rate, rateOut),
+    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go,
+      st.state === "done" ? el("button", { class: "btn", onclick: () => fetch("/api/autotune/revert", { method: "POST" }) }, "Revert") : null),
+    out);
+}
+function onTune(m) {
+  const was = TUNE.state.state; TUNE.state = m;
+  if (m.state === "done" && was === "running" && m.result) setMinConf(m.result.show_threshold);
+  if (!$("#detector").contains(document.activeElement) || m.state !== "running") buildDetector();
 }
 
 // ---------------- receiver tab (advanced) ----------------
@@ -729,6 +784,8 @@ async function buildSDR() {
     el("div", { class: "row wide" }, el("label", {}, "Record raw IQ continuously"), toggle(c.iq_ring.enabled, v => patch({ iq_ring: { enabled: v } }))),
     slider("IQ ring size", ["iq_ring", "max_gb"], 0.5, 100, 0.5, v => v + " GB"),
     el("div", { class: "row wide" }, el("label", {}, "Keep a small IQ clip with each recording"), toggle(c.record.save_iq, v => patch({ record: { save_iq: v } }))),
+    slider("Save to disk at confidence ≥", ["record", "min_save_conf"], 0, 1, 0.01, v => Math.round(v * 100) + "%"),
+    slider("Detection audio kept in memory", ["record", "memory_mb"], 50, 4000, 50, v => (v >= 1000 ? (v / 1000).toFixed(1) + " GB" : v + " MB")),
     slider("Recordings size", ["record", "max_mb"], 100, 20000, 100, v => (v >= 1000 ? (v / 1000).toFixed(1) + " GB" : v + " MB")),
     slider("Always keep free on disk", ["storage", "min_free_gb"], 1, 100, 1, v => v + " GB"),
     slider("Waterfall history (memory)", ["display", "history_min"], 2, 60, 1, v => v + " min"),
@@ -751,6 +808,14 @@ $("#sreset").addEventListener("click", () => {
 });
 $("#cmap").value = S.cmap;
 $("#cmap").addEventListener("change", e => setCmap(e.target.value));
+$("#minConf").value = Math.round(S.minConf * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(S.minConf * 100) + "%";
+let confTimer = null;
+function setMinConf(v) {
+  S.minConf = v; lsSet("gb_minconf", v);
+  $("#minConf").value = Math.round(v * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(v * 100) + "%";
+  renderLive(); clearTimeout(confTimer); confTimer = setTimeout(() => loadPage(true), 250);
+}
+$("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
 $("#caps").checked = lsGet("gb_caps", "1") === "1";
 $("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
 let WS = null;
@@ -807,6 +872,7 @@ function connect() {
         setStatus(m.status || {});
         for (const b of m.detections) S.dets.set(b.id, { box: b, ended: false, playing: [], pcm: [] });
         buildTop(); buildDetector(); loadPage(true);
+        fetch("/api/autotune").then(r => r.json()).then(t => { TUNE.state = t; buildDetector(); });
         const t = m.status && m.status.t; if (t) fetchHistory(t - 240, t + 5);
         break;
       }
@@ -822,6 +888,8 @@ function connect() {
       case "det_end": { const d = S.dets.get(m.box.id); if (d) { d.box = m.box; d.ended = true; } renderLive(); break; }
       case "audio": onAudio(m); break;
       case "recording": onRecording(m.meta); break;
+      case "saved": onSaved(m); break;
+      case "autotune": onTune(m); break;
       case "transcript": onTranscript(m); break;
     }
   };

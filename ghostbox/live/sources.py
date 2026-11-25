@@ -109,13 +109,18 @@ class ProcSource(Source):
 
 
 class FileSource(Source):
-    """Replays a .cu8/.cs8 capture at real-time pace, looping."""
+    """Replays one or more .cu8/.cs8 captures (played back to back).
 
-    def __init__(self, path, fs, fc):
-        self.path, self.fs, self.fc = Path(path), fs, fc
-        self.signed = self.path.suffix == ".cs8"
-        self.raw = np.memmap(self.path, dtype=np.int8 if self.signed else np.uint8, mode="r")
-        self.pos = 0
+    paced=True: real-time pace (for live replay); False: as fast as the reader asks (auto-tune).
+    loop=True: start over at the end; False: read() returns None once the data runs out."""
+
+    def __init__(self, paths, fs, fc, paced=True, loop=True):
+        paths = [paths] if isinstance(paths, (str, Path)) else list(paths)
+        self.paths, self.fs, self.fc, self.paced, self.loop = [Path(p) for p in paths], fs, fc, paced, loop
+        self.signed = self.paths[0].suffix == ".cs8"
+        self.raws = [np.memmap(p, dtype=np.int8 if self.signed else np.uint8, mode="r") for p in self.paths]
+        self.total = sum(len(r) for r in self.raws) // 2
+        self.idx, self.pos = 0, 0
         self.t0 = None
         self.sent = 0
         self.dropped = 0
@@ -124,19 +129,25 @@ class FileSource(Source):
     def read(self, n, timeout=2.0):
         if self.t0 is None:
             self.t0 = time.time()
-        # pace: don't run ahead of wall clock
-        ahead = (self.sent + n) / self.fs - (time.time() - self.t0)
-        if ahead > 0:
-            time.sleep(ahead)
+        if self.paced:                                   # don't run ahead of wall clock
+            ahead = (self.sent + n) / self.fs - (time.time() - self.t0)
+            if ahead > 0:
+                time.sleep(ahead)
         need = 2 * n
         out = []
         while need > 0:
-            take = min(need, len(self.raw) - self.pos)
-            out.append(np.asarray(self.raw[self.pos:self.pos + take]))
+            raw = self.raws[self.idx]
+            take = min(need, len(raw) - self.pos)
+            out.append(np.asarray(raw[self.pos:self.pos + take]))
             self.pos += take
             need -= take
-            if self.pos >= len(self.raw):
-                self.pos = 0  # loop
+            if self.pos >= len(raw):
+                self.idx, self.pos = self.idx + 1, 0
+                if self.idx >= len(self.raws):
+                    if not self.loop:
+                        self.status = "finished"
+                        return None
+                    self.idx = 0
         self.sent += n
         self.last_raw = np.concatenate(out)
         return _to_complex(self.last_raw, self.signed)

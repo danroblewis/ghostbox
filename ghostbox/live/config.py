@@ -100,7 +100,9 @@ DEFAULT = {
     },
     "audio": {"delay_s": 4.0, "bandwidth_hz": 3400},
     "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0,
-               "max_mb": 2000},                 # ring buffer: oldest recordings deleted beyond this
+               "max_mb": 2000,                  # ring buffer: oldest recordings deleted beyond this
+               "min_save_conf": 0.70,           # only detections at least this confident are written to disk
+               "memory_mb": 300},               # audio of the rest is kept in memory (oldest dropped first)
     "iq_ring": {"enabled": False, "dir": "iq_ring", "max_gb": 4.0, "segment_s": 10,
                 "record_replays": False},       # continuous raw IQ, oldest segments deleted beyond max_gb
     "storage": {"min_free_gb": 10.0},           # disk guard: below this, trim the IQ ring, then pause writing

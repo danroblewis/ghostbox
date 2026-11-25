@@ -15,9 +15,10 @@ import numpy as np
 
 
 class Transcriber:
-    def __init__(self, config, emit):
+    def __init__(self, config, emit, on_result=None):
         self.config = config
         self.emit = emit
+        self.on_result = on_result          # (keys, field, result): update in-memory detections
         self.q = queue.Queue(maxsize=50)
         self.model, self.model_name = None, None
         self.error = ""
@@ -62,8 +63,10 @@ class Transcriber:
                 }
                 self.emit({"type": "transcript", "kind": item["kind"], "id": item["id"],
                            "chain": item["chain"], "wav": item.get("wav"), "members": item.get("members"),
-                           **res})
+                           "keys": item.get("keys", []), **res})
                 key = "transcript" if item["kind"] == "track" else "chain_transcript"
+                if self.on_result:
+                    self.on_result(item.get("keys", []), key, res)
                 for p in item.get("meta_paths", []):
                     try:
                         m = json.loads(p.read_text())

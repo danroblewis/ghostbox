@@ -91,7 +91,7 @@ canvas#wf{position:absolute;inset:0;width:100%;height:100%;display:block}
 h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 
 /* detections table: one line each */
-.dethead,.det{display:grid;grid-template-columns:26px 82px 60px minmax(0,1fr) 34px;align-items:center;gap:8px;padding:0 12px 0 10px}
+.dethead,.det{display:grid;grid-template-columns:26px 82px 60px minmax(0,1fr) 30px 20px;align-items:center;gap:8px;padding:0 12px 0 10px}
 .dethead{height:28px;font-size:11px;color:var(--text-3);border-bottom:1px solid var(--line)}
 .dethead span:last-child{text-align:right}
 .det{position:relative;height:34px;border-bottom:1px solid var(--line);cursor:pointer;
@@ -111,6 +111,10 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .det .x.doubt{color:var(--text-2)}
 .det .c{font-family:var(--mono);font-size:11.5px;color:var(--text-2);text-align:right}
 .det.hi .c{color:var(--mark)}
+.det .sv{width:20px;height:20px;border:0;background:none;padding:0;cursor:pointer;color:var(--text-3);display:flex;align-items:center;justify-content:center}
+.det .sv svg{width:11px;height:11px}
+.det .sv:hover{color:var(--text)}
+.det .sv.done{cursor:default;color:var(--text-3)}
 .det .live{position:absolute;left:3px;top:50%;transform:translateY(-50%);width:4px;height:4px;border-radius:50%;background:var(--alarm)}
 #detHead{display:flex;align-items:center;gap:12px;padding:8px 12px}
 .search{flex:1;min-width:0;height:26px;border:0;border-bottom:1px solid var(--line-strong);background:transparent;padding:0 2px;outline:none;color:var(--text)}
@@ -176,6 +180,7 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
       <span class="lbl">Min</span><input id="smin" type="range" min="0" max="254" step="1" value="0">
       <span class="lbl">Max</span><input id="smax" type="range" min="1" max="255" step="1" value="255">
       <button id="sreset" class="btn">Auto</button>
+      <span class="lbl" style="margin-left:6px">Min confidence</span><input id="minConf" type="range" min="0" max="100" step="1" style="width:120px"><span id="minConfOut" class="num t2" style="min-width:34px"></span>
       <label class="lbl" style="display:flex;align-items:center;gap:6px"><span class="switch"><input id="caps" type="checkbox" checked><span></span></span>Captions</label>
     </div>
     <div id="wfwrap">
@@ -194,7 +199,7 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
     </div>
     <div id="dets" class="tab active">
       <div id="detHead"><span class="t2" id="detCount"></span><input id="search" class="search" type="search" placeholder="Search" title="Search transcripts and frequencies" autocomplete="off"></div>
-      <div class="dethead"><span></span><span>Frequency</span><span>Time</span><span>Transcript</span><span>Conf.</span></div>
+      <div class="dethead"><span></span><span>Frequency</span><span>Time</span><span>Transcript</span><span>Conf.</span><span></span></div>
       <div id="liveList"></div><div id="savedList"></div><div id="listMore" class="note" style="text-align:center"></div>
     </div>
     <div id="detector" class="tab pad"></div>

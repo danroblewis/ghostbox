@@ -15,6 +15,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
+from .autotune import AutoTune
 from .engine import Engine
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +80,7 @@ def make_app(args):
         hub = Hub(asyncio.get_running_loop())
         state["hub"] = hub
         state["engine"] = Engine(config, hub.emit, ROOT)
+        state["tune"] = AutoTune(ROOT, config, hub.emit, apply)
 
     async def on_cleanup(app):
         state["engine"].stop()
@@ -185,23 +187,34 @@ def make_app(args):
         m["confidence"].pop("history", None)
         for k in ("checks", "detect", "path", "sdr"):
             m.pop(k, None)
+        m.setdefault("saved", True)
+        m.setdefault("key", "wav:" + m["files"]["wav"])
+        m.setdefault("clip", "/rec/" + m["files"]["wav"])
         meta_cache[p] = (mt, m)
         return m
 
-    def list_recordings(offset, limit, q):
+    def list_recordings(offset, limit, q, min_conf=0.0):
+        """Detections newest first: in-memory ones (not saved) merged with saved ones on disk."""
         d = rec_dir()
-        if not d.exists():
-            return {"total": 0, "items": []}
-        paths = sorted(d.glob("*.json"), reverse=True)
+        paths = sorted(d.glob("*.json"), reverse=True) if d.exists() else []
         live = set(paths)
         for k in [k for k in meta_cache if k not in live]:
             meta_cache.pop(k, None)
-        q = q.strip().lower()
-        out, matched = [], 0
+        metas = []
         for p in paths:
             try:
-                m = slim_meta(p)
+                metas.append(slim_meta(p))
             except Exception:
+                continue
+        for m in state["engine"].mem_list():
+            m = {k: v for k, v in m.items() if k not in ("checks", "detect", "path", "sdr")}
+            m["confidence"] = {k: v for k, v in m["confidence"].items() if k != "history"}
+            metas.append(m)
+        metas.sort(key=lambda m: m.get("utc_start", ""), reverse=True)
+        q = q.strip().lower()
+        out, matched = [], 0
+        for m in metas:
+            if m["confidence"]["max"] < min_conf:
                 continue
             if q:
                 hay = " ".join([(m.get("transcript") or {}).get("text", ""),
@@ -219,8 +232,34 @@ def make_app(args):
         offset = max(0, int(request.query.get("offset", 0)))
         limit = max(1, min(500, int(request.query.get("limit", 100))))
         q = request.query.get("q", "")
-        res = await asyncio.get_running_loop().run_in_executor(None, list_recordings, offset, limit, q)
-        return web.json_response(res)
+        min_conf = float(request.query.get("min_conf", 0))
+        res = await asyncio.get_running_loop().run_in_executor(None, list_recordings, offset, limit, q, min_conf)
+        return web.json_response(res, dumps=lambda o: json.dumps(o, default=float))
+
+    async def clip(request):
+        key = request.query.get("key", "")
+        data = await asyncio.get_running_loop().run_in_executor(None, state["engine"].clip, key)
+        if data is None:
+            raise web.HTTPNotFound(text="audio no longer available (dropped from memory and not in the IQ ring)")
+        return web.Response(body=data, content_type="audio/wav")
+
+    async def save(request):
+        key = (await request.json()).get("key", "")
+        meta = await asyncio.get_running_loop().run_in_executor(None, state["engine"].save, key)
+        if meta is None:
+            return web.json_response({"error": "not available"}, status=404)
+        return web.json_response(meta, dumps=lambda o: json.dumps(o, default=float))
+
+    async def tune_start(request):
+        b = await request.json()
+        ok = state["tune"].start(b.get("minutes", 2), b.get("per_min", 6))
+        return web.json_response({"ok": ok, **state["tune"].state})
+
+    async def tune_get(request):
+        return web.json_response(state["tune"].state, dumps=lambda o: json.dumps(o, default=float))
+
+    async def tune_revert(request):
+        return web.json_response({"ok": state["tune"].revert()})
 
     async def rec_file(request):
         name = request.match_info["name"]
@@ -255,6 +294,12 @@ def make_app(args):
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws)
     app.router.add_get("/api/history", history)
+    app.router.add_get("/api/detections", recordings)
+    app.router.add_get("/api/clip", clip)
+    app.router.add_post("/api/save", save)
+    app.router.add_post("/api/autotune", tune_start)
+    app.router.add_get("/api/autotune", tune_get)
+    app.router.add_post("/api/autotune/revert", tune_revert)
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", post_config)
     app.router.add_post("/api/preset", post_preset)
