@@ -1,4 +1,4 @@
-# spiritbox-sdr (ghostbox)
+# ghostbox
 
 An SDR-native spirit box. A classic spirit box sweeps one tuner across the broadcast band and
 leaves it to the listener to hear words in the fragments. ghostbox works the other way round: it
@@ -62,7 +62,7 @@ tools above. One command installs the `ghostbox` command with everything the def
 including the ML voice detector and Whisper speech recognition:
 
 ```sh
-uv tool install git+https://github.com/danroblewis/spiritbox-sdr.git
+uv tool install git+https://github.com/danroblewis/ghostbox.git
 ```
 
 The first install downloads about 140 MB (mostly PyTorch) and takes about 900 MB on disk; Whisper's
@@ -85,13 +85,13 @@ Optional extra speech engines:
 | `plots` | matplotlib | the offline analysis script `ghostbox.analyze` |
 | `all` | all of the above | |
 
-e.g. `uv tool install "ghostbox[all] @ git+https://github.com/danroblewis/spiritbox-sdr.git"`.
+e.g. `uv tool install "ghostbox[all] @ git+https://github.com/danroblewis/ghostbox.git"`.
 
 ### From a clone (for development)
 
 ```sh
-git clone https://github.com/danroblewis/spiritbox-sdr.git
-cd spiritbox-sdr
+git clone https://github.com/danroblewis/ghostbox.git
+cd ghostbox
 uv sync            # add --all-extras for the optional engines
 uv run ghostbox --open
 ```

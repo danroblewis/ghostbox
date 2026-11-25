@@ -207,7 +207,7 @@ class Transcriber:
                 if self._missing != key:
                     self._missing = key
                     print(f"ghostbox: speech recognition unavailable ({e.name or e}); reinstall "
-                          "to get it:  uv tool install --reinstall git+https://github.com/danroblewis/spiritbox-sdr.git", flush=True)
+                          "to get it:  uv tool install --reinstall git+https://github.com/danroblewis/ghostbox.git", flush=True)
                 self.error = (f"Speech recognition isn't installed ({e.name or e} is missing). "
                               "Reinstall ghostbox (see the README), or pick another engine.")
             except Exception as e:
