@@ -37,6 +37,7 @@ from ..maps import power_frames
 from . import stage1, stage2
 from .config import CHECKS
 from .sources import _to_complex, make_source
+from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, fade, render_clip
 from .transcribe import Transcriber
 
 AUDIO_FS = 16000
@@ -101,6 +102,9 @@ class Track:
         self.conf_hist = []
         self.scores, self.info = {}, {}
         self.hp_zi = None
+        self.out = []                    # processed playback audio [(t_start, float32)]: denoise + gain + fades
+        self.den, self.gain = None, SmoothGain()
+        self.audio_t0 = None             # stream time where this track's audio (incl. pre-roll) starts
         self.agc = None
         self.seg_start = t               # recording segment start
         self.seg_index = 0
@@ -128,7 +132,8 @@ class Track:
                 "path": [[round(t, 3), fc + f] for t, f in self.path[-200:]],
                 "conf": round(self.conf, 3),
                 "scores": {k: round(v, 3) for k, v in self.scores.items()},
-                "info": self.info, "wavs": list(self.wavs), "clips": list(self.clips), "detected": self.detected}
+                "info": self.info, "wavs": list(self.wavs), "clips": list(self.clips), "detected": self.detected,
+                "audio_t0": self.audio_t0 if self.audio_t0 is not None else self.t0}
 
 
 class Engine:
@@ -445,12 +450,15 @@ class Engine:
         alive = []
         # demodulate every track's new audio in parallel (the heavy, full-rate part)
         jobs = []
+        au = cfg["audio"]
+        post = min(au.get("postroll_s", 0.5), max(0.0, cfg["analysis"]["settle_s"] - 0.3))
         for tr in self.tracks:
-            t_from = tr.audio_until if tr.audio_until is not None else tr.t0 - 0.5 / self.fr
-            t_to = min(tb, tr.t_last + 0.5 / self.fr)
+            ending = tb - tr.t_last > det["track_gap_s"]
+            t_from = tr.audio_until if tr.audio_until is not None else tr.t0 - au.get("preroll_s", 0.5)
+            t_to = tr.t_last + post if ending else min(tb, tr.t_last + 0.5 / self.fr)
             if t_to - t_from > 0.02:
-                jobs.append((tr, t_from, t_to))
-        list(self.pool.map(lambda j: self._demod_track(j[0], j[1], j[2], cfg), jobs))
+                jobs.append((tr, t_from, t_to, ending))
+        list(self.pool.map(lambda j: self._demod_track(j[0], j[1], j[2], cfg, j[3]), jobs))
         for tr in self.tracks:
             ended = tb - tr.t_last > det["track_gap_s"]
             # stage 2 on the last 3 s, stage 1 averaged over the last 1 s of the track
@@ -518,7 +526,7 @@ class Engine:
         a = np.concatenate([c for _, c in chunks])
         return a[-int(secs * AUDIO_FS):]
 
-    def _demod_track(self, tr, t_from, t_to, cfg):
+    def _demod_track(self, tr, t_from, t_to, cfg, ending=False):
         pad = int(0.02 * self.fs)
         s0, s1 = int(t_from * self.fs), int(t_to * self.fs)
         x, s0r = self._raw_span(s0 - pad, s1 + pad)
@@ -535,17 +543,28 @@ class Engine:
             tr.hp_zi = sosfilt_zi(self._hp) * float(env[0] if len(env) else 0)
         audio, tr.hp_zi = sosfilt(self._hp, env, zi=tr.hp_zi)
         audio = audio.astype(np.float32)
-        tr.audio.append((t_from, audio))
+        tr.audio.append((t_from, audio))                     # raw: what the checks judge
         tr.iq.append((t_from, iq.astype(np.complex64)))
         tr.audio_until = t_to
+        # playback chain: noise reduction -> gliding level -> fades at the very start / end
+        au = cfg["audio"]
+        first = tr.audio_t0 is None
+        if first:
+            tr.audio_t0 = t_from
+            tr.seg_start = t_from
+            if au.get("denoise", True):
+                tr.den = StreamingDenoiser(au.get("denoise_strength", 1.0), au.get("denoise_floor_db", -18.0))
+        y = tr.den.process(audio) if tr.den else audio
+        y = tr.gain.process(y)
+        y = fade(y, AUDIO_FS, au.get("fade_s", 0.15) if first else 0.0, au.get("fade_s", 0.15) if ending else 0.0)
+        lag = 512 / _AFS if tr.den else 0.0                 # the denoiser delays its output by 32 ms
+        tr.out.append((t_from - lag, y))
 
     def _emit_audio(self, tr):
-        for t, a in tr.audio:
+        for t, a in tr.out:
             if tr.emitted_until is not None and t < tr.emitted_until - 1e-6:
                 continue
-            rms = float(np.sqrt(np.mean(a ** 2)) + 1e-9)
-            tr.agc = rms if tr.agc is None else 0.8 * tr.agc + 0.2 * rms
-            pcm = np.clip(a / (4 * tr.agc), -1, 1)
+            pcm = np.clip(a, -1, 1)
             self.emit({"type": "audio", "id": tr.id, "t": round(t, 4), "rate": AUDIO_FS,
                        "pcm": _b64((pcm * 32767).astype(np.int16))})
             tr.emitted_until = t + len(a) / AUDIO_FS
@@ -556,13 +575,14 @@ class Engine:
         if self.storage["paused"]:
             rec = dict(rec, enabled=False)           # disk guard: keep detecting, stop writing
         seg_t0 = tr.seg_start
-        audio = [(t, a) for t, a in tr.audio if t >= seg_t0 - 1e-6]
+        audio = [(t, a) for t, a in tr.out if t >= seg_t0 - 0.05]
         iq = [(t, a) for t, a in tr.iq if t >= seg_t0 - 1e-6]
         if not final:
             tr.seg_start = tr.audio_until or tr.t_last
             tr.seg_index += 1
             keep_from = tr.seg_start - 3.0                  # stage 2 still needs recent audio
             tr.audio = [(t, a) for t, a in tr.audio if t >= keep_from]
+            tr.out = [(t, a) for t, a in tr.out if t >= keep_from]
             tr.iq = [(t, a) for t, a in tr.iq if t >= keep_from]
         if not audio:
             return
@@ -572,7 +592,7 @@ class Engine:
         utc = datetime.fromtimestamp(self.utc0 + seg_t0, timezone.utc)
         fr = [p[1] for p in tr.path]
         f_mean = self.fc + float(np.mean([fr_[1] for fr_ in tr.frames if fr_[0] >= seg_t0] or fr))
-        pcm = np.clip(a / (4 * (np.sqrt(np.mean(a ** 2)) + 1e-9)), -1, 1)
+        pcm = np.clip(a, -1, 1)                               # already level-controlled and faded
         conf_max = max([c for _, c in tr.conf_hist] or [0])
         meta = {
             "id": tr.id, "chain": tr.chain, "segment": tr.seg_index, "epoch": self.t_origin,
@@ -695,7 +715,7 @@ class Engine:
         d = self.root / cfg["iq_ring"]["dir"]
         if not d.exists():
             return None
-        t0, t1 = meta["stream_t0"] - 0.05, meta["stream_t1"] + 0.1
+        t0, t1 = meta["stream_t0"] - 0.05, meta["stream_t1"] + cfg["audio"].get("postroll_s", 0.5)
         segs = []
         for j in sorted(d.glob("*.json")):
             try:
@@ -728,7 +748,7 @@ class Engine:
         _, env = demod(x, fs, f_off, cfg["audio"]["bandwidth_hz"])
         hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
         audio = sosfilt(hp, env - env[:200].mean())
-        audio = np.clip(audio / (4 * (np.sqrt(np.mean(audio ** 2)) + 1e-9)), -1, 1)
+        audio = np.clip(render_clip(audio, cfg["audio"]), -1, 1)
         return (audio * 32767).astype(np.int16)
 
     # ---------------- continuous IQ ring + size limits ----------------

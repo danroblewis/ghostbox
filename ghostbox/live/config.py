@@ -98,7 +98,9 @@ DEFAULT = {
         "link_hops_s": 0.4,                 # a new track starting this soon after one ends = same voice (hop)
         "min_duration_s": 0.4,
     },
-    "audio": {"delay_s": 4.0, "bandwidth_hz": 3400},
+    "audio": {"delay_s": 4.0, "bandwidth_hz": 3400,
+              "preroll_s": 0.5, "postroll_s": 0.5, "fade_s": 0.15,      # ease detections in and out
+              "denoise": True, "denoise_strength": 1.0, "denoise_floor_db": -18.0},
     "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0,
                "max_mb": 2000,                  # ring buffer: oldest recordings deleted beyond this
                "min_save_conf": 0.70,           # only detections at least this confident are written to disk

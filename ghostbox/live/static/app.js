@@ -131,7 +131,15 @@ function liveTop() { return S.offset === null ? null : nowS() - S.offset - S.lag
 // The playhead is the stream time being heard: live minus S.delay. Live listening is just a small delay;
 // clicking the waterfall moves the playhead anywhere in history and playback continues from there.
 // While following, the view keeps the playhead line S.lineY seconds below the top edge.
-function playheadTime() { return nowS() - S.offset - S.delay; }
+function playheadTime() { return S.paused ? S.pausedAt : nowS() - S.offset - S.delay; }
+function setPaused(p) {
+  if (p === !!S.paused || S.offset === null) return;
+  if (p) { S.pausedAt = playheadTime(); S.paused = true; }
+  else { S.delay = Math.max(S.lag, nowS() - S.offset - S.pausedAt); S.paused = false; }
+  $("#pp").innerHTML = S.paused ? ICON_PLAY : ICON_PAUSE; $("#pp").title = S.paused ? "Resume playback (Space)" : "Pause playback (Space)";
+  $("#pp").classList.toggle("on", S.paused);
+  restartPlayback(); updateNav();
+}
 function topTime() {
   const live = liveTop(); if (live === null) return null;
   return S.follow ? Math.min(live, playheadTime() + S.lineY) : S.viewTop;
@@ -217,12 +225,12 @@ function draw() {
     caption(`Chain: “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 16 * dpr, tx.no_speech_prob > 0.6, false);
   }
   // playback line (draggable): the stream time being heard right now
-  const yPlay = (top - (now - S.offset - S.delay)) * pps;
+  const yPlay = (top - playheadTime()) * pps;
   if (yPlay >= -2 && yPlay <= H + 2) {
     ctx.save(); ctx.strokeStyle = TH.mark; ctx.globalAlpha = dragging ? 1 : 0.8; ctx.lineWidth = (dragging ? 1.5 : 1) * dpr;
     ctx.setLineDash([6 * dpr, 4 * dpr]); ctx.beginPath(); ctx.moveTo(0, yPlay); ctx.lineTo(W, yPlay); ctx.stroke(); ctx.setLineDash([]);
     const back = S.delay < 60 ? `−${S.delay.toFixed(2)} s` : `−${Math.floor(S.delay / 60)}:${pad2(Math.floor(S.delay % 60))}`;
-    const label = S.delay < 15 ? `Playback  ${back}` : `Playback  ${clockTime(playheadTime())}  (${back})`;
+    const label = S.paused ? `Paused  ${clockTime(playheadTime())}` : S.delay < 15 ? `Playback  ${back}` : `Playback  ${clockTime(playheadTime())}  (${back})`;
     const lw = ctx.measureText(label).width;
     ctx.globalAlpha = 1; ctx.fillStyle = TH.bg; ctx.fillRect(W - lw - 18 * dpr, yPlay - 9 * dpr, lw + 12 * dpr, 18 * dpr);
     ctx.fillStyle = TH.mark; ctx.fillText(label, W - lw - 12 * dpr, yPlay + 4 * dpr);
@@ -233,6 +241,7 @@ function draw() {
     ctx.fillText(`History — ${(liveTop() - top).toFixed(0)} s before live`, 6 * dpr, H - 26 * dpr);
   }
   ensureHistory(top, H / dpr);
+  drawScope();
   if (Math.random() < 0.01) evictChunks(top);
   updateRowProgress();
 }
@@ -259,18 +268,20 @@ function boxAt(x, y) {
   return null;
 }
 function setPlayhead(t, lineY) {
+  if (S.paused) { S.paused = false; $("#pp").innerHTML = ICON_PAUSE; $("#pp").classList.remove("on"); }
   const maxBack = 60 * ((S.cfg && S.cfg.display.history_min) || 20);
   S.delay = Math.max(S.lag, Math.min(maxBack, Math.round((nowS() - S.offset - t) * 4) / 4));
   S.lineY = Math.max(0, Math.min(lineY, S.delay - S.lag));
   S.follow = true; updateNav();
 }
 function returnToLive() {
+  if (S.paused) { S.paused = false; $("#pp").innerHTML = ICON_PAUSE; $("#pp").classList.remove("on"); }
   S.delay = Math.max(S.lag, +lsGet("gb_delay", 4)); S.lineY = S.delay - S.lag; S.follow = true;
   updateNav(); restartPlayback();
 }
 function updateNav() {
   $("#followBtn").style.display = S.follow ? "none" : "inline-flex";
-  $("#liveBtn").style.display = S.delay > Math.max(8, +lsGet("gb_delay", 4) + 2) ? "inline-flex" : "none";
+  $("#liveBtn").style.display = S.paused || S.delay > Math.max(8, +lsGet("gb_delay", 4) + 2) ? "inline-flex" : "none";
 }
 cv.addEventListener("mousedown", e => {
   const [x, y] = canvasPos(e);
@@ -315,6 +326,11 @@ cv.addEventListener("wheel", e => {
   updateNav();
 }, { passive: false });
 $("#followBtn").addEventListener("click", () => { S.follow = true; updateNav(); });
+$("#pp").addEventListener("click", () => setPaused(!S.paused));
+window.addEventListener("keydown", e => {
+  if (e.code !== "Space" || /input|select|textarea|button/i.test(e.target.tagName)) return;
+  e.preventDefault(); setPaused(!S.paused);
+});
 $("#liveBtn").addEventListener("click", returnToLive);
 function jumpTo(t) {
   const H = cv.clientHeight; S.follow = false; S.viewTop = Math.min(liveTop(), t + H / S.pps * 0.4);
@@ -324,7 +340,11 @@ function jumpTo(t) {
 // ---------------- audio ----------------
 let AC = null, master = null;
 function ensureAudio() {
-  if (!AC) { AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.connect(AC.destination); master.gain.value = +$("#vol").value; }
+  if (!AC) {
+    AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.connect(AC.destination);
+    master.gain.value = +$("#vol").value;
+    SCOPE.an = AC.createAnalyser(); SCOPE.an.fftSize = 2048; SCOPE.an.smoothingTimeConstant = 0; master.connect(SCOPE.an);
+  }
   const b = $("#audioBtn"); b.textContent = "Audio on"; b.classList.remove("primary"); b.classList.add("on");
   AC.resume().then(restartPlayback);                       // schedule once audio is actually running
 }
@@ -335,6 +355,57 @@ $("#audioBtn").addEventListener("click", () => {
   ensureAudio();
 });
 $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) master.gain.value = +e.target.value; });
+
+// ---------------- audio scope: waveform + scrolling spectrogram of what is playing ----------------
+const SCOPE = { an: null, img: null, col: 0 };
+const scv = $("#scope"), sctx = scv.getContext("2d");
+function nowPlaying() {
+  const now = nowS(); let best = null;
+  for (const d of S.dets.values()) if (d.playing.some(([a, z]) => now >= a && now <= z) && (!best || d.box.conf > best.box.conf)) best = d;
+  return best;
+}
+function drawScope() {
+  if (!$("#scopeWrap").offsetParent) return;
+  const dpr = devicePixelRatio, W = scv.clientWidth * dpr, H = scv.clientHeight * dpr;
+  if (scv.width !== W || scv.height !== H) { scv.width = W; scv.height = H; SCOPE.img = null; }
+  const waveW = Math.round(W * 0.28), specX = waveW + 8 * dpr, specW = W - specX;
+  const live = AC && AC.state === "running" && SCOPE.an;
+  // waveform
+  sctx.fillStyle = TH.bg; sctx.fillRect(0, 0, waveW, H);
+  sctx.strokeStyle = TH.grid; sctx.beginPath(); sctx.moveTo(0, H / 2); sctx.lineTo(waveW, H / 2); sctx.stroke();
+  if (live) {
+    const buf = new Float32Array(SCOPE.an.fftSize); SCOPE.an.getFloatTimeDomainData(buf);
+    sctx.strokeStyle = TH.mark; sctx.lineWidth = 1.2 * dpr; sctx.beginPath();
+    for (let i = 0; i < buf.length; i++) { const x = i / buf.length * waveW, y = H / 2 - buf[i] * H * 0.45; i ? sctx.lineTo(x, y) : sctx.moveTo(x, y); }
+    sctx.stroke();
+  }
+  // scrolling spectrogram, 0-4 kHz (the voice band), newest at the right
+  if (!SCOPE.img || SCOPE.img.width !== Math.max(1, Math.round(specW)) || SCOPE.img.height !== H) {
+    SCOPE.img = document.createElement("canvas"); SCOPE.img.width = Math.max(1, Math.round(specW)); SCOPE.img.height = H;
+    const c = SCOPE.img.getContext("2d"); c.fillStyle = TH.bg; c.fillRect(0, 0, SCOPE.img.width, H);
+  }
+  const ic = SCOPE.img.getContext("2d");
+  ic.drawImage(SCOPE.img, -2, 0);                          // scroll left by 2 px per frame
+  const col = ic.createImageData(2, H);
+  if (live) {
+    const bins = new Uint8Array(SCOPE.an.frequencyBinCount); SCOPE.an.getByteFrequencyData(bins);
+    const hzPerBin = AC.sampleRate / SCOPE.an.fftSize, maxBin = Math.min(bins.length - 1, Math.round(4000 / hzPerBin));
+    for (let y = 0; y < H; y++) {
+      const v = bins[Math.round((1 - y / H) * maxBin)] * 4;
+      for (let x = 0; x < 2; x++) { const o = (y * 2 + x) * 4; col.data[o] = LUT[v]; col.data[o + 1] = LUT[v + 1]; col.data[o + 2] = LUT[v + 2]; col.data[o + 3] = 255; }
+    }
+  } else for (let i = 0; i < col.data.length; i += 4) { col.data[i] = col.data[i + 1] = col.data[i + 2] = 0; col.data[i + 3] = 255; }
+  ic.putImageData(col, SCOPE.img.width - 2, 0);
+  sctx.drawImage(SCOPE.img, specX, 0);
+  sctx.font = `${10.5 * dpr}px ${TH.mono}`; sctx.fillStyle = TH.text;
+  for (const k of [1, 2, 3]) { const y = H - k / 4 * H; sctx.fillText(k + " kHz", specX + 4 * dpr, y + 4 * dpr); }
+  // caption
+  const d = nowPlaying(), cap = $("#scopeCap");
+  const text = !live ? "Audio is off. Enable audio to hear and see playback." :
+    d ? `${fmtFshort((d.box.fmin + d.box.fmax) / 2)} · ${clockTime(d.box.t0)} · ${Math.round(d.box.conf * 100)}%${S.tx.get(d.box.id) && S.tx.get(d.box.id).text ? " · “" + S.tx.get(d.box.id).text + "”" : ""}`
+      : S.paused ? "Paused" : "Silence";
+  if (cap.textContent !== text) cap.textContent = text;
+}
 
 // Playback scheduler: every detection plays when the playhead reaches it. Audio comes from the
 // chunks received live (with their stream times) or, for older detections, from their WAV files.
@@ -371,13 +442,14 @@ function restartPlayback() {
   schedulePlayback();
 }
 function schedulePlayback() {
-  if (S.offset === null) return;
+  if (S.offset === null || S.paused) return;
   const ph = playheadTime(), horizon = ph + 30;
   for (const d of S.dets.values()) {
     if (!d.sched) d.sched = new Set();
     const b = d.box;
     if (b.t1 < ph - 0.5 || b.t0 > horizon) continue;
-    const chunks = d.chunks || [], whole = chunks.length && chunks[0].t <= b.t0 + 0.5;
+    const a0 = b.audio_t0 ?? b.t0;                         // audio starts before the box (pre-roll)
+    const chunks = d.chunks || [], whole = chunks.length && chunks[0].t <= a0 + 0.1;
     const wavs = b.clips && b.clips.length;
     if (whole || (chunks.length && !wavs)) {
       for (const c of chunks) {
@@ -388,11 +460,11 @@ function schedulePlayback() {
     } else if (wavs && !d.wavSched) {
       d.wavSched = true; const gen = PB.gen;
       if (!AC) {                                           // no audio yet: still light the box as the playhead passes
-        const when = b.t0 + S.offset + S.delay; d.playing.push([when, when + (b.t1 - b.t0)]); continue;
+        const when = a0 + S.offset + S.delay; d.playing.push([when, when + (b.t1 - a0)]); continue;
       }
       (d.wavBuf ? Promise.resolve(d.wavBuf) : (AC ? decodeClips(b.clips) : Promise.resolve(null))).then(buf => {
         if (buf) d.wavBuf = buf;
-        if (gen === PB.gen && buf) playAt(d, buf, b.t0);
+        if (gen === PB.gen && buf) playAt(d, buf, a0);
       });
     }
   }
@@ -406,7 +478,7 @@ function onAudio(m) {                                      // live chunk: keep i
   d.chunks = d.chunks || []; d.chunks.push({ t: m.t, pcm, rate: m.rate }); if (d.chunks.length > 150) d.chunks.shift();
   if (!d.sched) d.sched = new Set();
   const key = m.t.toFixed(3);
-  if (!d.sched.has(key) && m.t + pcm.length / m.rate >= playheadTime()) { d.sched.add(key); playAt(d, pcm, m.t, m.rate); }
+  if (!S.paused && !d.sched.has(key) && m.t + pcm.length / m.rate >= playheadTime()) { d.sched.add(key); playAt(d, pcm, m.t, m.rate); }
 }
 
 // click-to-play: a detection (live PCM or its recording) or a saved recording
@@ -779,6 +851,14 @@ async function buildSDR() {
     rowW("RTL-SDR ppm correction", ppm),
     rowW("Bin width", bin),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { ppm: +ppm.value }, analysis: { bin_hz: +bin.value } }) }, "Apply")),
+    el("h2", {}, "Playback audio"),
+    slider("Lead-in before a detection", ["audio", "preroll_s"], 0, 1.5, 0.05, v => v.toFixed(2) + " s"),
+    slider("Tail after a detection", ["audio", "postroll_s"], 0, 1.2, 0.05, v => v.toFixed(2) + " s"),
+    slider("Fade in / out", ["audio", "fade_s"], 0, 0.5, 0.01, v => Math.round(v * 1000) + " ms"),
+    el("div", { class: "row wide" }, el("label", {}, "Noise reduction"), toggle(c.audio.denoise !== false, v => patch({ audio: { denoise: v } }))),
+    slider("Noise reduction strength", ["audio", "denoise_strength"], 0, 2, 0.05, v => v.toFixed(2)),
+    slider("Keep noise at", ["audio", "denoise_floor_db"], -30, -3, 1, v => v + " dB"),
+    el("div", { class: "note" }, "Applies to new detections: what you hear, saved recordings and transcripts. The detector always judges the unprocessed audio. Strength 1 lowers background noise by about 10 dB; the floor keeps some atmosphere."),
     el("h2", {}, "Storage"),
     usage,
     el("div", { class: "row wide" }, el("label", {}, "Record raw IQ continuously"), toggle(c.iq_ring.enabled, v => patch({ iq_ring: { enabled: v } }))),
@@ -817,6 +897,8 @@ function setMinConf(v) {
 }
 $("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
 $("#caps").checked = lsGet("gb_caps", "1") === "1";
+$("#scopeOn").checked = lsGet("gb_scope", "1") === "1"; $("#scopeWrap").style.display = $("#scopeOn").checked ? "" : "none";
+$("#scopeOn").addEventListener("change", e => { lsSet("gb_scope", e.target.checked ? "1" : "0"); $("#scopeWrap").style.display = e.target.checked ? "" : "none"; });
 $("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
 let WS = null;
 function setView(mode) {
