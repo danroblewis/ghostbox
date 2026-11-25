@@ -17,3 +17,4 @@ venv/
 # live engine runtime data (access key, config) and detections
 live_data/
 recordings/
+iq_ring/

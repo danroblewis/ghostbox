@@ -14,7 +14,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from .config import CHECKS, PRESETS, VIEWS, Config
+from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
 from .engine import Engine
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -98,17 +98,13 @@ def make_app(args):
         await sock.send_str(json.dumps({
             "type": "hello", "config": config.get(), "checks": CHECKS, "views": VIEWS,
             "presets": {k: v["label"] for k, v in PRESETS.items()},
+            "sensitivity": SENSITIVITY, "epoch": eng.t_origin,
             "status": eng.status, "detections": eng.snapshot(),
             "reset": {"fc": getattr(eng, "fc", 0), "fs": getattr(eng, "fs", 0),
                       "fmin": getattr(eng, "f_lo", 0), "fmax": getattr(eng, "f_hi", 0),
                       "frame_rate": getattr(eng, "fr", 25)},
         }, default=float))
-        for m in list(getattr(eng, "wf_hist", [])):          # backfill the waterfall
-            await sock.send_str(json.dumps(m))
         hub.clients[q] = "power"
-
-        def sync_views():
-            eng.view_modes = set(hub.clients.values()) - {"power"}
 
         async def writer():
             while True:
@@ -127,13 +123,8 @@ def make_app(args):
                         continue
                     if m.get("type") == "view" and m.get("mode") in {v["id"] for v in VIEWS}:
                         hub.clients[q] = m["mode"]
-                        sync_views()
-                        if m["mode"] == "power":
-                            for h in list(eng.wf_hist):
-                                await sock.send_str(json.dumps(h))
         finally:
             hub.clients.pop(q, None)
-            sync_views()
             wt.cancel()
         return sock
 
@@ -143,6 +134,13 @@ def make_app(args):
             state["engine"].request_restart()
         state["hub"].emit({"type": "config", "config": cfg})
         return cfg
+
+    async def history(request):
+        view = request.query.get("view", "power")
+        t0, t1 = float(request.query.get("t0", 0)), float(request.query.get("t1", 1e12))
+        chunks, boxes = await asyncio.get_running_loop().run_in_executor(
+            None, state["engine"].history, view, t0, t1)
+        return web.json_response({"chunks": chunks, "boxes": boxes}, dumps=lambda o: json.dumps(o, default=float))
 
     async def get_config(request):
         return web.json_response(config.get())
@@ -195,11 +193,17 @@ def make_app(args):
         return web.FileResponse(p)
 
     async def capture_files(request):
-        d = ROOT / "captures"
-        return web.json_response([f"captures/{p.name}" for p in sorted(d.glob("*")) if p.suffix in (".cu8", ".cs8")])
+        out = []
+        for sub in ("captures", config.get()["iq_ring"]["dir"]):
+            d = ROOT / sub
+            if d.exists():
+                out += [f"{sub}/{p.name}" for p in sorted(d.glob("*"), reverse=sub != "captures")
+                        if p.suffix in (".cu8", ".cs8")]
+        return web.json_response(out)
 
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws)
+    app.router.add_get("/api/history", history)
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", post_config)
     app.router.add_post("/api/preset", post_preset)

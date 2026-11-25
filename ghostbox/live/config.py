@@ -76,8 +76,9 @@ DEFAULT = {
         "sample_rate": 4e6,
         "fmin_hz": 520e3,                   # analysis/display crop (absolute Hz); null = whole capture
         "fmax_hz": 1720e3,
-        "hackrf": {"amp": True, "lna": 16, "vga": 20},
-        "rtlsdr": {"gain": 8.7, "ppm": 0},
+        "gain_db": 36,                      # one gain for both radios (HackRF: split into LNA + VGA)
+        "amp": True,                        # HackRF RF amplifier (+14 dB); ignored by RTL-SDR
+        "ppm": 0,                           # RTL-SDR crystal correction
         "file": {"path": "captures/fm_96.6MHz_2.4Msps_g8.7_inj.cu8"},
     },
     "analysis": {"bin_hz": 125, "frame_rate": 25, "hop_s": 1.0, "window_s": 5.0,
@@ -98,8 +99,11 @@ DEFAULT = {
         "min_duration_s": 0.4,
     },
     "audio": {"delay_s": 4.0, "bandwidth_hz": 3400},
-    "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0},
-    "display": {"width": 1200, "dyn_range_db": 60.0},
+    "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0,
+               "max_mb": 2000},                 # ring buffer: oldest recordings deleted beyond this
+    "iq_ring": {"enabled": True, "dir": "iq_ring", "max_gb": 4.0, "segment_s": 10,
+                "record_replays": False},       # continuous raw IQ, oldest segments deleted beyond max_gb
+    "display": {"width": 1200, "dyn_range_db": 60.0, "history_min": 20},
     "whisper": {
         "enabled": True,
         "model": "base",                    # tiny | base | small | medium
@@ -126,19 +130,19 @@ VIEWS = [
 PRESETS = {
     "am_hackrf": {"label": "AM broadcast (HackRF)",
                   "sdr": {"source": "hackrf", "center_hz": 2.2e6, "sample_rate": 4e6,
-                          "fmin_hz": 520e3, "fmax_hz": 1720e3},
+                          "fmin_hz": 520e3, "fmax_hz": 1720e3, "gain_db": 36, "amp": True},
                   "checks": {"ring": {"enabled": False}}},
     "air_hackrf": {"label": "Airband 118-122 MHz (HackRF)",
                    "sdr": {"source": "hackrf", "center_hz": 120.0e6, "sample_rate": 4e6,
-                           "fmin_hz": 118.0e6, "fmax_hz": 121.9e6},
+                           "fmin_hz": 118.0e6, "fmax_hz": 121.9e6, "gain_db": 48, "amp": True},
                    "checks": {"ring": {"enabled": False}}},
     "fm_hackrf": {"label": "FM band 96-104 MHz (HackRF, ghosts only)",
                   "sdr": {"source": "hackrf", "center_hz": 100.0e6, "sample_rate": 8e6,
-                          "fmin_hz": 96.2e6, "fmax_hz": 103.8e6},
+                          "fmin_hz": 96.2e6, "fmax_hz": 103.8e6, "gain_db": 24, "amp": False},
                   "checks": {"ring": {"enabled": True}}},
     "air_rtl": {"label": "Airband 119.5 MHz (RTL-SDR)",
                 "sdr": {"source": "rtlsdr", "center_hz": 119.5e6, "sample_rate": 2.4e6,
-                        "fmin_hz": None, "fmax_hz": None},
+                        "fmin_hz": None, "fmax_hz": None, "gain_db": 29.7},
                 "checks": {"ring": {"enabled": False}}},
     "file_inj": {"label": "Replay: FM capture with injected AM voices",
                  "sdr": {"source": "file", "center_hz": 96.6e6, "sample_rate": 2.4e6,
@@ -156,6 +160,32 @@ PRESETS = {
                         "file": {"path": "captures/am_2.2MHz_4Msps_hackrf_a1l16g20.cs8"}},
                 "checks": {"ring": {"enabled": False}}},
 }
+
+
+# One-click detector sensitivity. "Ghost hunter" trades precision for many more candidates;
+# stage-2 voice checks are softened so more human-ish fragments get through.
+SENSITIVITY = {
+    "strict": {"label": "Strict", "detect": {"candidate_threshold": 0.35, "threshold": 0.65, "min_duration_s": 0.5,
+               "max_candidates": 6, "max_tracks": 12, "novelty": 0.8, "prominence": 0.5},
+               "checks": {"vad": {"weight": 1.5}, "comb": {"weight": 1.0}}},
+    "balanced": {"label": "Balanced", "detect": {"candidate_threshold": 0.30, "threshold": 0.55, "min_duration_s": 0.4,
+                 "max_candidates": 6, "max_tracks": 12, "novelty": 0.8, "prominence": 0.5},
+                 "checks": {"vad": {"weight": 1.0}, "comb": {"weight": 1.0}}},
+    "ghost": {"label": "Ghost hunter", "detect": {"candidate_threshold": 0.22, "threshold": 0.42, "min_duration_s": 0.25,
+              "max_candidates": 12, "max_tracks": 24, "novelty": 0.6, "prominence": 0.3},
+              "checks": {"vad": {"weight": 0.5}, "comb": {"weight": 0.7}}},
+    "everything": {"label": "Everything", "detect": {"candidate_threshold": 0.15, "threshold": 0.30, "min_duration_s": 0.2,
+                   "max_candidates": 20, "max_tracks": 40, "novelty": 0.4, "prominence": 0.2},
+                   "checks": {"vad": {"weight": 0.25}, "comb": {"weight": 0.5}}},
+}
+
+
+def hackrf_gains(gain_db):
+    """Split one gain figure into HackRF LNA (0-40, step 8) + VGA (0-62, step 2)."""
+    g = max(0.0, float(gain_db))
+    lna = int(min(40, 8 * int(g / 2 / 8)))
+    vga = int(min(62, max(0, 2 * round((g - lna) / 2))))
+    return lna, vga
 
 
 def deep_merge(base, patch):

@@ -132,14 +132,14 @@ def make_source(sdr):
     kind = sdr["source"]
     fs, fc = float(sdr["sample_rate"]), float(sdr["center_hz"])
     if kind == "hackrf":
-        h = sdr["hackrf"]
+        from .config import hackrf_gains
+        lna, vga = hackrf_gains(sdr.get("gain_db", 36))
         cmd = ["hackrf_transfer", "-r", "-", "-f", str(int(fc)), "-s", str(int(fs)),
-               "-a", "1" if h.get("amp") else "0", "-l", str(int(h["lna"])), "-g", str(int(h["vga"]))]
+               "-a", "1" if sdr.get("amp") else "0", "-l", str(lna), "-g", str(vga)]
         return ProcSource(cmd, fs, fc, signed=True)
     if kind == "rtlsdr":
-        r = sdr["rtlsdr"]
-        cmd = ["rtl_sdr", "-f", str(int(fc)), "-s", str(int(fs)), "-g", str(r["gain"]),
-               "-p", str(int(r.get("ppm", 0))), "-"]
+        cmd = ["rtl_sdr", "-f", str(int(fc)), "-s", str(int(fs)), "-g", str(sdr.get("gain_db", 0)),
+               "-p", str(int(sdr.get("ppm", 0))), "-"]
         return ProcSource(cmd, fs, fc, signed=False)
     if kind == "file":
         return FileSource(sdr["file"]["path"], fs, fc)

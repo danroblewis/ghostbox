@@ -15,6 +15,7 @@ audio at stream time + delay, which keeps every sound locked to its place on the
 waterfall.
 """
 import base64
+import collections
 import json
 import threading
 import time
@@ -86,6 +87,7 @@ class Track:
         self.agc = None
         self.seg_start = t               # recording segment start
         self.seg_index = 0
+        self.wavs = []                   # recording files for click-to-play
 
     def add(self, t, f, score, checks):
         self.t_last = t
@@ -108,7 +110,7 @@ class Track:
                 "path": [[round(t, 3), fc + f] for t, f in self.path[-200:]],
                 "conf": round(self.conf, 3),
                 "scores": {k: round(v, 3) for k, v in self.scores.items()},
-                "info": self.info}
+                "info": self.info, "wavs": list(self.wavs), "detected": self.detected}
 
 
 class Engine:
@@ -120,8 +122,11 @@ class Engine:
         self._stop = threading.Event()
         self.status = {"state": "starting"}
         self.tracks, self.ended = [], []
-        self.wf_hist, self.recent_boxes = [], []   # replayed to newly connected clients
-        self.view_modes = set()                     # analysis waterfall views some client is watching
+        self.t_origin = time.time()                 # timeline zero: all times are seconds since this
+        self.hist = collections.defaultdict(collections.deque)   # view -> waterfall chunks (history)
+        self.box_hist = []                          # finished detections still inside the history window
+        self.iq_file, self.iq_seg_t0 = None, None
+        self._last_prune = 0.0
         self.chains = {}                            # hop chain id -> finished member clips
         self.transcriber = Transcriber(config, emit)
         self.lock = threading.Lock()
@@ -135,10 +140,19 @@ class Engine:
         self._stop.set()
 
     def snapshot(self):
-        """Detections still on screen: live ones plus those ended in the last ~60 s."""
+        """Live detections (history comes from history())."""
         with self.lock:
             fc = getattr(self, "fc", 0)
-            return self.recent_boxes + [t.box(fc) for t in self.tracks if t.detected]
+            return [t.box(fc) for t in self.tracks if t.detected]
+
+    def history(self, view, t0, t1, max_chunks=1500):
+        """Waterfall chunks of one view and detection boxes overlapping [t0, t1]."""
+        with self.lock:
+            chunks = [c for c in list(self.hist.get(view, ())) if c["t0"] + c["n"] * c["dt"] >= t0 and c["t0"] <= t1]
+            fc = getattr(self, "fc", 0)
+            boxes = [b for b in self.box_hist if b["t1"] >= t0 and b["t0"] <= t1]
+            boxes += [t.box(fc) for t in self.tracks if t.detected]
+        return chunks[-max_chunks:], boxes
 
     # ---------------- main loop ----------------
     def _reset(self, cfg):
@@ -158,23 +172,24 @@ class Engine:
         self.keep = keep
         self.f = f[keep].astype(np.float32)
         self.f_lo, self.f_hi = float(self.fc + f[keep][0]), float(self.fc + f[keep][-1])
-        self.n_samples = 0
+        # continuous timeline across receiver restarts: start this session at "now"
+        self.n_samples = int(round((time.time() - self.t_origin) * self.fs))
         self.raw_keep = int(self.fs * (an["window_s"] + 4))
         self.raw = np.zeros(self.raw_keep, np.complex64)
         self.spec, self.spec_t = [], []
         self.baseline = None
         self.wf_lo = None
-        self.analyzed_until = 0.0
-        self.utc0 = time.time()
+        self.analyzed_until = self.n_samples / self.fs
+        self.utc0 = self.t_origin
+        self._close_iq()
         with self.lock:
             for t in self.tracks:
                 if t.detected:
                     self._finish(t, cfg, final=True)
             self.tracks, self.ended = [], []
-        self.wf_hist, self.recent_boxes = [], []
         self.chains = {}
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
-                   "frame_rate": self.fr})
+                   "frame_rate": self.fr, "t": self.n_samples / self.fs})
 
     def _run(self):
         src = None
@@ -186,9 +201,15 @@ class Engine:
                     if src:
                         src.stop()
                     self.status = {"state": "starting", "source": cfg["sdr"]["source"]}
+                    if cfg["sdr"]["source"] == "file":     # a capture's name says how it was recorded
+                        from ..iq import parse_name
+                        fc_f, fs_f = parse_name(cfg["sdr"]["file"]["path"])
+                        if fc_f:
+                            cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = fc_f, fs_f
                     self._reset(cfg)
                     src = make_source(cfg["sdr"])
                     misses = 0
+                cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = self.fc, self.fs
                 n = int(self.fs * cfg["analysis"]["hop_s"]) // self.frame_len * self.frame_len
                 x = src.read(n, timeout=3.0)
                 if x is None:
@@ -207,6 +228,7 @@ class Engine:
                 self._analyze(cfg)
                 load = (time.time() - t_proc) / (len(x) / self.fs)
                 self.status = {"state": "running", "source": cfg["sdr"]["source"], "fs": self.fs,
+                               "epoch": self.t_origin, "fmin": self.f_lo, "fmax": self.f_hi,
                                "fc": self.fc, "t": self.n_samples / self.fs, "load": round(load, 2),
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
                                "tracks": len(self.tracks), "vad": stage2.vad_available(),
@@ -230,6 +252,10 @@ class Engine:
         self.raw[: n - first] = x[first:]
         t_start = self.n_samples / self.fs
         self.n_samples += n
+        self._write_iq(x, t_start, cfg)
+        if time.time() - self._last_prune > 30:
+            self._last_prune = time.time()
+            self._prune(cfg)
         x = x - x.mean()
         _, _, P = power_frames(x, self.fs, self.nfft, self.fr)
         P = P[:, self.keep]
@@ -252,27 +278,33 @@ class Engine:
         lo = np.percentile(db, 5)
         self.wf_lo = lo if self.wf_lo is None else 0.9 * self.wf_lo + 0.1 * lo
         q = np.clip((db - self.wf_lo) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
-        msg = {"type": "wf", "mode": "power", "t0": float(ts[0]), "dt": 1.0 / self.fr, "w": q.shape[1],
-               "fmin": self.f_lo, "fmax": self.f_hi, "rows": _b64(q)}
-        self.wf_hist = (self.wf_hist + [msg])[-int(30 * self.fr / len(q)):]
+        self._chunk("power", ts, q, cfg)
+
+    def _chunk(self, mode, ts, q, cfg):
+        """One waterfall chunk (n rows): sent to clients watching `mode` and kept as history."""
+        msg = {"type": "wf", "mode": mode, "t0": float(ts[0] - 0.5 / self.fr), "dt": 1.0 / self.fr,
+               "n": int(q.shape[0]), "w": int(q.shape[1]), "fmin": self.f_lo, "fmax": self.f_hi, "rows": _b64(q)}
+        with self.lock:
+            h = self.hist[mode]
+            h.append(msg)
+            keep_from = msg["t0"] - 60 * cfg["display"]["history_min"]
+            while h and h[0]["t0"] < keep_from:
+                h.popleft()
         self.emit(msg)
 
-    def _view_rows(self, modes, scores, comb, ev, ts, cfg):
-        """Waterfall rows for the detector's internal maps (values 0..1 -> 0..255)."""
-        if not modes or not len(ts):
+    def _view_rows(self, scores, comb, ev, ts, cfg):
+        """Waterfall rows for the detector's internal maps (values 0..1 -> 0..255), always computed
+        so every view has history."""
+        if not len(ts):
             return
         width = int(cfg["display"]["width"])
-        for mode in modes:
-            a = {"score": comb, "novelty": ev}.get(mode, scores.get(mode))
-            if a is None:
-                continue
+        for mode, a in [("score", comb), ("novelty", ev)] + list(scores.items()):
             K = a.shape[1]
             pool = max(1, -(-K // width))
             pad = (-K) % pool
             ap = np.pad(a, ((0, 0), (0, pad))).reshape(len(a), -1, pool).max(axis=2)
             q = (np.clip(ap, 0, 1) * 255).astype(np.uint8)
-            self.emit({"type": "wf", "mode": mode, "t0": float(ts[0]), "dt": 1.0 / self.fr, "w": q.shape[1],
-                       "fmin": self.f_lo, "fmax": self.f_hi, "rows": _b64(q)})
+            self._chunk(mode, ts, q, cfg)
 
     def _raw_span(self, s0, s1):
         """Absolute sample range [s0, s1) from the ring (must still be held)."""
@@ -295,8 +327,7 @@ class Engine:
             return
         sl = slice(idx[0], idx[-1] + 1)
         self.analyzed_until = float(T[idx[-1]])
-        modes = set(self.view_modes)
-        scores, comb = stage1.run(P, self.df, self.fr, cfg, sl, force=modes & set(stage1.STAGE1))
+        scores, comb = stage1.run(P, self.df, self.fr, cfg, sl, force=set(stage1.STAGE1))
         ts = T[sl]
 
         # novelty: subtract a slow per-bin baseline (always-on emitters cancel)
@@ -313,7 +344,7 @@ class Engine:
             w = int(2 * det["prominence_hz"] / self.df) | 1
             ev -= beta * uniform_filter1d(ev, size=w, axis=1, mode="nearest")
         ev = np.clip(ev, 0, None)
-        self._view_rows(modes, scores, comb, ev, ts, cfg)
+        self._view_rows(scores, comb, ev, ts, cfg)
 
         with self.lock:
             for i, t in enumerate(ts):
@@ -408,7 +439,8 @@ class Engine:
                 if tr.detected:
                     self._finish(tr, cfg, final=True)
                     box = tr.box(self.fc)
-                    self.recent_boxes = [b for b in self.recent_boxes if tb - b["t1"] < 60] + [box]
+                    hist_s = 60 * cfg["display"]["history_min"]
+                    self.box_hist = [b for b in self.box_hist if tb - b["t1"] < hist_s] + [box]
                     self.emit({"type": "det_end", "box": box})
             else:
                 alive.append(tr)
@@ -500,11 +532,12 @@ class Engine:
         pcm = np.clip(a / (4 * (np.sqrt(np.mean(a ** 2)) + 1e-9)), -1, 1)
         wavfile.write(out / f"{stem}.wav", AUDIO_FS, (pcm * 32767).astype(np.int16))
         files = {"wav": f"{stem}.wav"}
+        tr.wavs.append(files["wav"])
         if rec.get("save_iq") and iq:
             np.save(out / f"{stem}_iq16k.npy", np.concatenate([x for _, x in iq]))
             files["iq"] = f"{stem}_iq16k.npy"
         meta = {
-            "id": tr.id, "chain": tr.chain, "segment": tr.seg_index,
+            "id": tr.id, "chain": tr.chain, "segment": tr.seg_index, "epoch": self.t_origin,
             "utc_start": utc.isoformat(), "stream_t0": seg_t0, "stream_t1": tr.t_last,
             "duration_s": round(len(a) / AUDIO_FS, 2),
             "freq_hz": {"mean": f_mean, "min": self.fc + min(fr), "max": self.fc + max(fr)},
@@ -528,3 +561,53 @@ class Engine:
             ch = self.chains.setdefault(tr.chain, {"members": [], "last_end": tr.t_last})
             ch["members"].append((seg_t0, pcm.astype(np.float32), tr.id, meta_path))
             ch["last_end"] = max(ch["last_end"], tr.t_last)
+
+    # ---------------- continuous IQ ring + size limits ----------------
+    def _close_iq(self):
+        if self.iq_file:
+            self.iq_file.close()
+        self.iq_file = None
+
+    def _write_iq(self, x, t_start, cfg):
+        ring = cfg["iq_ring"]
+        if not ring["enabled"] or (cfg["sdr"]["source"] == "file" and not ring["record_replays"]):
+            self._close_iq()
+            return
+        if self.iq_file is None or t_start - self.iq_seg_t0 >= ring["segment_s"]:
+            self._close_iq()
+            d = self.root / ring["dir"]
+            d.mkdir(parents=True, exist_ok=True)
+            utc = datetime.fromtimestamp(self.t_origin + t_start, timezone.utc)
+            name = f"{utc:%Y%m%d-%H%M%S}_{self.fc / 1e6:g}MHz_{self.fs / 1e6:g}Msps.cs8"
+            self.iq_file = open(d / name, "wb")
+            self.iq_seg_t0 = t_start
+            (d / (name[:-4] + ".json")).write_text(json.dumps(
+                {"t0": t_start, "epoch": self.t_origin, "utc": utc.isoformat(), "fc": self.fc, "fs": self.fs,
+                 "source": cfg["sdr"]["source"], "format": "cs8"}))
+        q = np.empty(2 * len(x), np.int8)
+        q[0::2] = np.clip(np.round(x.real * 128), -127, 127)
+        q[1::2] = np.clip(np.round(x.imag * 128), -127, 127)
+        self.iq_file.write(q.tobytes())
+
+    def _prune(self, cfg):
+        """Ring-buffer limits: delete the oldest IQ segments / recordings beyond their size caps."""
+        def enforce(d, max_bytes, group):
+            if not d.exists():
+                return
+            files = sorted((p for p in d.iterdir() if p.is_file()), key=lambda p: p.name)
+            total = sum(p.stat().st_size for p in files)
+            groups = collections.OrderedDict()
+            for p in files:
+                groups.setdefault(group(p), []).append(p)
+            current = self.iq_file.name if self.iq_file else None
+            for _, ps in groups.items():
+                if total <= max_bytes:
+                    break
+                if current and any(str(p) == current for p in ps):
+                    continue
+                for p in ps:
+                    total -= p.stat().st_size
+                    p.unlink(missing_ok=True)
+        enforce(self.root / cfg["iq_ring"]["dir"], cfg["iq_ring"]["max_gb"] * 1e9, lambda p: p.stem)
+        enforce(self.root / cfg["record"]["dir"], cfg["record"]["max_mb"] * 1e6,
+                lambda p: p.stem.replace("_iq16k", ""))
