@@ -1246,7 +1246,7 @@ async function buildSDR() {
     rowW("Bin width", bin),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { ppm: +ppm.value }, analysis: { bin_hz: +bin.value } }) }, "Apply")),
     el("h2", {}, "Playback audio"),
-    selectRow("Demodulator", [["auto", "Auto (synchronous AM; SSB for SSB signals)"], ["sync", "Synchronous AM"], ["sync_sb", "Synchronous sideband (cleaner side)"], ["envelope", "Envelope"]],
+    selectRow("Demodulator", [["auto", "Auto (follows the carrier; recovers it when there is none)"], ["sync", "Synchronous AM (needs a carrier)"], ["suppressed", "Suppressed carrier (no carrier needed)"], ["sync_sb", "Synchronous sideband (cleaner side)"], ["envelope", "Envelope"]],
       c.audio.demod || "auto", v => patch({ audio: { demod: v } }, 50)),
     el("div", { class: "row wide" }, el("label", { title: "Hard band-pass: flat inside, at least 50 dB down outside" }, "Voice band filter"), toggle(c.audio.voice_band !== false, v => patch({ audio: { voice_band: v } }, 50))),
     slider("Voice band from", ["audio", "voice_lo_hz"], 100, 800, 25, v => v + " Hz"),
@@ -1602,7 +1602,7 @@ function abControls(base, clip) {
   const note = el("span", { id: "abNote", class: "t3", style: "font-size:12px" });
   return el("div", { class: "abrow" },
     el("span", { class: "t2" }, "Listen as"),
-    seg([["rec", "Recorded"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["sync_sb", "Sync sideband"]], "demod"),
+    seg([["rec", "Recorded"], ["auto", "Auto"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["suppressed", "No carrier"], ["sync_sb", "Sync sideband"]], "demod"),
     el("span", { class: "t2" }, "Noise reduction"), seg([[true, "On"], [false, "Off"]], "denoise"),
     el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note);
 }

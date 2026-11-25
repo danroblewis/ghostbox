@@ -137,7 +137,8 @@ DEFAULT = {
         "min_duration_s": 0.4,
     },
     "audio": {"delay_s": 4.0, "bandwidth_hz": 3400,      # (unused: the channel follows voice_hi_hz)
-              "demod": "auto",                          # auto (sync AM; product detector for SSB) | envelope | sync | sync_sb
+              "demod": "auto",                          # auto (sync AM with a carrier, suppressed-carrier loop without;
+                                                        # product detector for SSB) | sync | suppressed | sync_sb | envelope
               "voice_band": True, "voice_lo_hz": 300, "voice_hi_hz": 3000,   # hard band-pass for playback
               "preroll_s": 0.5, "postroll_s": 0.5, "fade_s": 0.15,      # ease detections in and out
               "denoise": True, "denoise_strength": 1.0, "denoise_floor_db": -18.0},

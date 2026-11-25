@@ -290,7 +290,7 @@ def make_app(args):
         ?demod=envelope|sync|sync_sb|auto &denoise=0|1 &band=0|1 (anything left out: as configured)."""
         q, eng, loop = request.query, state["engine"], asyncio.get_running_loop()
         au = dict(config.get()["audio"])
-        if q.get("demod") in ("auto", "envelope", "sync", "sync_sb"):
+        if q.get("demod") in ("auto", "envelope", "sync", "sync_sb", "suppressed"):
             au["demod"] = q["demod"]
         for k, key in (("denoise", "denoise"), ("band", "voice_band")):
             if q.get(k) in ("0", "1"):

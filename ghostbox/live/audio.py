@@ -160,13 +160,17 @@ class SyncDetector:
     sideband=False: synchronous AM (both sidebands). True: synchronous single sideband, keeping
     whichever side carries less interference (switching only on a clear difference)."""
 
-    DEC = 40                                                     # 16 kHz -> 400 Hz for the loop
-
-    def __init__(self, bw_hz=3000.0, sideband=False, loop_hz=4.0):
-        self.sideband = sideband
-        self.lp = butter(2, 150, fs=FS, output="sos")
+    def __init__(self, bw_hz=3000.0, sideband=False, loop_hz=4.0, square=False):
+        # square=True: suppressed-carrier DSB. Squaring the signal puts a real line at twice the
+        # carrier (voice squared has a strong steady part); the loop locks to it and the phase is
+        # halved (a 180-degree ambiguity only flips the audio's sign, which is inaudible).
+        self.sideband, self.square = sideband, square
+        self.DEC = 20 if square else 40                          # loop rate 800 / 400 Hz (2x offset when squaring)
+        cut = 320 if square else 150
+        self.lp = butter(2, cut, fs=FS, output="sos")
         self.zl = None
-        self.delay = int(round(np.sqrt(2) / (2 * np.pi * 150) * FS))   # the low-pass's group delay (samples)
+        self.delay = int(round(np.sqrt(2) / (2 * np.pi * cut) * FS))   # the low-pass's group delay (samples)
+        self.lim_hz = 2 * 150 if square else 150
         T, zeta = self.DEC / FS, 0.707
         wn = 2 * loop_hz / (zeta + 1 / (4 * zeta)) * 2 * np.pi
         self.alpha, self.beta = 2 * zeta * wn * T, (wn * T) ** 2
@@ -188,7 +192,7 @@ class SyncDetector:
             self.nu, self.theta = float(np.angle(r)) if len(d) > 1 else 0.0, float(np.angle(d[0]))
             self.amp = float(np.mean(np.abs(d))) + 1e-12
         th, nu, a, b, amp = self.theta, self.nu, self.alpha, self.beta, self.amp
-        lim = 2 * np.pi * 150 * self.DEC / FS
+        lim = 2 * np.pi * self.lim_hz * self.DEC / FS
         for i, x in enumerate(d):
             out[i] = th
             m = abs(x)
@@ -205,9 +209,10 @@ class SyncDetector:
         L = len(y)
         if not L:
             return np.zeros(0, np.float32)
+        src = y.astype(np.complex128) ** 2 if self.square else y
         if self.zl is None:
-            self.zl = (sosfilt_zi(self.lp) * y[0]).astype(np.complex128)
-        c, self.zl = sosfilt(self.lp, y, zi=self.zl)
+            self.zl = (sosfilt_zi(self.lp) * src[0]).astype(np.complex128)
+        c, self.zl = sosfilt(self.lp, src, zi=self.zl)
         first = (-self.n) % self.DEC                             # loop samples on a fixed grid across chunks
         idx = np.arange(first, L, self.DEC)
         th = self._loop(c[idx]) if len(idx) else np.zeros(0)
@@ -225,7 +230,11 @@ class SyncDetector:
         else:
             ph = np.zeros(L)
         self.n += L
+        if self.square:
+            ph = ph / 2.0                                        # the loop followed twice the carrier phase
         zc = y * np.exp(-1j * ph)                                # carrier on the real axis
+        # carrier share of this chunk: with the carrier on the real axis its mean is the carrier
+        self.share = float(np.abs(np.mean(zc)) ** 2 / (np.mean(np.abs(zc) ** 2) + 1e-20))
         if not self.sideband:
             return zc.real.astype(np.float32)
         full = np.concatenate([self.hist, zc.astype(np.complex64)])
@@ -264,9 +273,36 @@ def channel_hz(au):
     return float(au.get("voice_hi_hz", 3000)) + 300.0
 
 
+class AutoAM:
+    """Synchronous AM while there is a carrier, the suppressed-carrier loop while there isn't.
+    Both loops run all the time (they are cheap), so switching never has to re-acquire; the
+    choice follows the carrier's share of the signal with hysteresis."""
+
+    def __init__(self, bw_hz):
+        self.car, self.sup = SyncDetector(bw_hz), SyncDetector(bw_hz, square=True)
+        self.share, self.use_sup = None, False
+
+    def process(self, y):
+        y = np.asarray(y, np.complex64)
+        if not len(y):
+            return np.zeros(0, np.float32)
+        a, b = self.car.process(y), self.sup.process(y)
+        sh = self.car.share                                      # the locked carrier's share of the power
+        self.share = sh if self.share is None else 0.8 * self.share + 0.2 * sh
+        if self.use_sup and self.share > 0.15:
+            self.use_sup = False
+        elif not self.use_sup and self.share < 0.05:
+            self.use_sup = True
+        return b if self.use_sup else a
+
+
 def detector_for(au, mode):
     """The detector a track uses: None = envelope (AM) or product detector (SSB tracks)."""
     m = au.get("demod", "auto")
     if mode != 0 or m == "envelope":
         return None
+    if m == "auto":
+        return AutoAM(channel_hz(au))
+    if m == "suppressed":
+        return SyncDetector(channel_hz(au), square=True)
     return SyncDetector(channel_hz(au), sideband=(m == "sync_sb"))
