@@ -23,15 +23,23 @@ const S = {
   offsets: [], offset: null,          // client time - stream time of newest received row
   dets: new Map(),                     // id -> {box, playing:[[a,b]], ended}
   hop: 1.0, delay: 4, pps: 25,
+  view: "power", views: [], recs: [], tx: new Map(), chainTx: new Map(),
+  smin: 0, smax: 255, cmap: "magma",
 };
 const RING_H = 3000;
 const ring = document.createElement("canvas");
 const rctx = ring.getContext("2d");
 const cv = $("#wf"), ctx = cv.getContext("2d");
 
-// magma-ish colormap LUT
-const LUT = (() => {
-  const stops = [[0, 4, 4, 16], [0.25, 50, 18, 92], [0.5, 150, 40, 110], [0.75, 245, 110, 60], [1, 252, 250, 180]];
+// colour maps (256-entry RGBA LUTs) and the scale (min/max) applied on top
+const CMAPS = {
+  magma: [[0, 4, 4, 16], [0.25, 50, 18, 92], [0.5, 150, 40, 110], [0.75, 245, 110, 60], [1, 252, 250, 180]],
+  viridis: [[0, 68, 1, 84], [0.25, 59, 82, 139], [0.5, 33, 145, 140], [0.75, 94, 201, 98], [1, 253, 231, 37]],
+  ice: [[0, 0, 0, 8], [0.35, 10, 40, 120], [0.65, 40, 150, 220], [0.85, 160, 230, 250], [1, 255, 255, 255]],
+  gray: [[0, 0, 0, 0], [1, 255, 255, 255]],
+};
+function makeLUT(name) {
+  const stops = CMAPS[name] || CMAPS.magma;
   const lut = new Uint8ClampedArray(256 * 4);
   for (let i = 0; i < 256; i++) {
     const x = i / 255; let j = 0; while (j < stops.length - 2 && x > stops[j + 1][0]) j++;
@@ -40,35 +48,62 @@ const LUT = (() => {
     lut[i * 4 + 3] = 255;
   }
   return lut;
-})();
+}
+let LUT = makeLUT("magma");
+function scaledLUT() {                        // value 0..255 -> colour, after min/max stretch
+  const out = new Uint8ClampedArray(256 * 4), span = Math.max(1, S.smax - S.smin);
+  for (let v = 0; v < 256; v++) {
+    const i = Math.max(0, Math.min(255, Math.round((v - S.smin) / span * 255)));
+    out.set(LUT.subarray(i * 4, i * 4 + 4), v * 4);
+  }
+  return out;
+}
+let SLUT = scaledLUT();
+let VALS = new Uint8Array(0);                 // raw row values, same layout as the ring canvas
+function paintRow(ringY) {
+  const w = ring.width, img = rctx.createImageData(w, 1);
+  for (let x = 0; x < w; x++) { const v = VALS[ringY * w + x] * 4; img.data[x * 4] = SLUT[v]; img.data[x * 4 + 1] = SLUT[v + 1]; img.data[x * 4 + 2] = SLUT[v + 2]; img.data[x * 4 + 3] = 255; }
+  rctx.putImageData(img, 0, ringY);
+}
+function repaintRing() {
+  SLUT = scaledLUT();
+  const w = ring.width, img = rctx.createImageData(w, RING_H);
+  for (let i = 0; i < VALS.length; i++) { const v = VALS[i] * 4; img.data[i * 4] = SLUT[v]; img.data[i * 4 + 1] = SLUT[v + 1]; img.data[i * 4 + 2] = SLUT[v + 2]; img.data[i * 4 + 3] = 255; }
+  rctx.putImageData(img, 0, 0);
+}
+function clearRing(w) {
+  ring.width = Math.max(1, w); ring.height = RING_H; VALS = new Uint8Array(ring.width * RING_H);
+  repaintRing();
+}
 
 function resetWaterfall(r) {
   S.fmin = r.fmin; S.fmax = r.fmax; S.fr = r.frame_rate || 25;
   S.T0 = null; S.N = 0; S.offsets = []; S.offset = null; S.dets.clear();
-  ring.width = Math.max(1, S.wfW || 1200); ring.height = RING_H;
-  rctx.fillStyle = "#000"; rctx.fillRect(0, 0, ring.width, ring.height);
+  clearRing(S.wfW || 1200);
   renderDetList();
 }
 
 function onRows(m) {
   const bytes = Uint8Array.from(atob(m.rows), c => c.charCodeAt(0));
   const w = m.w, n = bytes.length / w;
+  if ((m.mode || "power") !== S.view) return;
   if (w !== ring.width || m.fmin !== S.fmin || m.fmax !== S.fmax) {
-    S.wfW = w; S.fmin = m.fmin; S.fmax = m.fmax; ring.width = w; ring.height = RING_H;
-    rctx.fillStyle = "#000"; rctx.fillRect(0, 0, w, RING_H); S.T0 = null; S.N = 0;
+    S.wfW = w; S.fmin = m.fmin; S.fmax = m.fmax; clearRing(w); S.T0 = null; S.N = 0;
   }
   if (S.T0 === null) { S.T0 = m.t0; S.N = 0; }
   const k0 = Math.round((m.t0 - S.T0) / m.dt);
   if (k0 > S.N + 2 || k0 < S.N - 2) { S.N = k0; }
-  const img = rctx.createImageData(w, 1);
   for (let r = 0; r < n; r++) {
-    for (let x = 0; x < w; x++) { const v = bytes[r * w + x] * 4; img.data.set(LUT.subarray(v, v + 4), x * 4); }
-    const k = S.N + r;
-    rctx.putImageData(img, 0, RING_H - 1 - (k % RING_H));
+    const ringY = RING_H - 1 - ((S.N + r) % RING_H);
+    VALS.set(bytes.subarray(r * w, (r + 1) * w), ringY * w);
+    paintRow(ringY);
   }
   S.N += n;
-  const newest = S.T0 + S.N * m.dt;
-  S.offsets.push(nowS() - newest); if (S.offsets.length > 20) S.offsets.shift();
+}
+// clock sync: status carries the live edge (stream time of the newest samples)
+function syncClock(t) {
+  if (typeof t !== "number") return;
+  S.offsets.push(nowS() - t); if (S.offsets.length > 20) S.offsets.shift();
   S.offset = Math.min(...S.offsets);
 }
 
@@ -113,7 +148,7 @@ function draw() {
     ctx.fillText(fmtF(f), x + 3 * dpr, 13 * dpr);
   }
   // playback line: audio at stream time t plays when it is (delay - hop) below the top
-  const yPlay = (S.delay - S.hop) * pps;
+  const yPlay = (top - (nowS() - S.offset - S.delay)) * pps;
   ctx.save(); ctx.setLineDash([6 * dpr, 6 * dpr]); ctx.strokeStyle = "rgba(245,197,66,.7)"; ctx.lineWidth = dpr;
   ctx.beginPath(); ctx.moveTo(0, yPlay); ctx.lineTo(W, yPlay); ctx.stroke(); ctx.restore();
   ctx.fillStyle = "rgba(245,197,66,.85)"; ctx.fillText(`▶ playback (${S.delay.toFixed(2)} s behind live)`, W - 230 * dpr, yPlay - 4 * dpr);
@@ -141,7 +176,10 @@ function draw() {
       ctx.lineTo(xOf(b.path[b.path.length - 1][1]), y0); ctx.stroke();
     }
     ctx.fillStyle = `hsla(${hue},100%,75%,1)`;
-    ctx.fillText(`#${b.id} ${fmtF((b.fmin + b.fmax) / 2)} ${(b.conf * 100).toFixed(0)}%`, x1 + 4 * dpr, Math.max(12 * dpr, y0 + 11 * dpr));
+    const ly = Math.max(12 * dpr, y0 + 11 * dpr);
+    ctx.fillText(`#${b.id} ${fmtF((b.fmin + b.fmax) / 2)} ${(b.conf * 100).toFixed(0)}%`, x1 + 4 * dpr, ly);
+    const tx = S.tx.get(b.id);
+    if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, x1 + 4 * dpr, ly + 15 * dpr, tx.no_speech_prob > 0.6, playing);
     if (!chains.has(b.chain)) chains.set(b.chain, []);
     chains.get(b.chain).push(b);
   }
@@ -156,8 +194,26 @@ function draw() {
     }
   }
   ctx.restore();
+  // whole-chain transcript, under the chain's newest box
+  if ($("#caps").checked) for (const [cid, list] of chains) {
+    const tx = S.chainTx.get(cid); if (!tx || !tx.text || list.length < 2) continue;
+    const b = list[list.length - 1];
+    caption(`⛓ “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 14 * dpr, tx.no_speech_prob > 0.6, false, "rgba(120,220,255,1)");
+  }
   // drop boxes that scrolled off
   for (const [id, d] of S.dets) if ((top - d.box.t1) * pps > H * 1.5 && d.ended) S.dets.delete(id);
+}
+function caption(text, x, y, doubtful, playing, color) {
+  const dpr = devicePixelRatio;
+  if (text.length > 90) text = text.slice(0, 88) + "…”";
+  ctx.save();
+  ctx.font = `italic ${(playing ? 13 : 12) * dpr}px system-ui,-apple-system,sans-serif`;
+  const w = ctx.measureText(text).width;
+  if (x + w > cv.width - 4 * dpr) x = Math.max(4 * dpr, cv.width - w - 8 * dpr);
+  ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fillRect(x - 3 * dpr, y - 12 * dpr, w + 6 * dpr, 16 * dpr);
+  ctx.fillStyle = doubtful ? "rgba(170,170,170,.8)" : (color || (playing ? "#fff6c8" : "#ffffff"));
+  ctx.fillText(text, x, y);
+  ctx.restore();
 }
 function niceStep(x) { const p = Math.pow(10, Math.floor(Math.log10(x))); const m = x / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
 
@@ -215,6 +271,13 @@ function scoresGrid(scores) {
   }
   return g;
 }
+function txBlock(tx, label) {
+  if (!tx) return "";
+  const doubt = !tx.text || tx.no_speech_prob > 0.6;
+  return el("div", { class: "transcript" + (doubt ? " doubt" : "") },
+    tx.text ? `${label ? label + " " : ""}“${tx.text}”` : `${label ? label + " " : ""}(no words)`,
+    el("div", { class: "tmeta" }, `whisper ${tx.model} · ${tx.language} · no-speech ${(tx.no_speech_prob * 100).toFixed(0)}%${doubt ? " · probably not real speech" : ""}`));
+}
 function renderDet(d) {
   const b = d.box; const id = "det" + b.id;
   const info = b.info || {};
@@ -226,6 +289,7 @@ function renderDet(d) {
     el("div", { class: "muted mono" }, `${(b.t1 - b.t0).toFixed(1)} s · conf ${(b.conf * 100).toFixed(0)}% ${d.ended ? "· ended" : "· live"}${b.fmax - b.fmin > 500 ? ` · slid ${((b.fmax - b.fmin) / 1e3).toFixed(1)} kHz` : ""}`),
     el("div", { class: "bar" }, el("i", { style: `width:${(b.conf * 100).toFixed(0)}%` })),
     extra ? el("div", { class: "muted", style: "font-size:11px" }, extra) : "",
+    txBlock(S.tx.get(b.id)),
     scoresGrid(b.scores));
   return card;
 }
@@ -235,7 +299,7 @@ function renderDetList() {
   detTimer = setTimeout(() => {
     detTimer = null;
     const list = $("#detList"); list.replaceChildren();
-    const ds = [...S.dets.values()].sort((a, b) => b.box.t0 - a.box.t0).slice(0, 60);
+    const ds = [...S.dets.values()].filter(d => !d.ended).sort((a, b) => b.box.t0 - a.box.t0).slice(0, 30);
     $("#detsEmpty").style.display = ds.length ? "none" : "block";
     for (const d of ds) list.append(renderDet(d));
   }, 250);
@@ -279,6 +343,22 @@ function buildDetector() {
     slider("min separation (kHz)", ["detect", "min_sep_hz"], 1000, 50000, 500, v => (v / 1e3) + " kHz"),
     slider("audio bandwidth (Hz)", ["audio", "bandwidth_hz"], 1500, 7500, 100, v => v + " Hz"),
   );
+  const w = c.whisper;
+  const wTog = el("input", { type: "checkbox" }); wTog.checked = w.enabled;
+  wTog.addEventListener("change", () => patch({ whisper: { enabled: wTog.checked } }));
+  const cTog = el("input", { type: "checkbox" }); cTog.checked = w.chains;
+  cTog.addEventListener("change", () => patch({ whisper: { chains: cTog.checked } }));
+  const sel = (opts, val, key) => { const e = el("select", {}, ...opts.map(o => el("option", { value: o }, o))); e.value = val; e.addEventListener("change", () => patch({ whisper: { [key]: e.value } })); return e; };
+  const ws = S.status.whisper || {};
+  root.append(el("h2", {}, "Transcription (Whisper, local)"),
+    el("div", { class: "card check" },
+      el("h3", {}, el("label", {}, wTog, "Transcribe detections"), el("span", { class: "stage" }, ws.model ? `loaded: ${ws.model}` : "loads on first use")),
+      el("div", { class: "desc" }, "Runs Whisper on each finished detection. Whisper invents words from noise, so each transcript shows its own no-speech probability."),
+      el("div", { class: "row" }, el("label", {}, "model"), sel(["tiny", "base", "small", "medium"], w.model, "model")),
+      el("div", { class: "row" }, el("label", {}, "language"), sel(["auto", "en", "es", "fr", "de", "it", "pt", "ja", "zh"], w.language, "language")),
+      slider("only if confidence reached", ["whisper", "min_confidence"], 0, 1, 0.01, v => v.toFixed(2)),
+      el("div", { class: "row" }, el("label", {}, cTog, " also transcribe whole hop chains")),
+      ws.error ? el("div", { style: "color:var(--bad)" }, ws.error) : ""));
   for (const stage of [1, 2]) {
     root.append(el("h2", {}, stage === 1 ? "Stage 1 — whole band, every bin (IQ domain)" : "Stage 2 — per candidate (demodulated)"));
     for (const ch of S.checks.filter(x => x.stage === stage)) {
@@ -353,35 +433,49 @@ async function buildSDR() {
 }
 
 async function loadRecs() {
-  const list = $("#recList");
-  const recs = await (await fetch("/api/recordings")).json();
-  list.replaceChildren(); list.classList.remove("muted");
-  if (!recs.length) { list.append(el("div", { class: "muted" }, "No recordings yet.")); return; }
-  for (const m of recs) list.append(recCard(m));
+  S.recs = await (await fetch("/api/recordings")).json();
+  renderRecs();
+}
+let recTimer = null;
+function renderRecs() {
+  if (recTimer) return;
+  recTimer = setTimeout(() => {
+    recTimer = null;
+    const list = $("#recList"); list.replaceChildren(); list.classList.remove("muted");
+    $("#recCount").textContent = S.recs.length ? `(${S.recs.length})` : "";
+    if (!S.recs.length) { list.append(el("div", { class: "muted" }, "No recordings yet.")); return; }
+    for (const m of S.recs.slice(0, 150)) list.append(recCard(m));
+  }, 300);
 }
 function recCard(m) {
   const f = m.freq_hz || {};
   return el("div", { class: "card" },
     el("h3", {}, el("span", {}, `#${m.id}${m.segment ? "." + m.segment : ""} · ${fmtF(f.mean || 0)}`, m.demo ? el("span", { class: "stage", title: m.demo, style: "margin-left:6px" }, "demo") : ""), el("span", { class: "mono muted" }, (m.utc_start || "").replace("T", " ").slice(0, 19))),
     el("div", { class: "muted mono" }, `${m.duration_s}s · conf max ${(m.confidence.max * 100).toFixed(0)}% · final ${(m.confidence.final * 100).toFixed(0)}%${f.max - f.min > 500 ? ` · slid ${((f.max - f.min) / 1e3).toFixed(1)} kHz` : ""}${m.chain !== m.id ? ` · hop-chain #${m.chain}` : ""}`),
+    txBlock(m.transcript), txBlock(m.chain_transcript, "⛓ whole hop chain:"),
     el("audio", { controls: "", preload: "none", src: "/rec/" + m.files.wav }),
-    el("div", { class: "row" }, el("a", { href: "/rec/" + m.files.wav, download: "" }, "wav"), " ",
-      el("a", { href: "/rec/" + m.files.wav.replace(".wav", ".json"), target: "_blank" }, "metadata"), " ",
-      m.files.iq ? el("a", { href: "/rec/" + m.files.iq, download: "" }, "IQ (16 kHz complex .npy)") : ""),
-    scoresGrid(m.scores));
+    el("details", {}, el("summary", {}, "scores & files"),
+      el("div", { class: "row" }, el("a", { href: "/rec/" + m.files.wav, download: "" }, "wav"), " ",
+        el("a", { href: "/rec/" + m.files.wav.replace(".wav", ".json"), target: "_blank" }, "metadata"), " ",
+        m.files.iq ? el("a", { href: "/rec/" + m.files.iq, download: "" }, "IQ (16 kHz complex .npy)") : ""),
+      scoresGrid(m.scores)));
 }
-async function loadLib() {
-  const list = $("#libList"); const items = await (await fetch("/api/library")).json();
-  list.replaceChildren(); list.classList.remove("muted");
-  for (const it of items) list.append(el("div", { class: "card" }, el("div", { class: "mono", style: "color:var(--accent)" }, it.name),
-    it.note ? el("div", { class: "muted", style: "font-size:12px" }, it.note) : "",
-    it.kind === "wav" ? el("audio", { controls: "", preload: "none", src: "/lib/" + it.name }) : el("a", { href: "/lib/" + it.name, target: "_blank" }, el("img", { src: "/lib/" + it.name, loading: "lazy" }))));
+function onTranscript(m) {
+  const res = { text: m.text, no_speech_prob: m.no_speech_prob, avg_logprob: m.avg_logprob, language: m.language, model: m.model };
+  if (m.kind === "track") {
+    S.tx.set(m.id, res);
+    const r = S.recs.find(r => r.files && r.files.wav === m.wav); if (r) r.transcript = res;
+  } else {
+    S.chainTx.set(m.chain, res);
+    for (const r of S.recs) if ((m.members || []).includes(r.id)) r.chain_transcript = res;
+  }
+  renderRecs(); renderDetList();
 }
 
 function switchTab(name) {
   document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === name));
-  if (name === "recs") loadRecs(); if (name === "lib") loadLib(); if (name === "sdr") buildSDR();
+  if (name === "sdr") buildSDR();
 }
 document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
@@ -390,10 +484,35 @@ S.delay = +lsGet("gb_delay", 4); $("#delay").value = S.delay; $("#delayOut").tex
 $("#delay").addEventListener("input", e => { S.delay = +e.target.value; $("#delayOut").textContent = S.delay.toFixed(2) + " s"; lsSet("gb_delay", S.delay); });
 S.pps = +lsGet("gb_pps", 25); $("#pps").value = S.pps;
 $("#pps").addEventListener("input", e => { S.pps = +e.target.value; lsSet("gb_pps", S.pps); });
-$("#dyn").addEventListener("change", e => patch({ display: { dyn_range_db: +e.target.value } }));
+function loadScale() {
+  const sc = JSON.parse(lsGet("gb_scale_" + S.view, "null") || "null") || { min: 0, max: 255 };
+  S.smin = sc.min; S.smax = sc.max; $("#smin").value = S.smin; $("#smax").value = S.smax;
+}
+function saveScale() { lsSet("gb_scale_" + S.view, JSON.stringify({ min: S.smin, max: S.smax })); }
+$("#smin").addEventListener("input", e => { S.smin = Math.min(+e.target.value, S.smax - 1); saveScale(); repaintRing(); });
+$("#smax").addEventListener("input", e => { S.smax = Math.max(+e.target.value, S.smin + 1); saveScale(); repaintRing(); });
+$("#sreset").addEventListener("click", () => {          // auto-scale to the 2nd..99.8th percentile of what's on screen
+  const v = Array.from(VALS.filter((x, i) => i % 7 === 0)).sort((a, b) => a - b);
+  if (!v.length) return;
+  S.smin = v[Math.floor(v.length * 0.02)]; S.smax = Math.max(S.smin + 1, v[Math.floor(v.length * 0.998)]);
+  $("#smin").value = S.smin; $("#smax").value = S.smax; saveScale(); repaintRing();
+});
+S.cmap = lsGet("gb_cmap", "magma"); $("#cmap").value = S.cmap; LUT = makeLUT(S.cmap);
+$("#cmap").addEventListener("change", e => { S.cmap = e.target.value; lsSet("gb_cmap", S.cmap); LUT = makeLUT(S.cmap); repaintRing(); });
+$("#caps").checked = lsGet("gb_caps", "1") === "1";
+$("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
+let WS = null;
+function setView(mode) {
+  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode;
+  S.T0 = null; S.N = 0; clearRing(ring.width); loadScale(); repaintRing();
+  $("#viewNote").textContent = mode === "power" ? "" : "detector map, 0–1 scale · runs ~1.5 s behind live (analysis needs a little future)";
+  if (WS && WS.readyState === 1) WS.send(JSON.stringify({ type: "view", mode }));
+}
+$("#view").addEventListener("change", e => setView(e.target.value));
 
 function setStatus(s) {
   S.status = s;
+  syncClock(s.t);
   const st = $("#st");
   const ok = s.state === "running";
   st.className = "pill " + (ok ? "ok" : s.state === "error" || s.state === "no data" ? "bad" : "warn");
@@ -408,13 +527,16 @@ function setStatus(s) {
 // ---------------- websocket ----------------
 function connect() {
   const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  WS = ws;
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello":
-        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.hop = m.config.analysis.hop_s;
-        $("#dyn").value = m.config.display.dyn_range_db;
+        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.hop = m.config.analysis.hop_s; S.views = m.views;
+        $("#view").replaceChildren(...m.views.map(v => el("option", { value: v.id }, v.label)));
         resetWaterfall(m.reset); setStatus(m.status || {});
+        { const v = lsGet("gb_view", "power"); if (v !== "power" && m.views.some(x => x.id === v)) setView(v); else { S.view = "power"; $("#view").value = "power"; loadScale(); } }
+        loadRecs();
         for (const b of m.detections) S.dets.set(b.id, { box: b, playing: [], ended: true });
         buildDetector(); renderDetList(); break;
       case "config": S.cfg = m.config; S.hop = m.config.analysis.hop_s; if (!$("#detector").contains(document.activeElement)) buildDetector(); break;
@@ -425,7 +547,8 @@ function connect() {
       case "det_update": { const d = S.dets.get(m.box.id); if (d) { d.box = m.box; d.ended = false; renderDetList(); } else S.dets.set(m.box.id, { box: m.box, playing: [], ended: false }); break; }
       case "det_end": { const d = S.dets.get(m.box.id); if (d) { d.box = m.box; d.ended = true; renderDetList(); } break; }
       case "audio": onAudio(m); break;
-      case "recording": if ($("#recs").classList.contains("active")) $("#recList").prepend(recCard(m.meta)); break;
+      case "recording": S.recs.unshift(m.meta); renderRecs(); break;
+      case "transcript": onTranscript(m); break;
     }
   };
   ws.onclose = () => { setStatus({ state: "disconnected" }); setTimeout(connect, 1500); };

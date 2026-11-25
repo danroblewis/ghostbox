@@ -19,7 +19,14 @@ button:hover{border-color:var(--accent)} button.primary{background:var(--accent)
 button.on{background:#2a2350;border-color:var(--accent)}
 main{display:grid;grid-template-columns:minmax(0,1fr) 400px;height:calc(100% - 50px)}
 #left{position:relative;min-width:0;display:flex;flex-direction:column}
+#wfbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--panel)}
+#wfbar select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 5px;font:inherit;font-size:12px}
+#wfbar input[type=range]{width:90px}
 #wfwrap{position:relative;flex:1;min-height:300px}
+.transcript{margin-top:6px;padding:6px 8px;border-left:3px solid var(--accent);background:#1d1830;border-radius:4px;font-style:italic}
+.transcript.doubt{border-left-color:#555;background:#1a1d22;color:var(--muted)}
+.transcript .tmeta{font-style:normal;font-size:10.5px;color:var(--muted);margin-top:2px}
+details summary{cursor:pointer;color:var(--muted);font-size:11.5px;margin-top:6px}
 canvas#wf{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair}
 #tip{position:absolute;pointer-events:none;background:rgba(0,0,0,.75);border:1px solid var(--line);padding:3px 6px;border-radius:4px;font-family:var(--mono);font-size:11px;display:none}
 #side{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
@@ -60,10 +67,18 @@ img{max-width:100%;border-radius:6px}
   <span class="ctl">vol <input id="vol" type="range" min="0" max="1.5" step="0.05" value="0.9"></span>
   <span class="ctl">delay <input id="delay" type="range" min="2" max="5" step="0.25" value="4"><output id="delayOut" class="mono">4.0 s</output></span>
   <span class="ctl">zoom <input id="pps" type="range" min="8" max="60" step="1" value="25"></span>
-  <span class="ctl">contrast <input id="dyn" type="range" min="20" max="90" step="5" value="50"></span>
 </header>
 <main>
   <section id="left">
+    <div id="wfbar">
+      <span class="ctl">view <select id="view"></select></span>
+      <span class="ctl">colours <select id="cmap"><option>magma</option><option>viridis</option><option>ice</option><option>gray</option></select></span>
+      <span class="ctl">min <input id="smin" type="range" min="0" max="254" step="1" value="0"></span>
+      <span class="ctl">max <input id="smax" type="range" min="1" max="255" step="1" value="255"></span>
+      <button id="sreset">auto</button>
+      <span class="ctl"><label><input id="caps" type="checkbox" checked> captions</label></span>
+      <span id="viewNote" class="muted" style="font-size:11.5px"></span>
+    </div>
     <div id="wfwrap"><canvas id="wf"></canvas><div id="tip"></div>
       <div id="banner" class="muted"></div></div>
   </section>
@@ -72,14 +87,13 @@ img{max-width:100%;border-radius:6px}
       <button data-tab="dets" class="active">Detections</button>
       <button data-tab="detector">Detector</button>
       <button data-tab="sdr">SDR</button>
-      <button data-tab="recs">Recordings</button>
-      <button data-tab="lib">Library</button>
     </div>
-    <div id="dets" class="tab active"><div class="muted" id="detsEmpty">No detections yet.</div><div id="detList"></div></div>
+    <div id="dets" class="tab active">
+      <h2 style="margin-top:2px">Live now</h2><div class="muted" id="detsEmpty">Nothing detected right now.</div><div id="detList"></div>
+      <h2>Saved <span id="recCount" class="muted"></span></h2><div id="recList" class="muted">Loading…</div>
+    </div>
     <div id="detector" class="tab"></div>
     <div id="sdr" class="tab"></div>
-    <div id="recs" class="tab"><div id="recList" class="muted">Loading…</div></div>
-    <div id="lib" class="tab"><div id="libList" class="muted">Loading…</div></div>
   </aside>
 </main>
 <script src="/static/app.js"></script>

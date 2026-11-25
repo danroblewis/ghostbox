@@ -32,6 +32,7 @@ from ..maps import power_frames
 from . import stage1, stage2
 from .config import CHECKS
 from .sources import make_source
+from .transcribe import Transcriber
 
 AUDIO_FS = 16000
 _LP = {}
@@ -120,6 +121,9 @@ class Engine:
         self.status = {"state": "starting"}
         self.tracks, self.ended = [], []
         self.wf_hist, self.recent_boxes = [], []   # replayed to newly connected clients
+        self.view_modes = set()                     # analysis waterfall views some client is watching
+        self.chains = {}                            # hop chain id -> finished member clips
+        self.transcriber = Transcriber(config, emit)
         self.lock = threading.Lock()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -168,6 +172,7 @@ class Engine:
                     self._finish(t, cfg, final=True)
             self.tracks, self.ended = [], []
         self.wf_hist, self.recent_boxes = [], []
+        self.chains = {}
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
                    "frame_rate": self.fr})
 
@@ -204,7 +209,9 @@ class Engine:
                 self.status = {"state": "running", "source": cfg["sdr"]["source"], "fs": self.fs,
                                "fc": self.fc, "t": self.n_samples / self.fs, "load": round(load, 2),
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
-                               "tracks": len(self.tracks), "vad": stage2.vad_available()}
+                               "tracks": len(self.tracks), "vad": stage2.vad_available(),
+                               "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
+                                           "queue": self.transcriber.q.qsize()}}
                 self.emit({"type": "status", **self.status})
             except Exception as e:
                 self.status = {"state": "error", "error": f"{type(e).__name__}: {e}"}
@@ -245,10 +252,27 @@ class Engine:
         lo = np.percentile(db, 5)
         self.wf_lo = lo if self.wf_lo is None else 0.9 * self.wf_lo + 0.1 * lo
         q = np.clip((db - self.wf_lo) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
-        msg = {"type": "wf", "t0": float(ts[0]), "dt": 1.0 / self.fr, "w": q.shape[1],
+        msg = {"type": "wf", "mode": "power", "t0": float(ts[0]), "dt": 1.0 / self.fr, "w": q.shape[1],
                "fmin": self.f_lo, "fmax": self.f_hi, "rows": _b64(q)}
         self.wf_hist = (self.wf_hist + [msg])[-int(30 * self.fr / len(q)):]
         self.emit(msg)
+
+    def _view_rows(self, modes, scores, comb, ev, ts, cfg):
+        """Waterfall rows for the detector's internal maps (values 0..1 -> 0..255)."""
+        if not modes or not len(ts):
+            return
+        width = int(cfg["display"]["width"])
+        for mode in modes:
+            a = {"score": comb, "novelty": ev}.get(mode, scores.get(mode))
+            if a is None:
+                continue
+            K = a.shape[1]
+            pool = max(1, -(-K // width))
+            pad = (-K) % pool
+            ap = np.pad(a, ((0, 0), (0, pad))).reshape(len(a), -1, pool).max(axis=2)
+            q = (np.clip(ap, 0, 1) * 255).astype(np.uint8)
+            self.emit({"type": "wf", "mode": mode, "t0": float(ts[0]), "dt": 1.0 / self.fr, "w": q.shape[1],
+                       "fmin": self.f_lo, "fmax": self.f_hi, "rows": _b64(q)})
 
     def _raw_span(self, s0, s1):
         """Absolute sample range [s0, s1) from the ring (must still be held)."""
@@ -271,7 +295,8 @@ class Engine:
             return
         sl = slice(idx[0], idx[-1] + 1)
         self.analyzed_until = float(T[idx[-1]])
-        scores, comb = stage1.run(P, self.df, self.fr, cfg, sl)
+        modes = set(self.view_modes)
+        scores, comb = stage1.run(P, self.df, self.fr, cfg, sl, force=modes & set(stage1.STAGE1))
         ts = T[sl]
 
         # novelty: subtract a slow per-bin baseline (always-on emitters cancel)
@@ -288,6 +313,7 @@ class Engine:
             w = int(2 * det["prominence_hz"] / self.df) | 1
             ev -= beta * uniform_filter1d(ev, size=w, axis=1, mode="nearest")
         ev = np.clip(ev, 0, None)
+        self._view_rows(modes, scores, comb, ev, ts, cfg)
 
         with self.lock:
             for i, t in enumerate(ts):
@@ -388,6 +414,26 @@ class Engine:
                 alive.append(tr)
         self.tracks = alive
         self.ended = [e for e in self.ended if tb - e[0] < 5]
+        self._flush_chains(cfg, tb)
+
+    def _flush_chains(self, cfg, tb):
+        """A hop chain is finished when none of its tracks is alive and no new hop can link to it.
+        Then the members' audio is stitched in time order and transcribed as one utterance."""
+        w = cfg["whisper"]
+        live = {t.chain for t in self.tracks}
+        for cid in list(self.chains):
+            ch = self.chains[cid]
+            if cid in live or tb - ch["last_end"] < cfg["detect"]["link_hops_s"] + 0.5:
+                continue
+            del self.chains[cid]
+            if len(ch["members"]) < 2 or not (w["enabled"] and w["chains"]):
+                continue
+            parts = []
+            for _, audio, _, _ in sorted(ch["members"], key=lambda m: m[0]):
+                parts += [audio, np.zeros(int(0.12 * AUDIO_FS), np.float32)]
+            self.transcriber.submit({"kind": "chain", "id": cid, "chain": cid, "audio": np.concatenate(parts),
+                                     "members": [m[2] for m in ch["members"]],
+                                     "meta_paths": [m[3] for m in ch["members"]]})
 
     @staticmethod
     def _recent(chunks, secs):
@@ -471,5 +517,14 @@ class Engine:
         }
         if cfg["sdr"]["source"] == "file":
             meta["demo"] = f"Replay of {Path(cfg['sdr']['file']['path']).name} (not a live detection)"
-        (out / f"{stem}.json").write_text(json.dumps(meta, indent=1, default=float))
+        meta_path = out / f"{stem}.json"
+        meta_path.write_text(json.dumps(meta, indent=1, default=float))
         self.emit({"type": "recording", "meta": meta})
+        w = cfg["whisper"]
+        if w["enabled"] and meta["confidence"]["max"] >= w["min_confidence"]:
+            self.transcriber.submit({"kind": "track", "id": tr.id, "chain": tr.chain, "audio": pcm.astype(np.float32),
+                                     "wav": files["wav"], "meta_paths": [meta_path]})
+        if final:
+            ch = self.chains.setdefault(tr.chain, {"members": [], "last_end": tr.t_last})
+            ch["members"].append((seg_t0, pcm.astype(np.float32), tr.id, meta_path))
+            ch["last_end"] = max(ch["last_end"], tr.t_last)

@@ -25,9 +25,11 @@ def geo_mean(scores, weights, eps=0.02):
     return None if num is None else np.exp(num / den)
 
 
-def run(P, df, frame_rate, cfg, sl):
+def run(P, df, frame_rate, cfg, sl, force=()):
+    """force: check ids to compute even if disabled (for waterfall views); they don't count
+    toward the combined score unless enabled."""
     an, ch = cfg["analysis"], cfg["checks"]
-    on = {k: ch[k]["enabled"] for k in STAGE1}
+    on = {k: ch[k]["enabled"] or k in force for k in STAGE1}
     inner = max(1, round(an["sideband_lo_hz"] / df))
     outer = max(inner + 2, round(an["sideband_hi_hz"] / df))
     max_off = outer
@@ -66,7 +68,7 @@ def run(P, df, frame_rate, cfg, sl):
             r = bp(S(r0, r1) + S(-r1, -r0))
             out[k] = 1 - np.clip(corr(u + l, r), 0, 1)[sl]
 
-    weights = {k: ch[k]["weight"] for k in out}
+    weights = {k: ch[k]["weight"] if ch[k]["enabled"] else 0.0 for k in out}
     combined = geo_mean(out, weights)
     if combined is None:
         combined = np.zeros((sl.stop - sl.start, P.shape[1]), np.float32)

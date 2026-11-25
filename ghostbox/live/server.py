@@ -14,7 +14,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from .config import CHECKS, PRESETS, Config
+from .config import CHECKS, PRESETS, VIEWS, Config
 from .engine import Engine
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,16 +32,21 @@ def load_token(path):
 
 
 class Hub:
+    """Fans engine events out to clients. Waterfall rows go only to clients watching that view."""
+
     def __init__(self, loop):
         self.loop = loop
-        self.clients = set()
+        self.clients = {}            # queue -> waterfall view mode
 
     def emit(self, msg):  # called from the engine thread
+        mode = msg.get("mode") if msg.get("type") == "wf" else None
         data = json.dumps(msg, default=float)
-        self.loop.call_soon_threadsafe(self._fanout, data)
+        self.loop.call_soon_threadsafe(self._fanout, data, mode)
 
-    def _fanout(self, data):
-        for q in list(self.clients):
+    def _fanout(self, data, mode=None):
+        for q, m in list(self.clients.items()):
+            if mode is not None and m != mode:
+                continue
             if q.qsize() > 600:
                 try:
                     q.get_nowait()
@@ -91,7 +96,7 @@ def make_app(args):
         hub = state["hub"]
         eng = state["engine"]
         await sock.send_str(json.dumps({
-            "type": "hello", "config": config.get(), "checks": CHECKS,
+            "type": "hello", "config": config.get(), "checks": CHECKS, "views": VIEWS,
             "presets": {k: v["label"] for k, v in PRESETS.items()},
             "status": eng.status, "detections": eng.snapshot(),
             "reset": {"fc": getattr(eng, "fc", 0), "fs": getattr(eng, "fs", 0),
@@ -100,7 +105,10 @@ def make_app(args):
         }, default=float))
         for m in list(getattr(eng, "wf_hist", [])):          # backfill the waterfall
             await sock.send_str(json.dumps(m))
-        hub.clients.add(q)
+        hub.clients[q] = "power"
+
+        def sync_views():
+            eng.view_modes = set(hub.clients.values()) - {"power"}
 
         async def writer():
             while True:
@@ -112,8 +120,20 @@ def make_app(args):
             async for msg in sock:
                 if msg.type == WSMsgType.ERROR:
                     break
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        m = json.loads(msg.data)
+                    except ValueError:
+                        continue
+                    if m.get("type") == "view" and m.get("mode") in {v["id"] for v in VIEWS}:
+                        hub.clients[q] = m["mode"]
+                        sync_views()
+                        if m["mode"] == "power":
+                            for h in list(eng.wf_hist):
+                                await sock.send_str(json.dumps(h))
         finally:
-            hub.clients.discard(q)
+            hub.clients.pop(q, None)
+            sync_views()
             wt.cancel()
         return sock
 
@@ -174,25 +194,6 @@ def make_app(args):
             raise web.HTTPNotFound()
         return web.FileResponse(p)
 
-    async def library(request):
-        d = ROOT / "captures"
-        out = []
-        for p in sorted(d.glob("*")):
-            if p.suffix in (".wav", ".png") and p.is_file():
-                side = p.with_suffix(".txt")
-                out.append({"name": p.name, "kind": p.suffix[1:],
-                            "note": side.read_text().strip() if side.is_file() else ""})
-        return web.json_response(out)
-
-    async def lib_file(request):
-        name = request.match_info["name"]
-        if not SAFE.match(name) or Path(name).suffix not in (".wav", ".png"):
-            raise web.HTTPNotFound()
-        p = ROOT / "captures" / name
-        if not p.is_file():
-            raise web.HTTPNotFound()
-        return web.FileResponse(p)
-
     async def capture_files(request):
         d = ROOT / "captures"
         return web.json_response([f"captures/{p.name}" for p in sorted(d.glob("*")) if p.suffix in (".cu8", ".cs8")])
@@ -205,10 +206,8 @@ def make_app(args):
     app.router.add_post("/api/reset", post_reset)
     app.router.add_post("/api/restart", post_restart)
     app.router.add_get("/api/recordings", recordings)
-    app.router.add_get("/api/library", library)
     app.router.add_get("/api/captures", capture_files)
     app.router.add_get("/rec/{name}", rec_file)
-    app.router.add_get("/lib/{name}", lib_file)
     app.router.add_static("/static", STATIC)
     return app, token
 

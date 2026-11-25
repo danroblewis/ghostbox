@@ -99,9 +99,29 @@ DEFAULT = {
     },
     "audio": {"delay_s": 4.0, "bandwidth_hz": 3400},
     "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0},
-    "display": {"width": 1200, "dyn_range_db": 50.0},
+    "display": {"width": 1200, "dyn_range_db": 60.0},
+    "whisper": {
+        "enabled": True,
+        "model": "base",                    # tiny | base | small | medium
+        "language": "auto",                 # auto or an ISO code (en, es, ...)
+        "min_confidence": 0.55,             # only transcribe detections that reached this confidence
+        "chains": True,                     # also transcribe a whole hop chain stitched together
+    },
     "checks": {c["id"]: dict(c["default"]) for c in CHECKS},
 }
+
+# Waterfall views: power plus the detector's internal maps (all scaled 0..1 except power).
+VIEWS = [
+    {"id": "power", "label": "Power (dB)"},
+    {"id": "score", "label": "AM-voice score (stage 1 combined)"},
+    {"id": "novelty", "label": "Novelty evidence (what triggers candidates)"},
+    {"id": "twinning", "label": "Check: sideband twinning"},
+    {"id": "syllabic", "label": "Check: syllable rhythm"},
+    {"id": "mirror", "label": "Check: fine mirror"},
+    {"id": "carrier", "label": "Check: carrier present"},
+    {"id": "broadband", "label": "Check: broadband-pulse rejection"},
+    {"id": "ring", "label": "Check: FM rejection (ring)"},
+]
 
 PRESETS = {
     "am_hackrf": {"label": "AM broadcast (HackRF)",
