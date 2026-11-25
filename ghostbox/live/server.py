@@ -20,6 +20,7 @@ from .autotune import AutoTune, pick_segments
 from .engine import Engine
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
+from .survey import Survey
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = Path(__file__).parent / "static"
@@ -84,6 +85,7 @@ def make_app(args):
         state["hub"] = hub
         state["engine"] = Engine(config, hub.emit, ROOT)
         state["tune"] = AutoTune(ROOT, config, hub.emit, apply, session=lambda: state["engine"].session())
+        state["survey"] = Survey(ROOT, config, apply, lambda: state["engine"], hub.emit)
         state["auto_task"] = asyncio.create_task(auto_tune_loop())
 
     def rx_signature(c):
@@ -99,6 +101,9 @@ def make_app(args):
             try:
                 c = config.get()
                 at, tune, eng = c["autotune"], state["tune"], state["engine"]
+                sv = state["survey"]
+                if sv.running:
+                    continue
                 if not at["auto"] or c["sdr"]["source"] == "file" or tune.state.get("state") == "running":
                     continue
                 if not c["iq_ring"]["enabled"]:                # auto-tune needs the IQ recording
@@ -106,7 +111,7 @@ def make_app(args):
                     continue
                 eng.show_conf = tune.show_conf if tune.show_conf is not None else c["detect"]["threshold"]
                 changed = tune.auto_band != rx_signature(c)
-                due = time.time() - max(eng.last_hit, tune.last_end) >= at["minutes"] * 60
+                due = time.time() - max(eng.last_hit, tune.last_end, sv.ended_at) >= at["minutes"] * 60
                 if not (changed or due):
                     continue
                 _, have = await asyncio.get_running_loop().run_in_executor(
@@ -232,6 +237,37 @@ def make_app(args):
         (PRESET_DIR / f).unlink(missing_ok=True)
         return web.json_response({"presets": saved_presets()})
 
+    async def get_survey(request):
+        """Current/last survey (?file= for a saved one); ?list=1 for the saved survey names."""
+        sv = state["survey"]
+        if request.query.get("list"):
+            return web.json_response({"saved": sv.saved(), "state": sv.state})
+        f = request.query.get("file")
+        if f:
+            if not SAFE.match(f):
+                raise web.HTTPNotFound()
+            res = await asyncio.get_running_loop().run_in_executor(None, sv.load, f)
+        else:
+            res = await asyncio.get_running_loop().run_in_executor(None, sv.public)
+        return web.json_response({"state": sv.state, "result": res}, dumps=lambda o: json.dumps(o, default=float))
+
+    async def start_survey(request):
+        b = await request.json()
+        c = config.get()
+        if c["sdr"]["source"] == "file":
+            return web.json_response({"error": "A survey needs a live receiver."}, status=400)
+        if state["tune"].state.get("state") == "running":
+            return web.json_response({"error": "Calibration is running; try again when it finishes."}, status=409)
+        lo, hi = float(b["lo_hz"]), float(b["hi_hz"])
+        if not (hi > lo >= 0):
+            return web.json_response({"error": "Give a range with From below To."}, status=400)
+        ok = state["survey"].start(lo, hi, float(b.get("dwell_s", 30)))
+        return web.json_response({"ok": ok, **state["survey"].state})
+
+    async def stop_survey(request):
+        state["survey"].stop()
+        return web.json_response({"ok": True})
+
     async def post_preset(request):
         """Apply a built-in preset ({name}) or a saved one ({file})."""
         b = await request.json()
@@ -350,6 +386,8 @@ def make_app(args):
 
     async def tune_start(request):
         b = await request.json()
+        if state["survey"].running:
+            return web.json_response({"error": "A survey is running; calibrate when it finishes."}, status=409)
         at = config.get()["autotune"]
         ok = state["tune"].start(b.get("minutes", at["minutes"]), b.get("per_min", at["per_min"]))
         return web.json_response({"ok": ok, **state["tune"].state})
@@ -419,6 +457,9 @@ def make_app(args):
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", post_config)
     app.router.add_post("/api/preset", post_preset)
+    app.router.add_get("/api/survey", get_survey)
+    app.router.add_post("/api/survey", start_survey)
+    app.router.add_post("/api/survey/stop", stop_survey)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)

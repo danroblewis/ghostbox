@@ -179,6 +179,7 @@ class Engine:
         score_all: check ids to compute for every track even when disabled (auto-tune needs every
         column); they don't affect which candidates are found or their confidence."""
         self.score_all = set(score_all)
+        self.on_hop = None                       # (engine, cfg, tb) after each hop's tracking (band survey)
         self.show_conf = 0.0                     # what counts as "caught something" for auto-recalibration
         self.last_hit = time.time()
         self.config = config
@@ -726,6 +727,8 @@ class Engine:
                     self.emit({"type": "det_end", "box": box})
             else:
                 alive.append(tr)
+        if self.on_hop is not None:              # before ended tracks are dropped
+            self.on_hop(self, cfg, tb)
         self.tracks = alive
         self.ended = [e for e in self.ended if tb - e[0] < 5]
         self._merge_comod_chains()
