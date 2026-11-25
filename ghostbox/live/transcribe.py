@@ -46,9 +46,42 @@ def _phrase_re(phrase):
                       re.IGNORECASE)
 
 
+def collapse_loops(text, min_repeats=3, max_n=10):
+    """Whisper's repetition loop ("to be the one to be the one to be the one ..."): a run of 3+
+    back-to-back copies of the same 1..10-word phrase becomes one copy (and a trailing partial
+    copy is dropped)."""
+    words = text.split()
+    key = [re.sub(r"[^\w']", "", w.lower()) for w in words]
+    out, i = [], 0
+    while i < len(words):
+        best = None
+        for n in range(1, max_n + 1):
+            unit = key[i:i + n]
+            if len(unit) < n:
+                break
+            k = 1
+            while key[i + k * n:i + (k + 1) * n] == unit:
+                k += 1
+            if k >= min_repeats and (best is None or k * n > best[0] * best[1]):
+                best = (k, n)
+        if best:
+            k, n = best
+            out += words[i:i + n]
+            j = i + k * n
+            m = 0                                          # a trailing partial copy
+            while j + m < len(words) and m < n and key[j + m] == key[i + m]:
+                m += 1
+            i = j + (m if m < n else 0)
+        else:
+            out.append(words[i])
+            i += 1
+    return " ".join(out)
+
+
 def strip_stock(text, phrases=()):
     """Remove the user's phrases wherever they occur, then stock sentences ("The end.", "Thank
     you.") that make up a whole sentence; keep the rest."""
+    text = collapse_loops(text)
     for ph in phrases:
         rx = _phrase_re(ph)
         if rx is not None:

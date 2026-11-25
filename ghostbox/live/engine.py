@@ -181,6 +181,7 @@ class Engine:
         self.score_all = set(score_all)
         self.on_hop = None                       # (engine, cfg, tb) after each hop's tracking (band survey)
         self.on_maps = None                      # (engine, ts, {view: [frames, bins] in 0..1}) each hop
+        self.on_clip = None                      # (track, meta, pcm16) for every finished segment
         self.show_conf = 0.0                     # what counts as "caught something" for auto-recalibration
         self.last_hit = time.time()
         self.config = config
@@ -871,6 +872,8 @@ class Engine:
             if not self.oneshot:
                 self._mem_put(meta, pcm16, cfg)
         tr.clips.append(meta["clip"])
+        if self.on_clip is not None:
+            self.on_clip(tr, meta, pcm16)
         self.emit({"type": "recording", "meta": {k: v for k, v in meta.items() if k not in ("checks", "detect", "sdr")}})
         w = cfg["whisper"]
         if self.transcriber and w["enabled"] and conf_max >= w["min_confidence"]:

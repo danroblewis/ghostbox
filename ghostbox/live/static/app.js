@@ -896,7 +896,7 @@ function surveyControls() {
   const est = el("div", { class: "note", style: "margin:4px 0" });
   const upd = () => {
     const n = Math.max(1, Math.ceil(((+hi.value - +lo.value) * 1e6) / step));
-    est.textContent = +hi.value > +lo.value ? `${n} step${n > 1 ? "s" : ""} of ${(step / 1e6).toFixed(2)} MHz · about ${fmtMS(n * (+dwell.value + 6))}. Uses the detector as currently tuned; the receiver returns here afterwards.` : "From must be below To.";
+    est.textContent = +hi.value > +lo.value ? `${n} step${n > 1 ? "s" : ""} of ${(step / 1e6).toFixed(2)} MHz · about ${fmtMS(n * (+dwell.value + 6))}. Each step is calibrated on its own sample and its detections transcribed; the receiver returns here afterwards.` : "From must be below To.";
     lsSet("gb_sv_lo", lo.value); lsSet("gb_sv_hi", hi.value); lsSet("gb_sv_dwell", dwell.value);
   };
   [lo, hi, dwell].forEach(x => x.addEventListener("input", upd)); upd();
@@ -909,23 +909,28 @@ function surveyControls() {
   } }, running ? "Stop survey" : "Survey");
   const msg = el("div", { class: SV.state.state === "error" ? "err" : "note", style: "margin:6px 0 0" },
     running ? `${SV.state.message || ""}` : SV.state.state === "error" ? SV.state.message : "");
-  const savedSel = SV.saved.length ? el("select", { class: "sel", onchange: e => { if (e.target.value) openSurvey(e.target.value); e.target.value = ""; } },
-    el("option", { value: "" }, "Open a saved survey…"), ...SV.saved.map(f => el("option", { value: f }, f.replace(/\.json$/, "").replace(/_/g, " ")))) : null;
   return el("div", { style: "margin-top:14px" },
     el("h2", { style: "margin-top:0" }, "Survey a range"),
     el("div", { class: "row wide" }, el("label", {}, "From – to (MHz)"), el("div", { style: "display:flex;gap:6px;align-items:center" }, lo, el("span", { class: "t3" }, "–"), hi)),
     el("div", { class: "row wide" }, el("label", {}, "Time per step"), dwell),
     est,
-    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn,
-      SV.meta || running || SV.saved.length ? el("button", { class: "btn", onclick: () => openSurvey(SV.meta || running ? undefined : SV.saved[0]) }, "Show map") : null, savedSel),
+    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn),
     msg);
 }
 async function loadSurveyList() {
   try { const r = await (await fetch("/api/survey?list=1")).json(); SV.saved = r.saved; SV.state = r.state; } catch (e) {}
 }
+// Top-bar Map button: the running/last survey, else the newest saved one.
+async function openMap() {
+  if (SV.open) { closeSurvey(); return; }
+  await loadSurveyList();
+  if (SV.state.state === "running" || (SV.meta && !SV.file)) return openSurvey();
+  if (SV.saved.length) return openSurvey(SV.saved[0]);
+  SV.open = true; SV.meta = null; drawSurvey();
+}
 async function openSurvey(file) {
   const r = await (await fetch("/api/survey" + (file ? "?file=" + encodeURIComponent(file) : ""))).json();
-  if (!r.result) return;
+  if (!r.result) { SV.open = true; SV.meta = null; drawSurvey(); return; }
   const same = SV.meta && SV.file === (file || null) && SV.meta.started === r.result.started;
   SV.meta = r.result; SV.file = file || null; SV.open = true;
   if (!same) { SV.imgs = {}; SV.v0 = r.result.lo; SV.v1 = r.result.hi; SV.sel = null; SV.hl = null; }
@@ -939,7 +944,7 @@ function onSurvey(m) {
   const t = $("#svStatus"); if (t) t.textContent = m.state === "running" ? m.message || "" : "";
   if (!$("#detector").contains(document.activeElement) && m.state !== "running") buildDetector();
 }
-function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); }
+function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); $("#mapBtn").classList.remove("on"); buildViewList(); }
 function surveyTune(f) {
   const step = SV.meta ? SV.meta.step_hz : S.cfg.sdr.sample_rate * 0.8;
   patch({ sdr: { center_hz: Math.round(f), fmin_hz: Math.round(f - step / 2), fmax_hz: Math.round(f + step / 2) } }, 50);
@@ -978,7 +983,8 @@ function drawSurvey() {
   if (!p) {
     p = el("div", { id: "survey" }); $("#wfwrap").append(p);
     const head = el("div", { class: "svhead" },
-      el("strong", {}, "Survey"), el("span", { id: "svInfo", class: "t2" }), el("span", { id: "svStatus", class: "t3" }),
+      el("select", { id: "svPick", class: "sel", title: "Recorded maps", onchange: e => openSurvey(e.target.value || undefined) }),
+      el("span", { id: "svInfo", class: "t2" }), el("span", { id: "svStatus", class: "t3" }),
       el("span", { style: "flex:1" }), el("span", { id: "svSel", class: "num t2" }),
       el("button", { id: "svTune", class: "btn primary", style: "display:none", onclick: () => SV.sel != null && surveyTune(SV.sel) }, "Tune here"),
       el("button", { class: "btn", title: "Show the whole range (or double-click the map)", onclick: () => { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); } }, "Fit"),
@@ -989,6 +995,13 @@ function drawSurvey() {
     for (const c of [map, chart]) surveyInteract(c);
   }
   const m = SV.meta, run = SV.state.state === "running";
+  $("#mapBtn").classList.add("on"); buildViewList();
+  const pick = $("#svPick"), cur = SV.file || "";
+  pick.replaceChildren(...(run || (m && !SV.file) ? [el("option", { value: "" }, run ? "Survey in progress" : "Latest survey")] : []),
+    ...SV.saved.map(f => el("option", { value: f }, f.replace(/\.json$/, "").replace(/_/g, " "))));
+  if (!pick.options.length) pick.append(el("option", { value: "" }, "No surveys yet"));
+  pick.value = cur;
+  if (!m) { $("#svInfo").textContent = "Start one in Detector › Survey a range."; for (const id of ["svMap", "svChart"]) { const c = $("#" + id); c.getContext("2d").clearRect(0, 0, c.width, c.height); } $("#svAxis").replaceChildren(); $("#svSamples").replaceChildren(); return; }
   $("#svInfo").textContent = m ? `${fmtFshort(m.lo)} – ${fmtFshort(m.hi)} · ${m.dwell_s} s per step · ${m.source} · ${(m.started || "").replace("T", " ").slice(0, 16)}`
     + (S.view !== surveyView() ? ` · “${(S.views.find(v => v.id === S.view) || {}).label || S.view}” wasn't recorded; showing power` : "") : "";
   $("#svStatus").textContent = run ? SV.state.message || "" : "";
@@ -1012,9 +1025,10 @@ async function renderSurvey() {
   g.strokeStyle = "rgba(255,255,255,.14)"; g.lineWidth = dpr;
   for (const st of m.steps) { const x = X(st.lo); if (x > 0 && x < map.width) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, map.height); g.stroke(); } }
   // detector picks as boxes, filtered by Min confidence
-  const pad = 1500, Y = t => t / m.dwell_s * map.height;
+  const pad = 1500;
   for (const t of svTracks()) {
     if (t.conf < S.minConf) continue;
+    const win = m.steps[t.step].dwell_s || m.dwell_s, Y = x => Math.min(1, x / win) * map.height;
     const x0 = X(t.fmin - pad), x1 = X(t.fmax + pad); if (x1 < 0 || x0 > map.width) continue;
     const w = Math.max(3 * dpr, x1 - x0), y0 = Y(t.t0), y1 = Math.max(y0 + 3 * dpr, Y(t.t1));
     g.strokeStyle = mark; g.lineWidth = (SV.hl === t.id ? 2.5 : 1.2) * dpr; g.globalAlpha = 0.5 + 0.5 * t.conf;
@@ -1062,7 +1076,9 @@ function surveyInteract(c) {
     }
     const f = fAt(e), r = c.getBoundingClientRect(), B = SV.bins, b = B ? Math.floor((f - SV.v0) / B.bw) : -1;
     tip.style.display = ""; tip.style.left = Math.max(0, Math.min(r.width - 300, e.clientX - r.left + 12)) + "px";
-    tip.textContent = fmtF(f) + (B && b >= 0 && b < B.nb ? ` · ${(B.all[b] / B.mins).toFixed(1)}/min tracked · ${(B.shown[b] / B.mins).toFixed(1)}/min ≥ ${Math.round(S.minConf * 100)}%` : "");
+    const st = m.steps.find(s => f >= s.lo && f < s.hi), cal = st && st.calibration;
+    tip.textContent = fmtF(f) + (B && b >= 0 && b < B.nb ? ` · ${(B.all[b] / B.mins).toFixed(1)}/min tracked · ${(B.shown[b] / B.mins).toFixed(1)}/min ≥ ${Math.round(S.minConf * 100)}%` : "")
+      + (cal ? ` · step calibrated on ${cal.candidates} candidates, ${cal.voice_like} speech-like` : st ? " · step too quiet to calibrate" : "");
   });
   c.addEventListener("pointerup", e => { if (drag && !drag.moved) { SV.sel = fAt(e); renderSurvey(); } drag = null; });
   c.addEventListener("pointerleave", () => { $("#svTip").style.display = "none"; });
@@ -1080,7 +1096,7 @@ function renderSamples() {
       onclick: () => { SV.hl = t.id; SV.sel = t.f; const w = 60e3; SV.v0 = Math.max(SV.meta.lo, t.f - w); SV.v1 = Math.min(SV.meta.hi, t.f + w); renderSurvey(); } },
       (() => { const b = el("button", { class: "play", title: "Play", onclick: e => { e.stopPropagation(); togglePlay(key, null, { clip: t.clips[0] }); } }); b.innerHTML = ICON_PLAY; return b; })(),
       el("span", { class: "num" }, fmtF(t.f)),
-      el("span", { class: "t2" }, tx && tx.text ? `“${tx.text}”` : `step ${t.step + 1} · ${t.t0.toFixed(1)} s`),
+      el("span", { class: "t2" }, t.text ? `“${t.text}”` : tx && tx.text ? `“${tx.text}”` : `step ${t.step + 1} · ${t.t0.toFixed(1)} s`),
       el("span", { class: "num t2", title: "ML voice score" }, t.vad != null ? `voice ${Math.round(t.vad * 100)}%` : ""),
       el("span", { class: "num", style: t.vad != null && t.vad >= floor ? "color:var(--ok)" : "" }, Math.round(t.conf * 100) + "%"));
   }));
@@ -1262,7 +1278,8 @@ $("#view").addEventListener("change", e => setView(e.target.value));
 
 // Waterfall views: only checks that are enabled are computed, so only those are listed.
 function availableViews() {
-  return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].enabled));
+  const sv = SV.open && SV.meta ? new Set(SV.meta.views) : null;
+  return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].enabled) || (sv && sv.has(v.id)));
 }
 function buildViewList() {
   const vs = availableViews(), sel = $("#view");
@@ -1347,3 +1364,4 @@ function connect() {
 fillRange($("#vol"));
 connect();
 requestAnimationFrame(draw);
+$("#mapBtn").addEventListener("click", openMap);

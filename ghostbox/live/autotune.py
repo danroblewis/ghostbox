@@ -191,6 +191,66 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
     }
 
 
+def analysis_config(cfg):
+    """Config for an analysis replay: permissive candidate finding with the checks as they are now
+    (switching everything on flattens the combined score so nothing stands out), every check
+    computed for each candidate (score_all) so a search can try any of them, nothing written."""
+    tcfg = copy.deepcopy(cfg)
+    tcfg["detect"].update(TUNE_DETECT)
+    score_all = {c["id"] for c in CHECKS if c["id"] not in SKIP
+                 and (c["id"] != "slide" or tcfg["checks"]["slide"]["enabled"])} | {"vad"}
+    if not any(tcfg["checks"][c["id"]]["enabled"] for c in CHECKS if c["stage"] == 1 and c["id"] != "profile"):
+        for k in ("twinning", "syllabic", "comb"):       # nothing to find candidates with: a basic set
+            tcfg["checks"][k]["enabled"] = True
+    tcfg["checks"]["profile"]["enabled"] = False        # learned live; a replay mustn't feed it
+    for k in ("whisper", "record", "iq_ring"):
+        tcfg[k]["enabled"] = False
+    return tcfg, score_all
+
+
+def analyse_iq(root, tcfg, score_all, paths, fs, fc, dur, step=0, progress=None, hooks=None):
+    """Replay recorded IQ once through the detector at ladder step `step`; returns every candidate's
+    box (with all check scores). hooks: engine attributes to set (on_hop, on_maps, on_clip)."""
+    boxes = []
+    t = copy.deepcopy(tcfg)
+    t["detect"].update(LADDER[step])
+
+    def collect(m):
+        if m.get("type") == "det_end":
+            boxes.append(m["box"])
+        elif progress and m.get("type") == "status" and m.get("progress") is not None:
+            progress(m["progress"], len(boxes))
+
+    src = FileSource(paths, fs, fc, paced=False, loop=False)
+    eng = Engine(StaticConfig(t), collect, root, source=src, oneshot=True, transcribe=False, score_all=score_all)
+    for k, v in (hooks or {}).items():
+        setattr(eng, k, v)
+    t_start = time.time()
+    while not eng.done.wait(1.0):
+        if time.time() - t_start > dur * 4 + 120:
+            eng.stop()
+            raise RuntimeError("Analysis took too long.")
+    return boxes
+
+
+def calibrate_boxes(boxes, cfg, minutes, per_min, available):
+    """Weights and thresholds from analysed candidates (see optimise); keeps the current checks
+    when (almost) nothing is speech-like, since a search against noise would be arbitrary."""
+    floor = cfg["autotune"].get("floor", 0.3)
+    res = optimise(boxes, minutes, per_min, cfg["checks"], floor=floor, available=available)
+    if res["voice_like"] < 3:
+        res = optimise(boxes, minutes, per_min, cfg["checks"], floor=floor, available=available, keep=True)
+        res["decisions"], res["kept_checks"] = [], True
+    return res
+
+
+def rescore(box, checks):
+    """A candidate's confidence under other check settings (the ML voice check at its own weight)."""
+    sc = {k: np.array(v) for k, v in box["scores"].items()}
+    g = stage1.combine(sc, checks)
+    return float(g) if g is not None else 0.0
+
+
 class AutoTune:
     def __init__(self, root, config, emit, apply, session=lambda: None):
         self.root, self.config, self.emit, self.apply = Path(root), config, emit, apply
@@ -237,46 +297,13 @@ class AutoTune:
                 raise RuntimeError("Not enough raw IQ recorded at this frequency yet. Turn on Settings > Storage > "
                                    f"Record raw IQ, stay on this band for {max(1, int(minutes))} min, then try again.")
             fc, fs = float(cfg["sdr"]["center_hz"]), float(cfg["sdr"]["sample_rate"])
-            tcfg = copy.deepcopy(cfg)
-            tcfg["detect"].update(TUNE_DETECT)
-            # Candidates are found with the checks as they are now (switching everything on flattens
-            # the combined score so that nothing stands out); every check is still computed for each
-            # candidate so the search below can try any of them.
-            score_all = {c["id"] for c in CHECKS if c["id"] not in SKIP
-                         and (c["id"] != "slide" or tcfg["checks"]["slide"]["enabled"])} | {"vad"}
-            if not any(tcfg["checks"][c["id"]]["enabled"] for c in CHECKS if c["stage"] == 1 and c["id"] != "profile"):
-                for k in ("twinning", "syllabic", "comb"):       # nothing to find candidates with: a basic set
-                    tcfg["checks"][k]["enabled"] = True
-            tcfg["checks"]["profile"]["enabled"] = False    # learned live; a replay mustn't feed it
-            tcfg["whisper"]["enabled"] = False
-            tcfg["record"]["enabled"] = False
-            tcfg["iq_ring"]["enabled"] = False
-            def analyse(step):
-                boxes = []
-                t = copy.deepcopy(tcfg)
-                t["detect"].update(LADDER[step])
-                pre = f"Analysing {dur / 60:.1f} min of recorded IQ" + (f" (looser, step {step + 1}/{len(LADDER)})" if step else "")
-
-                def collect(m):
-                    if m.get("type") == "det_end":
-                        boxes.append(m["box"])
-                    elif m.get("type") == "status" and m.get("progress") is not None:
-                        self._set(progress=round(0.9 * (step + m["progress"]) / len(LADDER), 3),
-                                  message=f"{pre}… {len(boxes)} candidates")
-
-                self._set(message=pre + "…")
-                src = FileSource(paths, fs, fc, paced=False, loop=False)
-                eng = Engine(StaticConfig(t), collect, self.root, source=src, oneshot=True, transcribe=False,
-                             score_all=score_all)
-                t_start = time.time()
-                while not eng.done.wait(1.0):
-                    if time.time() - t_start > dur * 4 + 120:
-                        eng.stop()
-                        raise RuntimeError("Analysis took too long; try fewer minutes.")
-                return boxes
-
+            tcfg, score_all = analysis_config(cfg)
             for step in range(len(LADDER)):
-                boxes = analyse(step)
+                pre = f"Analysing {dur / 60:.1f} min of recorded IQ" + (f" (looser, step {step + 1}/{len(LADDER)})" if step else "")
+                self._set(message=pre + "…")
+                boxes = analyse_iq(self.root, tcfg, score_all, paths, fs, fc, dur, step,
+                                   progress=lambda p, n, step=step, pre=pre: self._set(
+                                       progress=round(0.9 * (step + p) / len(LADDER), 3), message=f"{pre}… {n} candidates"))
                 if len(boxes) >= ENOUGH:
                     break
             found = {**TUNE_DETECT, **LADDER[step]}
@@ -292,15 +319,8 @@ class AutoTune:
                 return
             self._set(progress=0.95, message=f"Searching settings over {len(boxes)} candidates…")
             avail = score_all - SKIP
-            res = optimise(boxes, dur / 60, per_min, cfg["checks"], floor=cfg["autotune"].get("floor", 0.3), available=avail)
+            res = calibrate_boxes(boxes, cfg, dur / 60, per_min, avail)
             self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
-            if res["voice_like"] < 3:
-                # nothing (or almost nothing) speech-like to learn from: weights chosen against noise would
-                # be arbitrary, so keep the current checks and only fix tracking and candidate finding;
-                # the thresholds then come from the current checks' ranking
-                res = optimise(boxes, dur / 60, per_min, {**cfg["checks"]}, floor=cfg["autotune"].get("floor", 0.3),
-                               available=avail, keep=True)
-                res["decisions"], res["kept_checks"] = [], True
             live_detect = {**found, "max_tracks": 16, "max_candidates": 8,   # the analysis pass is wide open;
                            "threshold": res["capture_threshold"]}                      # live keeps CPU in check
             labels = {c["id"]: c["label"] for c in CHECKS}

@@ -263,6 +263,15 @@ def make_app(args):
         return web.Response(body=np.ascontiguousarray(img, np.uint8).tobytes(), content_type="application/octet-stream",
                             headers={"X-Rows": str(img.shape[0]), "X-Cols": str(img.shape[1])})
 
+    async def survey_clip(request):
+        f, c = request.query.get("file", ""), request.query.get("clip", "")
+        if not (SAFE.match(f) and SAFE.match(c)):
+            raise web.HTTPNotFound()
+        p = state["survey"].clip_path(f, c)
+        if p is None:
+            raise web.HTTPNotFound()
+        return web.FileResponse(p, headers={"Content-Type": "audio/wav"})
+
     async def start_survey(request):
         b = await request.json()
         c = config.get()
@@ -473,6 +482,7 @@ def make_app(args):
     app.router.add_post("/api/survey", start_survey)
     app.router.add_post("/api/survey/stop", stop_survey)
     app.router.add_get("/api/survey/image", survey_image)
+    app.router.add_get("/api/survey/clip", survey_clip)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)
