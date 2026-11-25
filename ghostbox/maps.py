@@ -9,7 +9,9 @@ syllabic band (2-10 Hz):
 
   u  upper sideband   k+inner .. k+outer        (~250 Hz .. 3.4 kHz)
   l  lower sideband   k-outer .. k-inner
-  r  ring             k +- (ring_lo .. ring_hi) (~4.5 .. 8 kHz, both sides)
+  r  ring             k +- (ring_lo .. ring_hi) (~4.5 .. 8 kHz, both sides;
+                    ring_hz=None disables it, e.g. in the AM broadcast band where
+                    there is no FM to reject and station audio reaches 10+ kHz)
 
   sym   = corr(u, l)        AM double sideband: mirror-image sidebands -> ~+1
   mod   = rms(u,l) / noise  how strongly the sidebands pulse at syllable rate
@@ -75,30 +77,35 @@ class OffsetSummer:
         return (self.cs[:, self.k + b] - self.cs[:, self.k + a - 1]).astype(np.float32)
 
 
-def compute_maps(x, fs, nfft=19200, frame_rate=25, inner_hz=250, outer_hz=3400,
-                 ring_hz=(4500, 8000), band=(2.0, 10.0), stat_win_s=0.5, dc_guard_hz=2000,
-                 baseline_s=15.0):
+def compute_maps(x, fs, bin_hz=125, frame_rate=25, dc_guard_hz=2000, **kw):
+    nfft = int(round(fs / bin_hz))
     t, f, P = power_frames(x, fs, nfft, frame_rate)
     dc = np.abs(f) <= dc_guard_hz
     P[:, dc] = np.median(P, axis=1, keepdims=True)  # drop DC/LO leakage spike
+    return maps_from_power(t, f, P, frame_rate=frame_rate, **kw)
 
-    df = fs / nfft
+
+def maps_from_power(t, f, P, frame_rate=25, inner_hz=250, outer_hz=3400,
+                    ring_hz=(4500, 8000), band=(2.0, 10.0), stat_win_s=0.5, baseline_s=15.0):
+    """All maps from a precomputed power spectrogram (lets callers build P in chunks or crop it)."""
+    df = float(f[1] - f[0])
     inner, outer = round(inner_hz / df), round(outer_hz / df)
-    r0, r1 = round(ring_hz[0] / df), round(ring_hz[1] / df)
-    S = OffsetSummer(P, r1)
+    S = OffsetSummer(P, round(ring_hz[1] / df) if ring_hz else outer)
     U, L = S(inner, outer), S(-outer, -inner)
-    R = S(r0, r1) + S(-r1, -r0)
 
     sos = butter(4, band, btype="bandpass", fs=frame_rate, output="sos")
     bp = lambda a: sosfiltfilt(sos, np.log(a + 1e-12), axis=0).astype(np.float32)
-    u, l, r = bp(U), bp(L), bp(R)
-    ul = u + l
+    u, l = bp(U), bp(L)
 
     n = max(3, int(stat_win_s * frame_rate))
     avg = lambda a: uniform_filter1d(a, size=n, axis=0, mode="nearest")
     corr = lambda a, b: avg(a * b) / np.sqrt(avg(a * a) * avg(b * b) + 1e-12)
     sym = corr(u, l)
-    ring = corr(ul, r)
+    if ring_hz:  # FM rejection; pointless (and harmful to wideband AM) where there is no FM
+        r0, r1 = round(ring_hz[0] / df), round(ring_hz[1] / df)
+        ring = corr(u + l, bp(S(r0, r1) + S(-r1, -r0)))
+    else:
+        ring = np.zeros_like(u)
     rms = np.sqrt(0.5 * (avg(u * u) + avg(l * l)))
     mod = rms / np.median(rms)
     raw = np.clip(sym, 0, 1) * np.clip(np.log(mod), 0, None) * (1 - np.clip(ring, 0, 1))

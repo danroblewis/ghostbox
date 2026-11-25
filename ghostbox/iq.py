@@ -1,4 +1,8 @@
-"""Loading and saving RTL-SDR IQ captures (.cu8 = interleaved unsigned 8-bit I/Q)."""
+"""Loading and saving IQ captures.
+
+.cu8 = interleaved unsigned 8-bit I/Q (RTL-SDR, rtl_sdr)
+.cs8 = interleaved signed 8-bit I/Q   (HackRF, hackrf_transfer)
+"""
 import re
 from pathlib import Path
 
@@ -17,17 +21,22 @@ def parse_name(path):
             float(fs.group(1)) * 1e6 if fs else 2.4e6)
 
 
-def load_cu8(path, start_s=0.0, dur_s=None, fs=None):
-    """Return complex64 baseband samples with the DC offset removed."""
+def load_iq(path, start_s=0.0, dur_s=None, fs=None):
+    """Return complex64 baseband samples with the DC offset removed (.cu8 or .cs8 by extension)."""
     if fs is None:
         fs = parse_name(path)[1]
-    raw = np.memmap(path, dtype=np.uint8, mode="r")
+    signed = Path(path).suffix == ".cs8"
+    raw = np.memmap(path, dtype=np.int8 if signed else np.uint8, mode="r")
     a = int(start_s * fs) * 2
     b = len(raw) if dur_s is None else min(len(raw), a + int(dur_s * fs) * 2)
     u = np.asarray(raw[a:b], dtype=np.float32)
-    x = ((u[0::2] - CU8_OFFSET) + 1j * (u[1::2] - CU8_OFFSET)).astype(np.complex64) / CU8_SCALE
+    off = 0.0 if signed else CU8_OFFSET
+    x = ((u[0::2] - off) + 1j * (u[1::2] - off)).astype(np.complex64) / CU8_SCALE
     x -= x.mean()
     return x
+
+
+load_cu8 = load_iq  # backwards-compatible name
 
 
 def save_cu8(path, x):

@@ -57,7 +57,8 @@ def make_handler(root: Path):
 
         def _index(self):
             def card(p, body):
-                note = NOTES.get(p.name, "")
+                side = p.with_suffix(".txt")
+                note = side.read_text().strip() if side.is_file() else NOTES.get(p.name, "")
                 return (f'<div class="card"><div class="name">{html.escape(p.name)}</div>'
                         f'<div class="note">{html.escape(note)}</div>{body}</div>')
             audio = "".join(card(p, f'<audio controls preload="none" src="{html.escape(p.name)}"></audio>')

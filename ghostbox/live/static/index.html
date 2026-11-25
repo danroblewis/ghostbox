@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ghostbox Live</title>
+<style>
+:root{--bg:#0b0d10;--panel:#12161b;--panel2:#181d24;--line:#252c35;--fg:#d9dee5;--muted:#8a94a3;--accent:#8b7cf6;--good:#3fb950;--warn:#d29922;--bad:#f85149;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:15px;margin:0 8px 0 0;letter-spacing:.02em}
+.pill{font-family:var(--mono);font-size:12px;padding:3px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.pill.ok{color:var(--good)} .pill.warn{color:var(--warn)} .pill.bad{color:var(--bad)}
+.ctl{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.ctl input[type=range]{width:110px}
+button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent)} button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.on{background:#2a2350;border-color:var(--accent)}
+main{display:grid;grid-template-columns:minmax(0,1fr) 400px;height:calc(100% - 50px)}
+#left{position:relative;min-width:0;display:flex;flex-direction:column}
+#wfwrap{position:relative;flex:1;min-height:300px}
+canvas#wf{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair}
+#tip{position:absolute;pointer-events:none;background:rgba(0,0,0,.75);border:1px solid var(--line);padding:3px 6px;border-radius:4px;font-family:var(--mono);font-size:11px;display:none}
+#side{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+.tabs{display:flex;border-bottom:1px solid var(--line);overflow-x:auto}
+.tabs button{border:0;border-radius:0;background:none;padding:9px 12px;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap}
+.tabs button.active{color:var(--fg);border-bottom-color:var(--accent)}
+.tab{display:none;overflow-y:auto;padding:10px 12px;flex:1;min-height:0}
+.tab.active{display:block}
+.card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 10px;margin:0 0 8px}
+.card.live{border-color:var(--accent)} .card.playing{box-shadow:0 0 0 2px #f5c542 inset}
+.card h3{font-size:13px;margin:0;display:flex;justify-content:space-between;gap:8px;align-items:center}
+.muted{color:var(--muted)} .mono{font-family:var(--mono)}
+.bar{height:6px;background:#222a33;border-radius:3px;overflow:hidden;margin:3px 0}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,#f5c542,#f85149)}
+.scores{display:grid;grid-template-columns:auto 1fr 34px;gap:1px 8px;font-size:11px;margin-top:6px;align-items:center}
+.scores .bar{margin:0}
+.row{display:flex;align-items:center;gap:8px;margin:5px 0;flex-wrap:wrap}
+.row label{min-width:150px;color:var(--muted);font-size:12px}
+.row input[type=range]{flex:1;min-width:120px}
+.row output{font-family:var(--mono);font-size:11px;min-width:54px;text-align:right}
+.row input[type=number],.row select,.row input[type=text]{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:4px 6px;font:inherit;min-width:0;flex:1}
+.check h3 label{display:flex;gap:6px;align-items:center;font-weight:600}
+.check .desc{font-size:11.5px;color:var(--muted);margin:3px 0 4px}
+.stage{font-size:10px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:14px 0 6px}
+audio{width:100%;height:32px;margin-top:6px}
+img{max-width:100%;border-radius:6px}
+#banner{position:absolute;left:50%;top:40%;transform:translate(-50%,-50%);text-align:center}
+@media (max-width:900px){main{grid-template-columns:1fr;grid-template-rows:55vh auto;height:auto}#side{border-left:0;border-top:1px solid var(--line);min-height:60vh}}
+</style>
+</head>
+<body>
+<header>
+  <h1>👻 Ghostbox Live</h1>
+  <span id="st" class="pill">connecting…</span>
+  <span id="st2" class="pill"></span>
+  <button id="audioBtn" class="primary">Enable audio</button>
+  <span class="ctl">vol <input id="vol" type="range" min="0" max="1.5" step="0.05" value="0.9"></span>
+  <span class="ctl">delay <input id="delay" type="range" min="2" max="5" step="0.25" value="4"><output id="delayOut" class="mono">4.0 s</output></span>
+  <span class="ctl">zoom <input id="pps" type="range" min="8" max="60" step="1" value="25"></span>
+  <span class="ctl">contrast <input id="dyn" type="range" min="20" max="90" step="5" value="50"></span>
+</header>
+<main>
+  <section id="left">
+    <div id="wfwrap"><canvas id="wf"></canvas><div id="tip"></div>
+      <div id="banner" class="muted"></div></div>
+  </section>
+  <aside id="side">
+    <div class="tabs">
+      <button data-tab="dets" class="active">Detections</button>
+      <button data-tab="detector">Detector</button>
+      <button data-tab="sdr">SDR</button>
+      <button data-tab="recs">Recordings</button>
+      <button data-tab="lib">Library</button>
+    </div>
+    <div id="dets" class="tab active"><div class="muted" id="detsEmpty">No detections yet.</div><div id="detList"></div></div>
+    <div id="detector" class="tab"></div>
+    <div id="sdr" class="tab"></div>
+    <div id="recs" class="tab"><div id="recList" class="muted">Loading…</div></div>
+    <div id="lib" class="tab"><div id="libList" class="muted">Loading…</div></div>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

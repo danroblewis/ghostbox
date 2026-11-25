@@ -13,3 +13,7 @@ venv/
 
 # OS / editor
 .DS_Store
+
+# live engine runtime data (access key, config) and detections
+live_data/
+recordings/
