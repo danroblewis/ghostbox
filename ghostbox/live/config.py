@@ -115,6 +115,11 @@ DEFAULT = {
         "language": "auto",                 # auto or an ISO code (en, es, ...)
         "min_confidence": 0.55,             # only transcribe detections that reached this confidence
         "chains": True,                     # also transcribe a whole hop chain stitched together
+        "workers": 2,                       # worker threads sharing one resident model
+        "batch_size": 16,                   # clips per batch (each in its own 30 s window)
+        "cpu_threads": 8,
+        "max_queue": 64,                    # beyond this the least confident clip is dropped
+        "max_age_s": 120,                   # clips waiting longer than this are skipped
     },
     "checks": {c["id"]: dict(c["default"]) for c in CHECKS},
 }

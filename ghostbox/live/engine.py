@@ -276,7 +276,8 @@ class Engine:
                                "storage": self.storage,
                                "progress": (src.sent / src.total) if getattr(src, "total", None) else None,
                                "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
-                                           "queue": self.transcriber.q.qsize()} if self.transcriber else {}}
+                                           "queue": self.transcriber.qsize(), "busy": self.transcriber.busy,
+                                           **self.transcriber.stats} if self.transcriber else {}}
                 self.emit({"type": "status", **self.status})
             except Exception as e:
                 self.status = {"state": "error", "error": f"{type(e).__name__}: {e}"}
@@ -517,7 +518,8 @@ class Engine:
             self.transcriber.submit({"kind": "chain", "id": cid, "chain": cid, "audio": np.concatenate(parts),
                                      "members": [m[2] for m in ch["members"]],
                                      "keys": [m[4] for m in ch["members"]],
-                                     "meta_paths": [m[3] for m in ch["members"] if m[3]]})
+                                     "meta_paths": [m[3] for m in ch["members"] if m[3]]},
+                                    priority=ch.get("conf", 0.5))
 
     @staticmethod
     def _recent(chunks, secs):
@@ -625,11 +627,12 @@ class Engine:
         if self.transcriber and w["enabled"] and conf_max >= w["min_confidence"]:
             self.transcriber.submit({"kind": "track", "id": tr.id, "chain": tr.chain, "audio": pcm.astype(np.float32),
                                      "wav": meta["files"].get("wav"), "keys": [meta["key"]],
-                                     "meta_paths": [meta_path] if meta_path else []})
+                                     "meta_paths": [meta_path] if meta_path else []}, priority=conf_max)
         if final:
             ch = self.chains.setdefault(tr.chain, {"members": [], "last_end": tr.t_last})
             ch["members"].append((seg_t0, pcm.astype(np.float32), tr.id, meta_path, meta["key"]))
             ch["last_end"] = max(ch["last_end"], tr.t_last)
+            ch["conf"] = max(ch.get("conf", 0.0), conf_max)
 
     def _write_recording(self, meta, pcm16, iq, stem, cfg):
         out = self.root / cfg["record"]["dir"]

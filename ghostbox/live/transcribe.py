@@ -1,17 +1,28 @@
 """Local Whisper transcription (faster-whisper) for finished detections and hop chains.
 
-Runs in its own thread so the detection engine never waits on it. Results are
-emitted to clients and written into the recordings' JSON metadata.
+One model is loaded once, in-process, and kept resident (reloaded only if the model name or
+thread settings change). A small pool of worker threads shares it; each worker transcribes a
+*batch* of clips at a time with faster-whisper's batched pipeline. Whisper always encodes a full
+30 s window however short the clip, so batching many clips — each still in its own window, so no
+context leaks between them — is what makes it keep up (~8x one-at-a-time on CPU).
 
-Whisper hallucinates on noise (it will happily "hear" phrases in static), so every
-result carries Whisper's own no_speech_prob and avg_logprob for the UI to show.
+The queue is prioritised by detection confidence: the most confident clips are transcribed first,
+the least confident are dropped when the queue is full, and clips that waited too long are skipped.
+
+Whisper hallucinates on noise (it will happily "hear" phrases in static), so every result carries
+Whisper's own no_speech_prob for the UI to show.
 """
+import heapq
+import itertools
 import json
-import queue
 import threading
+import time
 import traceback
 
 import numpy as np
+
+FS = 16000
+GAP = np.zeros(FS // 2, np.float32)
 
 
 class Transcriber:
@@ -19,62 +30,142 @@ class Transcriber:
         self.config = config
         self.emit = emit
         self.on_result = on_result          # (keys, field, result): update in-memory detections
-        self.q = queue.Queue(maxsize=50)
-        self.model, self.model_name = None, None
+        self._heap, self._seq = [], itertools.count()
+        self._cv = threading.Condition()
+        self._model_lock = threading.Lock()
+        self.model = self.pipe = None
+        self.model_name, self._model_key = None, None
         self.error = ""
-        threading.Thread(target=self._run, daemon=True).start()
+        self.busy = 0
+        self.stats = {"done": 0, "dropped": 0, "stale": 0, "rate": 0.0}
+        self._recent = []                   # (time, clips) for a throughput estimate
+        self._workers = []
+        self._ensure_workers()
 
-    def submit(self, item):
-        """item: {kind: track|chain, id, chain, audio (float32 16 kHz), meta_paths: [...], wav}"""
-        if len(item["audio"]) < 16000 * 0.3:
+    # ---------------- queue ----------------
+    @property
+    def q(self):                            # kept for status code that asks q.qsize()
+        return self
+
+    def qsize(self):
+        return len(self._heap)
+
+    def submit(self, item, priority=0.0):
+        """item: {kind: track|chain, id, chain, audio (float32 16 kHz), keys, meta_paths, wav}"""
+        if len(item["audio"]) < FS * 0.3:
             return
-        try:
-            self.q.put_nowait(item)
-        except queue.Full:
-            pass
+        cfg = self.config.get()["whisper"]
+        item["t_submit"] = time.time()
+        with self._cv:
+            heapq.heappush(self._heap, (-float(priority), next(self._seq), item))
+            limit = int(cfg.get("max_queue", 64))
+            if len(self._heap) > limit:      # drop the least confident clip
+                worst = max(range(len(self._heap)), key=lambda i: (self._heap[i][0], -self._heap[i][1]))
+                self._heap[worst] = self._heap[-1]
+                self._heap.pop()
+                heapq.heapify(self._heap)
+                self.stats["dropped"] += 1
+            self._cv.notify()
+        self._ensure_workers()
 
-    def _load(self, name):
-        if self.model_name != name:
-            from faster_whisper import WhisperModel
-            self.model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=4)
-            self.model_name = name
+    def _take_batch(self, size, linger=0.25):
+        with self._cv:
+            while not self._heap:
+                self._cv.wait()
+            deadline = time.time() + linger  # give a burst of detections a moment to join the batch
+            while len(self._heap) < size and time.time() < deadline:
+                self._cv.wait(timeout=max(0.0, deadline - time.time()))
+            batch = [heapq.heappop(self._heap)[2] for _ in range(min(size, len(self._heap)))]
+        return batch
 
-    def _run(self):
+    # ---------------- model ----------------
+    def _ensure_workers(self):
+        n = int(self.config.get()["whisper"].get("workers", 2))
+        while len(self._workers) < n:
+            th = threading.Thread(target=self._run, args=(len(self._workers),), daemon=True)
+            self._workers.append(th)
+            th.start()
+
+    def _load(self, cfg):
+        key = (cfg["model"], int(cfg.get("cpu_threads", 8)), int(cfg.get("workers", 2)))
+        with self._model_lock:
+            if self._model_key != key:
+                from faster_whisper import BatchedInferencePipeline, WhisperModel
+                self.model = WhisperModel(cfg["model"], device="cpu", compute_type="int8",
+                                          cpu_threads=key[1], num_workers=key[2])
+                self.pipe = BatchedInferencePipeline(model=self.model)
+                self.model_name, self._model_key = cfg["model"], key
+            return self.pipe
+
+    # ---------------- workers ----------------
+    def _run(self, idx):
         while True:
-            item = self.q.get()
             cfg = self.config.get()["whisper"]
+            if idx >= int(cfg.get("workers", 2)):          # pool shrunk: idle this worker
+                time.sleep(2)
+                continue
+            batch = self._take_batch(int(cfg.get("batch_size", 16)))
             if not cfg["enabled"]:
                 continue
+            fresh = [it for it in batch if time.time() - it["t_submit"] <= cfg.get("max_age_s", 120)]
+            self.stats["stale"] += len(batch) - len(fresh)
+            if not fresh:
+                continue
+            self.busy += 1
             try:
-                self._load(cfg["model"])
-                a = item["audio"].astype(np.float32)
-                a = a / (np.abs(a).max() + 1e-9) * 0.9
-                lang = None if cfg["language"] in ("", "auto") else cfg["language"]
-                segs, info = self.model.transcribe(a, language=lang, beam_size=1,
-                                                   condition_on_previous_text=False, vad_filter=False)
-                segs = list(segs)
-                text = " ".join(s.text.strip() for s in segs).strip()
-                res = {
-                    "text": text,
-                    "no_speech_prob": float(np.mean([s.no_speech_prob for s in segs])) if segs else 1.0,
-                    "avg_logprob": float(np.mean([s.avg_logprob for s in segs])) if segs else None,
-                    "language": info.language, "language_prob": float(info.language_probability),
-                    "model": cfg["model"],
-                }
-                self.emit({"type": "transcript", "kind": item["kind"], "id": item["id"],
-                           "chain": item["chain"], "wav": item.get("wav"), "members": item.get("members"),
-                           "keys": item.get("keys", []), **res})
-                key = "transcript" if item["kind"] == "track" else "chain_transcript"
-                if self.on_result:
-                    self.on_result(item.get("keys", []), key, res)
-                for p in item.get("meta_paths", []):
-                    try:
-                        m = json.loads(p.read_text())
-                        m[key] = res
-                        p.write_text(json.dumps(m, indent=1, default=float))
-                    except Exception:
-                        pass
+                results = self._transcribe(fresh, cfg)
+                for it, res in zip(fresh, results):
+                    self._deliver(it, res)
+                self.stats["done"] += len(fresh)
+                now = time.time()
+                self._recent = [(t, n) for t, n in self._recent if now - t < 60] + [(now, len(fresh))]
+                span = max(1.0, now - self._recent[0][0]) if len(self._recent) > 1 else 60.0
+                self.stats["rate"] = round(sum(n for _, n in self._recent) / span, 2)
                 self.error = ""
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
                 traceback.print_exc()
+            finally:
+                self.busy -= 1
+
+    def _transcribe(self, items, cfg):
+        pipe = self._load(cfg)
+        lang = None if cfg["language"] in ("", "auto") else cfg["language"]
+        parts, spans, t = [], [], 0.0
+        for it in items:                                   # each clip gets its own 30 s window
+            a = it["audio"].astype(np.float32)
+            a = a / (np.abs(a).max() + 1e-9) * 0.9
+            spans.append((t, t + len(a) / FS))
+            parts += [a, GAP]
+            t += len(a) / FS + len(GAP) / FS
+        segs, info = pipe.transcribe(np.concatenate(parts), batch_size=max(1, len(items)), beam_size=1,
+                                     language=lang, without_timestamps=True,
+                                     clip_timestamps=[{"start": a, "end": b} for a, b in spans])
+        texts, nsp = [[] for _ in items], [[] for _ in items]
+        for s in segs:
+            i = min(range(len(spans)), key=lambda k: abs(spans[k][0] - s.start))
+            if s.text.strip():
+                texts[i].append(s.text.strip())
+            nsp[i].append(getattr(s, "no_speech_prob", None))
+        out = []
+        for i in range(len(items)):
+            probs = [p for p in nsp[i] if p is not None]
+            out.append({"text": " ".join(texts[i]).strip(),
+                        "no_speech_prob": float(np.mean(probs)) if probs else (0.5 if texts[i] else 1.0),
+                        "language": info.language, "model": cfg["model"]})
+        return out
+
+    def _deliver(self, item, res):
+        self.emit({"type": "transcript", "kind": item["kind"], "id": item["id"],
+                   "chain": item["chain"], "wav": item.get("wav"), "members": item.get("members"),
+                   "keys": item.get("keys", []), **res})
+        key = "transcript" if item["kind"] == "track" else "chain_transcript"
+        if self.on_result:
+            self.on_result(item.get("keys", []), key, res)
+        for p in item.get("meta_paths", []):
+            try:
+                m = json.loads(p.read_text())
+                m[key] = res
+                p.write_text(json.dumps(m, indent=1, default=float))
+            except Exception:
+                pass

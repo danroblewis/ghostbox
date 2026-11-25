@@ -760,6 +760,11 @@ function buildDetector() {
       selectRow("Language", ["auto", "en", "es", "fr", "de", "it", "pt", "ja", "zh"], w.language, v => patch({ whisper: { language: v } })),
       slider("Only above confidence", ["whisper", "min_confidence"], 0, 1, 0.01, v => v.toFixed(2)),
       el("div", { class: "row wide" }, el("label", {}, "Also transcribe whole hop chains"), toggle(w.chains, v => patch({ whisper: { chains: v } }))),
+      slider("Workers (share one loaded model)", ["whisper", "workers"], 1, 4, 1),
+      slider("Clips per batch", ["whisper", "batch_size"], 1, 32, 1),
+      slider("CPU threads", ["whisper", "cpu_threads"], 2, 16, 1),
+      slider("Skip clips waiting longer than", ["whisper", "max_age_s"], 10, 600, 10, v => v + " s"),
+      el("div", { class: "note" }, `Most confident clips are transcribed first. Done ${ws.done ?? 0}, skipped as stale ${ws.stale ?? 0}, dropped (queue full) ${ws.dropped ?? 0}.`),
       ws.error ? el("div", { class: "err" }, ws.error) : null));
   for (const stage of [1, 2]) {
     root.append(el("h2", {}, stage === 1 ? "Whole-band checks (every frequency, from IQ)" : "Per-candidate checks (demodulated)"));
@@ -929,7 +934,7 @@ function setStatus(s) {
   st.className = ok && !behind ? "" : "bad";
   const paused = ok && s.storage && s.storage.paused;
   if (paused) st.className = "bad";
-  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: lower the sample rate or narrow the analysis range" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue ? ` · transcribing ${w.queue}` : ""}${s.error ? " · " + s.error : ""}`
+  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: lower the sample rate or narrow the analysis range" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue || w.busy ? ` · transcribing ${w.queue} queued${w.rate ? `, ${w.rate}/s` : ""}` : ""}${s.error ? " · " + s.error : ""}`
     : `${s.state}${s.error ? ": " + s.error : ""}`;
   st.title = st.textContent;
 }
