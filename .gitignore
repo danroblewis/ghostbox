@@ -1,0 +1,15 @@
+# IQ captures, generated audio and plots (large, machine-specific)
+captures/
+*.cu8
+*.cf32
+*.wav
+*.aiff
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
