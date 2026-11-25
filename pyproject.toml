@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ghostbox"
+version = "0.1.0"
+description = "SDR-native spirit box: finds human-voice-like AM/SSB signals across a whole band of IQ from a HackRF or RTL-SDR, with a live web UI."
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["sdr", "hackrf", "rtl-sdr", "spirit box", "iq", "voice detection", "am", "ssb"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+]
+# The detector, demodulators and web server need only these. The ML voice detector and
+# speech recognition are optional extras (imported lazily; the app runs without them).
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+# Silero voice-activity detector: the "ML voice detector" check, calibration and audio tuning.
+vad = ["torch>=2.1", "silero-vad>=5.1"]
+# Whisper transcription (the default speech-recognition engine; surveys use Whisper tiny).
+whisper = ["faster-whisper>=1.0"]
+# Moonshine and wav2vec2 speech recognition.
+transformers = ["torch>=2.1", "transformers>=4.48"]
+# Vosk speech recognition.
+vosk = ["vosk>=0.3.44,!=0.3.45"]   # 0.3.45 has no macOS wheels
+# Plots for the offline analysis script (ghostbox.analyze).
+plots = ["matplotlib>=3.7"]
+# What the default settings use: voice detector + Whisper.
+recommended = ["ghostbox[vad,whisper]"]
+all = ["ghostbox[vad,whisper,transformers,vosk,plots]"]
+
+[project.scripts]
+ghostbox = "ghostbox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ghostbox"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/ghostbox", "/README.md", "/pyproject.toml"]
+exclude = ["__pycache__", "*.pyc"]

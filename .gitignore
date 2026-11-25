@@ -19,3 +19,9 @@ live_data/
 recordings/
 iq_ring/
 .claude/
+
+# packaging
+dist/
+build/
+*.egg-info/
+*.cs8
