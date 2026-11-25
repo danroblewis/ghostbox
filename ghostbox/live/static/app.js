@@ -901,41 +901,41 @@ function tuneCard() {
     slider("Voice-likeness floor", ["autotune", "floor"], 0, 0.9, 0.05, v => Math.round(v * 100) + "%"),
     readyBlock(),
     el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go),
-    out,
-    surveyControls());
+    out);
 }
 
 // ---------------- band survey ----------------
-function surveyControls() {
+// "New" on the map: a small dialog to configure and start a survey.
+function newSurveyDialog() {
   const sdr = S.cfg.sdr, fs = sdr.sample_rate, step = fs * 0.8;
-  const defLo = +lsGet("gb_sv_lo", sdr.source === "rtlsdr" ? 24 : 0.5), defHi = +lsGet("gb_sv_hi", 30);
-  const num = v => el("input", { class: "field", type: "number", step: "0.1", min: 0, value: v, style: "width:84px" });
-  const lo = num(defLo), hi = num(defHi);
+  const num = v => el("input", { class: "field", type: "number", step: "0.1", min: 0, value: v, style: "width:96px" });
+  const lo = num(+lsGet("gb_sv_lo", sdr.source === "rtlsdr" ? 24 : 0.5)), hi = num(+lsGet("gb_sv_hi", 30));
   const dwell = el("select", { class: "sel" }, ...[[15, "15 s"], [30, "30 s"], [60, "1 min"], [120, "2 min"]].map(([v, l]) => el("option", { value: v }, l)));
   dwell.value = lsGet("gb_sv_dwell", 30);
-  const est = el("div", { class: "note", style: "margin:4px 0" });
+  const est = el("div", { class: "note", style: "margin:8px 0 0" }), err = el("div", { class: "err", style: "margin:6px 0 0" });
   const upd = () => {
     const n = Math.max(1, Math.ceil(((+hi.value - +lo.value) * 1e6) / step));
-    est.textContent = +hi.value > +lo.value ? `${n} step${n > 1 ? "s" : ""} of ${(step / 1e6).toFixed(2)} MHz · about ${fmtMS(n * (+dwell.value + 6))}. Each step is calibrated on its own sample and its detections transcribed; the receiver returns here afterwards.` : "From must be below To.";
+    est.textContent = +hi.value > +lo.value ? `${n} step${n > 1 ? "s" : ""} of ${(step / 1e6).toFixed(2)} MHz (80% of the ${(fs / 1e6).toFixed(1)} MHz span) · about ${fmtMS(n * (+dwell.value + 6))}. Each step is calibrated on its own sample and its detections transcribed; the receiver comes back here afterwards.` : "From must be below To.";
     lsSet("gb_sv_lo", lo.value); lsSet("gb_sv_hi", hi.value); lsSet("gb_sv_dwell", dwell.value);
   };
   [lo, hi, dwell].forEach(x => x.addEventListener("input", upd)); upd();
-  const running = SV.state.state === "running";
-  const btn = el("button", { class: "btn" + (running ? "" : " primary"), onclick: async () => {
-    if (running) { await fetch("/api/survey/stop", { method: "POST" }); return; }
+  const close = () => { wrap.remove(); document.removeEventListener("keydown", key, true); };
+  const key = e => { if (e.key === "Escape") { e.stopPropagation(); close(); } else if (e.key === "Enter") { e.preventDefault(); start.click(); } };
+  const start = el("button", { class: "btn primary", onclick: async () => {
+    start.disabled = true;
     const r = await (await fetch("/api/survey", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ lo_hz: +lo.value * 1e6, hi_hz: +hi.value * 1e6, dwell_s: +dwell.value }) })).json();
-    if (r.error) alert(r.error); else openSurvey();
-  } }, running ? "Stop survey" : "Survey");
-  const msg = el("div", { class: SV.state.state === "error" ? "err" : "note", style: "margin:6px 0 0" },
-    running ? `${SV.state.message || ""}` : SV.state.state === "error" ? SV.state.message : "");
-  return el("div", { style: "margin-top:14px" },
-    el("h2", { style: "margin-top:0" }, "Survey a range"),
-    el("div", { class: "row wide" }, el("label", {}, "From – to (MHz)"), el("div", { style: "display:flex;gap:6px;align-items:center" }, lo, el("span", { class: "t3" }, "–"), hi)),
+    if (r.error) { err.textContent = r.error; start.disabled = false; return; }
+    close(); SV.state = r; openSurvey();
+  } }, "Start survey");
+  const box = el("div", { class: "dlg", style: "width:min(460px,100%)" },
+    el("div", { class: "dlghead" }, el("strong", {}, "New survey"), el("span", { style: "flex:1" }), el("button", { class: "btn", onclick: close }, "Cancel")),
+    el("div", { class: "row wide", style: "margin-top:12px" }, el("label", {}, "From – to (MHz)"), el("div", { style: "display:flex;gap:6px;align-items:center" }, lo, el("span", { class: "t3" }, "–"), hi)),
     el("div", { class: "row wide" }, el("label", {}, "Time per step"), dwell),
-    est,
-    el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn),
-    msg);
+    est, err,
+    el("div", { style: "display:flex;justify-content:flex-end;margin-top:12px" }, start));
+  const wrap = el("div", { id: "newSurvey", class: "modalwrap", onclick: e => { if (e.target === wrap) close(); } }, box);
+  document.body.append(wrap); document.addEventListener("keydown", key, true); lo.focus();
 }
 async function loadSurveyList() {
   try { const r = await (await fetch("/api/survey?list=1")).json(); SV.saved = r.saved; SV.state = r.state; } catch (e) {}
@@ -961,7 +961,8 @@ function onSurvey(m) {
   const was = SV.state.state; SV.state = m;
   if (SV.open && !SV.file && (m.steps_done || (m.state !== "running" && was === "running"))) openSurvey();
   if (m.state !== "running" && was === "running") loadSurveyList().then(() => { if ($("#detector").classList.contains("active")) buildDetector(); });
-  const t = $("#svStatus"); if (t) t.textContent = m.state === "running" ? m.message || "" : "";
+  const t = $("#svStatus"); if (t) t.textContent = m.state === "running" ? m.message || "" : m.state === "error" ? m.message || "" : "";
+  const nb = $("#svNew"); if (nb) nb.textContent = m.state === "running" ? "Stop survey" : "New";
   if (!$("#detector").contains(document.activeElement) && m.state !== "running") buildDetector();
 }
 function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); $("#mapBtn").classList.remove("on"); buildViewList(); }
@@ -1007,7 +1008,8 @@ function drawSurvey() {
       el("span", { id: "svInfo", class: "t2" }), el("span", { id: "svStatus", class: "t3" }),
       el("span", { style: "flex:1" }), el("span", { id: "svSel", class: "num t2" }),
       el("button", { id: "svTune", class: "btn primary", style: "display:none", onclick: () => SV.sel != null && surveyTune(SV.sel) }, "Tune here"),
-      el("button", { class: "btn", title: "Show the whole range (or double-click the map)", onclick: () => { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); } }, "Fit"),
+      el("button", { id: "svNew", class: "btn", title: "Survey a new range", onclick: () => SV.state.state === "running" ? fetch("/api/survey/stop", { method: "POST" }) : newSurveyDialog() }, "New"),
+      el("button", { class: "btn", title: "Show the whole range (or double-click the map)", onclick: () => { if (SV.meta) { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); } } }, "Fit"),
       el("button", { class: "btn", onclick: closeSurvey }, "Close"));
     const map = el("canvas", { id: "svMap", class: "svmap" }), chart = el("canvas", { id: "svChart", class: "svchart" });
     p.append(head, el("div", { class: "svmapwrap" }, map, el("div", { id: "svTip", class: "svtip" })), el("div", { id: "svAxis", class: "svaxis" }), chart,
@@ -1016,12 +1018,13 @@ function drawSurvey() {
   }
   const m = SV.meta, run = SV.state.state === "running";
   $("#mapBtn").classList.add("on"); buildViewList();
+  $("#svNew").textContent = run ? "Stop survey" : "New";
   const pick = $("#svPick"), cur = SV.file || "";
   pick.replaceChildren(...(run || (m && !SV.file) ? [el("option", { value: "" }, run ? "Survey in progress" : "Latest survey")] : []),
     ...SV.saved.map(f => el("option", { value: f }, f.replace(/\.json$/, "").replace(/_/g, " "))));
   if (!pick.options.length) pick.append(el("option", { value: "" }, "No surveys yet"));
   pick.value = cur;
-  if (!m) { $("#svInfo").textContent = "Start one in Detector › Survey a range."; for (const id of ["svMap", "svChart"]) { const c = $("#" + id); c.getContext("2d").clearRect(0, 0, c.width, c.height); } $("#svAxis").replaceChildren(); $("#svSamples").replaceChildren(); return; }
+  if (!m) { $("#svInfo").textContent = "No surveys yet: click New to start one."; for (const id of ["svMap", "svChart"]) { const c = $("#" + id); c.getContext("2d").clearRect(0, 0, c.width, c.height); } $("#svAxis").replaceChildren(); $("#svSamples").replaceChildren(); return; }
   $("#svInfo").textContent = m ? `${fmtFshort(m.lo)} – ${fmtFshort(m.hi)} · ${m.dwell_s} s per step · ${m.source} · ${(m.started || "").replace("T", " ").slice(0, 16)}`
     + (S.view !== surveyView() ? ` · “${(S.views.find(v => v.id === S.view) || {}).label || S.view}” wasn't recorded; showing power` : "") : "";
   $("#svStatus").textContent = run ? SV.state.message || "" : "";
