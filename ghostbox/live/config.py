@@ -136,7 +136,9 @@ DEFAULT = {
         "link_hops_s": 0.4,                 # a new track starting this soon after one ends = same voice (hop)
         "min_duration_s": 0.4,
     },
-    "audio": {"delay_s": 4.0, "bandwidth_hz": 3400,
+    "audio": {"delay_s": 4.0, "bandwidth_hz": 3400,      # (unused: the channel follows voice_hi_hz)
+              "demod": "auto",                          # auto (sync AM; product detector for SSB) | envelope | sync | sync_sb
+              "voice_band": True, "voice_lo_hz": 300, "voice_hi_hz": 3000,   # hard band-pass for playback
               "preroll_s": 0.5, "postroll_s": 0.5, "fade_s": 0.15,      # ease detections in and out
               "denoise": True, "denoise_strength": 1.0, "denoise_floor_db": -18.0},
     "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0,

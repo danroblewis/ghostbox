@@ -283,7 +283,9 @@ class Survey:
                            "conf": round(conf, 3), "vad": b["scores"].get("vad"), "clips": [], "text": None,
                            "iq_t": [round(b["t0"] - sess0, 3), round(b["t1"] - sess0, 3)],
                            "scores": {k: round(float(v), 3) for k, v in b["scores"].items()},
-                           "info": b.get("info", {}), "dur": round(b["t1"] - b["t0"], 2)})
+                           "info": b.get("info", {}), "dur": round(b["t1"] - b["t0"], 2),
+                           "mode": {"usb": 1, "lsb": -1}.get(b.get("mode"), 0),
+                           "path": [[round(t - sess0, 3), f] for t, f in (b.get("path") or [])][-200:]})
         # keep (and transcribe) the clips of what the calibrated detector shows
         shown = sorted([t for t in tracks if t["conf"] >= show and st["clips"].get(t["id"])], key=lambda t: -t["conf"])[:MAX_CLIPS]
         cdir = self.dir / name

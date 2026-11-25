@@ -830,8 +830,7 @@ function buildDetector() {
     slider("Max slide rate", ["detect", "max_slide_hz_s"], 0, 500000, 5000, v => (v / 1e3) + " kHz/s"),
     slider("Track gap", ["detect", "track_gap_s"], 0.05, 2, 0.05, v => v.toFixed(2) + " s"),
     slider("Hop link window", ["detect", "link_hops_s"], 0, 2, 0.05, v => v.toFixed(2) + " s"),
-    slider("Min separation", ["detect", "min_sep_hz"], 1000, 50000, 500, v => (v / 1e3) + " kHz"),
-    slider("Audio bandwidth", ["audio", "bandwidth_hz"], 1500, 7500, 100, v => v + " Hz"));
+    slider("Min separation", ["detect", "min_sep_hz"], 1000, 50000, 500, v => (v / 1e3) + " kHz"));
   const w = c.whisper, ws = S.status.whisper || {};
   root.append(el("h2", {}, "Transcription"),
     el("div", { class: "card" + (w.enabled ? "" : " off") },
@@ -1247,6 +1246,11 @@ async function buildSDR() {
     rowW("Bin width", bin),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { ppm: +ppm.value }, analysis: { bin_hz: +bin.value } }) }, "Apply")),
     el("h2", {}, "Playback audio"),
+    selectRow("Demodulator", [["auto", "Auto (synchronous AM; SSB for SSB signals)"], ["sync", "Synchronous AM"], ["sync_sb", "Synchronous sideband (cleaner side)"], ["envelope", "Envelope"]],
+      c.audio.demod || "auto", v => patch({ audio: { demod: v } }, 50)),
+    el("div", { class: "row wide" }, el("label", { title: "Hard band-pass: flat inside, at least 50 dB down outside" }, "Voice band filter"), toggle(c.audio.voice_band !== false, v => patch({ audio: { voice_band: v } }, 50))),
+    slider("Voice band from", ["audio", "voice_lo_hz"], 100, 800, 25, v => v + " Hz"),
+    slider("Voice band to", ["audio", "voice_hi_hz"], 1800, 5000, 100, v => v + " Hz"),
     slider("Lead-in before a detection", ["audio", "preroll_s"], 0, 1.5, 0.05, v => v.toFixed(2) + " s"),
     slider("Tail after a detection", ["audio", "postroll_s"], 0, 1.2, 0.05, v => v.toFixed(2) + " s"),
     slider("Fade in / out", ["audio", "fade_s"], 0, 0.5, 0.01, v => Math.round(v * 1000) + " ms"),
@@ -1439,7 +1443,7 @@ async function openDetail(opts) {
     info = { f: t.f, fmin: t.fmin, fmax: t.fmax, dur: t.dur ?? (t.t1 - t.t0), conf: t.conf, scores: t.scores || { vad: t.vad }, info: t.info || {},
       when: `Survey ${file ? file.replace(/\.json$/, "").replace(/_/g, " ") : ""} · step ${opts.survey.stepIndex + 1} at ${t.t0.toFixed(1)} s`,
       extra: st.calibration ? [["Step calibration", `${st.calibration.candidates} candidates, ${st.calibration.voice_like} speech-like${st.calibration.kept_checks ? " (kept current checks)" : ""}`]] : [],
-      rx: { center: st.fc, rate: st.fs } };
+      rx: { center: st.fc, rate: st.fs }, mode: t.mode };
     tx = t.text ? { text: t.text } : null;
     clip = t.clips && t.clips[0];
     iqUrl = `/api/iq?survey=${encodeURIComponent(file || SV.meta.file)}&track=${t.id}`;
@@ -1452,7 +1456,7 @@ async function openDetail(opts) {
       info = { f: meta.freq_hz.mean, fmin: meta.freq_hz.min, fmax: meta.freq_hz.max, dur: meta.duration_s, conf: meta.confidence.max, confFinal: meta.confidence.final,
         scores: meta.scores || {}, info: meta.info || {}, when: new Date(meta.utc_start).toLocaleString(), utc: meta.utc_start,
         hist: meta.confidence.history, rx: { center: meta.fc, rate: meta.fs, gain: meta.sdr && meta.sdr.gain_db, amp: meta.sdr && meta.sdr.amp, source: meta.sdr && meta.sdr.source },
-        extra: [["Chain / segment", `${meta.chain} / ${meta.segment}`], ["Saved", meta.saved === false ? "In memory only" : "On disk"]] };
+        extra: [["Chain / segment", `${meta.chain} / ${meta.segment}`], ["Saved", meta.saved === false ? "In memory only" : "On disk"]], mode: meta.mode };
       tx = meta.transcript || S.tx.get(meta.id) || null;
       clip = meta.clip || (meta.files && meta.files.wav ? "/rec/" + meta.files.wav : null);
       iqUrl = "/api/iq?key=" + encodeURIComponent(meta.key);
@@ -1463,6 +1467,8 @@ async function openDetail(opts) {
     }
   }
   if (!DT.open) return;
+  const renderBase = iqUrl ? iqUrl.split("?")[1] : null;
+  DT.clip = clip;
   // ---- header, transcript
   box.replaceChildren();
   box.append(el("div", { class: "dlghead" },
@@ -1479,7 +1485,8 @@ async function openDetail(opts) {
   const pl = el("div", { class: "dlgplot" }, wave, spec, head);
   pl.addEventListener("click", e => { if (!DT.buf) return; const r = pl.getBoundingClientRect(); dtSeek((e.clientX - r.left) / r.width * DT.buf.duration); });
   box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
-    el("span", { style: "flex:1" }), el("span", { class: "t3", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl));
+    el("span", { style: "flex:1" }), el("span", { class: "t3", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
+    renderBase ? abControls(renderBase, clip) : el("div", { class: "note" }, "A/B listening needs this detection's IQ, which isn't available.")));
   // ---- downloads and actions
   const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
   const dl = (label, href, name, title) => el("a", { class: "btn", href, download: name, title }, label);
@@ -1497,7 +1504,7 @@ async function openDetail(opts) {
   const fmtMode = m => m === 1 ? "USB" : m === -1 ? "LSB" : m === 0 ? "AM" : null;
   kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
   if (info.confFinal != null) kv.push(["Confidence", `max ${Math.round(info.conf * 100)}%, final ${Math.round(info.confFinal * 100)}%`]);
-  const I = info.info || {};
+  const I = { ...(info.info || {}), ...(info.mode != null ? { mode: info.mode } : {}) };
   if (fmtMode(I.mode) || I.mode_name) kv.push(["Modulation", I.mode_name || fmtMode(I.mode)]);
   if (I.f0_median_hz) kv.push(["Pitch", `${Math.round(I.f0_median_hz)} Hz`]);
   if (I.voiced_frac != null) kv.push(["Voiced", `${Math.round(I.voiced_frac * 100)}% of frames`]);
@@ -1585,4 +1592,35 @@ function dtTick() {
   const t = DT.src ? DT.off + AC.currentTime - DT.t0 : DT.off, h = $("#detail .dlgplayhead"), tm = $("#dtTime");
   if (h) h.style.left = (Math.min(1, t / DT.buf.duration) * 100) + "%";
   if (tm) tm.textContent = `${t.toFixed(1)} / ${DT.buf.duration.toFixed(1)} s`;
+}
+// A/B: the same clip re-rendered from its IQ with another demodulator, noise reduction or voice band.
+function abControls(base, clip) {
+  const au = S.cfg.audio;
+  DT.ab = { demod: "rec", denoise: au.denoise !== false, band: au.voice_band !== false };
+  const seg = (items, key) => el("div", { class: "abseg" }, ...items.map(([v, l]) => el("button", { class: "btn" + (DT.ab[key] === v ? " on" : ""), "data-v": String(v),
+    onclick: e => { DT.ab[key] = v; e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
+  const note = el("span", { id: "abNote", class: "t3", style: "font-size:12px" });
+  return el("div", { class: "abrow" },
+    el("span", { class: "t2" }, "Listen as"),
+    seg([["rec", "Recorded"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["sync_sb", "Sync sideband"]], "demod"),
+    el("span", { class: "t2" }, "Noise reduction"), seg([[true, "On"], [false, "Off"]], "denoise"),
+    el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note);
+}
+async function abLoad(base, clip) {
+  const a = DT.ab, note = $("#abNote");
+  const url = a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false) && clip ? clip
+    : `/api/render?${base}&demod=${a.demod === "rec" ? "" : a.demod}&denoise=${a.denoise ? 1 : 0}&band=${a.band ? 1 : 0}`;
+  if (note) note.textContent = "Rendering…";
+  const gen = DT.abGen = (DT.abGen || 0) + 1;
+  try {
+    const r = await fetch(url); if (!r.ok) throw new Error(await r.text());
+    const buf = await AC.decodeAudioData(await r.arrayBuffer());
+    if (gen !== DT.abGen || !DT.open) return;
+    const playing = !!DT.src, at = DT.src ? DT.off + AC.currentTime - DT.t0 : DT.off;
+    if (playing) dtStop();
+    DT.buf = buf; DT.spec = specOf(buf.getChannelData(0), buf.sampleRate); DT.off = Math.min(at, buf.duration);
+    drawDetailWave(); drawDetailSpec(); dtTick();
+    if (playing) dtToggle();
+    if (note) note.textContent = "";
+  } catch (e) { if (note && gen === DT.abGen) note.textContent = String(e.message || e).slice(0, 80); }
 }

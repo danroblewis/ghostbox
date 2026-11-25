@@ -18,7 +18,7 @@ import numpy as np
 
 from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
-from .engine import Engine, iq_cut_wav
+from .engine import Engine, iq_cut_wav, render_segments
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
 from .survey import Survey
@@ -270,6 +270,58 @@ def make_app(args):
         meta = {k: v for k, v in meta.items() if k not in ("checks", "detect")}
         return web.json_response(meta, dumps=lambda o: json.dumps(o, default=float))
 
+    def survey_segments(f, track_id):
+        """(segments, timeline base, step, track) for a survey sample's IQ in the ring."""
+        st, t = state["survey"].track(f, track_id)
+        if t is None or "iq_t" not in t:
+            raise web.HTTPNotFound(text="no IQ recorded for this sample")
+        ring = ROOT / config.get()["iq_ring"]["dir"]
+        segs = []
+        for name in st.get("iq_files", []):
+            p = ring / name
+            if p.exists() and p.with_suffix(".json").exists():
+                segs.append((json.loads(p.with_suffix(".json").read_text()), p))
+        if not segs:
+            raise web.HTTPNotFound(text="this sample's IQ is no longer in the IQ ring")
+        return segs, segs[0][0]["t0"], st, t
+
+    async def render(request):
+        """A detection / survey sample re-rendered from the IQ ring with other audio settings, for A/B:
+        ?demod=envelope|sync|sync_sb|auto &denoise=0|1 &band=0|1 (anything left out: as configured)."""
+        q, eng, loop = request.query, state["engine"], asyncio.get_running_loop()
+        au = dict(config.get()["audio"])
+        if q.get("demod") in ("auto", "envelope", "sync", "sync_sb"):
+            au["demod"] = q["demod"]
+        for k, key in (("denoise", "denoise"), ("band", "voice_band")):
+            if q.get(k) in ("0", "1"):
+                au[key] = q[k] == "1"
+        pre, post = au.get("preroll_s", 0.5), au.get("postroll_s", 0.5)
+        if q.get("survey"):
+            if not SAFE.match(q["survey"]):
+                raise web.HTTPNotFound()
+            segs, base, st, t = survey_segments(q["survey"], int(q.get("track", -1)))
+            t0, t1 = base + t["iq_t"][0] - pre, base + t["iq_t"][1] + post
+            pts = [[base + r, f] for r, f in t.get("path") or []] or [[t0, t["f"]]]
+            mode = t.get("mode", 0)
+        else:
+            meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
+            if meta is None:
+                raise web.HTTPNotFound()
+            t0, t1 = meta["stream_t0"] - pre, meta["stream_t1"] + post
+            segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
+            if not segs:
+                raise web.HTTPNotFound(text="this detection's IQ is no longer in the IQ ring")
+            pts = [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]]
+            mode = meta.get("mode", 0)
+        pcm = await loop.run_in_executor(None, render_segments, segs, t0, t1, pts, au, mode)
+        if pcm is None:
+            raise web.HTTPNotFound(text="no IQ in that time range")
+        import io
+        from scipy.io import wavfile
+        buf = io.BytesIO()
+        wavfile.write(buf, 16000, pcm)
+        return web.Response(body=buf.getvalue(), content_type="audio/wav")
+
     async def get_iq(request):
         """IQ around a detection (?key=) or a survey sample (?survey=&track=), as a stereo I/Q WAV."""
         q, eng = request.query, state["engine"]
@@ -280,18 +332,7 @@ def make_app(args):
             f = q["survey"]
             if not SAFE.match(f):
                 raise web.HTTPNotFound()
-            st, t = state["survey"].track(f, int(q.get("track", -1)))
-            if t is None or "iq_t" not in t:
-                raise web.HTTPNotFound(text="no IQ recorded for this sample")
-            ring = ROOT / config.get()["iq_ring"]["dir"]
-            segs = []
-            for name in st.get("iq_files", []):
-                p = ring / name
-                if p.exists() and p.with_suffix(".json").exists():
-                    segs.append((json.loads(p.with_suffix(".json").read_text()), p))
-            if not segs:
-                raise web.HTTPNotFound(text="this sample's IQ is no longer in the IQ ring")
-            base = segs[0][0]["t0"]
+            segs, base, st, t = survey_segments(f, int(q.get("track", -1)))
             t0, t1, fcen, utc = base + t["iq_t"][0] - pad, base + t["iq_t"][1] + pad, t["f"], None
         else:
             meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
@@ -532,6 +573,7 @@ def make_app(args):
     app.router.add_get("/api/survey/clip", survey_clip)
     app.router.add_get("/api/detection", get_detection)
     app.router.add_get("/api/iq", get_iq)
+    app.router.add_get("/api/render", render)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)

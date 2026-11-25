@@ -37,7 +37,7 @@ from ..maps import power_frames
 from . import stage1, stage2
 from .config import CHECKS
 from .sources import _to_complex, make_source
-from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, fade, render_clip
+from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, VoiceBand, channel_hz, detector_for, fade, render_clip
 from .profile import BandProfile
 from .vad_batch import vad_probs_batch
 from .transcribe import Transcriber
@@ -110,6 +110,35 @@ def iq_cut_wav(segs, t0, t1, f_center, rate=48000):
     return buf.getvalue(), start
 
 
+def render_segments(segs, t0, t1, pts, au, mode=0):
+    """Playback audio (int16, 16 kHz) of [t0, t1] from IQ-ring segments, demodulated and processed
+    exactly like live playback with audio settings `au`. pts: [[time, absolute frequency], ...]."""
+    if not segs:
+        return None
+    parts, start, fs, fc = [], None, segs[0][0]["fs"], segs[0][0]["fc"]
+    for sj, p in segs:
+        raw = np.memmap(p, dtype=np.int8, mode="r")
+        a = max(0, int((t0 - sj["t0"]) * fs))
+        b = min(len(raw) // 2, int((t1 - sj["t0"]) * fs))
+        if b > a:
+            start = sj["t0"] + a / fs if start is None else start
+            parts.append(np.asarray(raw[2 * a:2 * b]))
+    if not parts:
+        return None
+    x = _to_complex(np.concatenate(parts), True)
+    pts = np.array(pts, float)
+    ts = start + np.arange(len(x)) / fs
+    f_off = pts[np.clip(np.searchsorted(pts[:, 0], ts, side="right") - 1, 0, len(pts) - 1), 1] - fc
+    iq, env = demod(x, fs, f_off, channel_hz(au), mode)
+    det = detector_for(au, mode)
+    if det is not None:
+        env = det.process(iq)
+    hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
+    audio = sosfilt(hp, env - env[:200].mean())
+    audio = np.clip(render_clip(audio, au), -1, 1)
+    return (audio * 32767).astype(np.int16)
+
+
 def demod(x, fs, f_offset, bw_hz, mode=0):
     """Mix x (complex, at fs) down by f_offset (scalar or per-sample Hz), decimate to 16 kHz.
     mode 0: AM (envelope). +1/-1: upper/lower single sideband (product detector: keep one side,
@@ -153,6 +182,8 @@ class Track:
         self.hp_zi = None
         self.out = []                    # processed playback audio [(t_start, float32)]: denoise + gain + fades
         self.den, self.gain = None, SmoothGain()
+        self.band = None                 # hard voice band-pass (playback)
+        self.det, self.det_kind = None, None   # synchronous detector (state across chunks)
         self.audio_t0 = None             # stream time where this track's audio (incl. pre-roll) starts
         self.vad_p, self.vad_t = np.zeros(0, np.float32), -1e18   # incremental ML voice scores
         self.agc = None
@@ -815,10 +846,17 @@ class Engine:
             return
         t_samp = (s0r + np.arange(len(x))) / self.fs
         f = tr.freq_at(t_samp)
-        iq, env = demod(x, self.fs, f, cfg["audio"]["bandwidth_hz"], tr.mode())
+        au = cfg["audio"]
+        mode = tr.mode()
+        iq, env = demod(x, self.fs, f, channel_hz(au), mode)
         cut = int(round((s0 - s0r) / self.fs * AUDIO_FS))
         n = int(round((s1 - s0) / self.fs * AUDIO_FS))
         iq, env = iq[cut:cut + n], env[cut:cut + n]
+        kind = (au.get("demod", "auto"), mode)
+        if tr.det_kind != kind:                              # (re)create the detector: setting or AM/SSB changed
+            tr.det_kind, tr.det = kind, detector_for(au, mode)
+        if tr.det is not None:
+            env = tr.det.process(iq)                         # synchronous AM / sideband
         if tr.hp_zi is None:
             self._hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
             tr.hp_zi = sosfilt_zi(self._hp) * float(env[0] if len(env) else 0)
@@ -827,15 +865,17 @@ class Engine:
         tr.audio.append((t_from, audio))                     # raw: what the checks judge
         tr.iq.append((t_from, iq.astype(np.complex64)))
         tr.audio_until = t_to
-        # playback chain: noise reduction -> gliding level -> fades at the very start / end
-        au = cfg["audio"]
+        # playback chain: voice band -> noise reduction -> gliding level -> fades at the very start / end
         first = tr.audio_t0 is None
         if first:
             tr.audio_t0 = t_from
             tr.seg_start = t_from
             if au.get("denoise", True):
                 tr.den = StreamingDenoiser(au.get("denoise_strength", 1.0), au.get("denoise_floor_db", -18.0))
-        y = tr.den.process(audio) if tr.den else audio
+            if au.get("voice_band", True):
+                tr.band = VoiceBand(au.get("voice_lo_hz", 300), au.get("voice_hi_hz", 3000))
+        y = tr.band.process(audio) if tr.band else audio
+        y = tr.den.process(y) if tr.den else y
         y = tr.gain.process(y)
         y = fade(y, AUDIO_FS, au.get("fade_s", 0.15) if first else 0.0, au.get("fade_s", 0.15) if ending else 0.0)
         lag = 512 / _AFS if tr.den else 0.0                 # the denoiser delays its output by 32 ms
@@ -882,7 +922,7 @@ class Engine:
             "freq_hz": {"mean": f_mean, "min": self.fc + min(fr), "max": self.fc + max(fr)},
             "path": [[round(t - seg_t0, 3), self.fc + f] for t, f in tr.path if t >= seg_t0 - 0.5],
             "confidence": {"final": tr.conf, "max": conf_max, "history": tr.conf_hist[-600:]},
-            "scores": tr.scores, "info": tr.info, "fc": self.fc, "fs": self.fs,
+            "scores": tr.scores, "info": tr.info, "fc": self.fc, "fs": self.fs, "mode": tr.mode(),
             "sdr": cfg["sdr"], "checks": cfg["checks"], "detect": cfg["detect"],
         }
         if cfg["sdr"]["source"] == "file":
@@ -997,44 +1037,10 @@ class Engine:
 
     def _clip_from_iq(self, meta, cfg):
         """Re-demodulate a detection from the continuous IQ ring (if those segments still exist)."""
-        d = self.root / cfg["iq_ring"]["dir"]
-        if not d.exists():
-            return None
         t0, t1 = meta["stream_t0"] - 0.05, meta["stream_t1"] + cfg["audio"].get("postroll_s", 0.5)
-        segs = []
-        for j in sorted(d.glob("*.json")):
-            try:
-                sj = json.loads(j.read_text())
-            except Exception:
-                continue
-            p = j.with_suffix(".cs8")
-            if abs(sj.get("epoch", 0) - meta["epoch"]) > 1e-3 or not p.exists():
-                continue
-            dur = p.stat().st_size / 2 / sj["fs"]
-            if sj["t0"] < t1 and sj["t0"] + dur > t0:
-                segs.append((sj, p))
-        if not segs:
-            return None
-        fs, fc = segs[0][0]["fs"], segs[0][0]["fc"]
-        parts, start = [], None
-        for sj, p in segs:
-            raw = np.memmap(p, dtype=np.int8, mode="r")
-            a = max(0, int((t0 - sj["t0"]) * fs))
-            b = min(len(raw) // 2, int((t1 - sj["t0"]) * fs))
-            if b > a:
-                start = sj["t0"] + a / fs if start is None else start
-                parts.append(np.asarray(raw[2 * a:2 * b]))
-        if not parts:
-            return None
-        x = _to_complex(np.concatenate(parts), True)
-        pts = np.array([[meta["stream_t0"] + r, f - fc] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"] - fc]])
-        ts = start + np.arange(len(x)) / fs
-        f_off = pts[np.clip(np.searchsorted(pts[:, 0], ts, side="right") - 1, 0, len(pts) - 1), 1]
-        _, env = demod(x, fs, f_off, cfg["audio"]["bandwidth_hz"])
-        hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
-        audio = sosfilt(hp, env - env[:200].mean())
-        audio = np.clip(render_clip(audio, cfg["audio"]), -1, 1)
-        return (audio * 32767).astype(np.int16)
+        segs = self.ring_segments(meta["epoch"], t0, t1)
+        pts = [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]]
+        return render_segments(segs, t0, t1, pts, cfg["audio"], meta.get("mode", 0))
 
     def detail(self, key):
         """Full metadata of one detection (in memory or saved), for the detail dialog."""
