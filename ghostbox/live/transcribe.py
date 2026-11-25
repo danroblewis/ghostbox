@@ -113,6 +113,7 @@ class Transcriber:
         self.model = self.pipe = None
         self.model_name, self._model_key = None, None
         self.error = ""
+        self._missing = None                # model whose recogniser package isn't installed
         self.busy = 0
         self.stats = {"done": 0, "dropped": 0, "stale": 0, "rate": 0.0}
         self._recent = []                   # (time, clips) for a throughput estimate
@@ -182,6 +183,8 @@ class Transcriber:
             batch = self._take_batch(int(cfg.get("batch_size", 16)))
             if not cfg["enabled"]:
                 continue
+            if self._missing == cfg["model"]:
+                continue                                   # no recogniser installed: drop the batch
             fresh = [it for it in batch if time.time() - it["t_submit"] <= cfg.get("max_age_s", 120)]
             self.stats["stale"] += len(batch) - len(fresh)
             if not fresh:
@@ -197,6 +200,16 @@ class Transcriber:
                 span = max(1.0, now - self._recent[0][0]) if len(self._recent) > 1 else 60.0
                 self.stats["rate"] = round(sum(n for _, n in self._recent) / span, 2)
                 self.error = ""
+            except ImportError as e:
+                # the speech-recognition extra isn't installed: say so once, then skip quietly
+                # (until the model setting changes) instead of failing on every detection
+                key = cfg["model"]
+                if self._missing != key:
+                    self._missing = key
+                    print(f"ghostbox: speech recognition unavailable ({e.name or e}); install the 'recommended' "
+                          "extra to transcribe, e.g.  uv tool install 'ghostbox[recommended] @ git+https://github.com/danroblewis/spiritbox-sdr.git'", flush=True)
+                self.error = (f"Speech recognition isn't installed ({e.name or e} is missing). Install the "
+                              "'recommended' extra to transcribe detections (see the README).")
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
                 traceback.print_exc()
