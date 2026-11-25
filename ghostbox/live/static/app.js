@@ -1272,7 +1272,8 @@ async function buildSDR() {
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn primary", onclick: () => apply({ sdr: { source: "file", file: { path: fileSel.value }, fmin_hz: null, fmax_hz: null } }) }, "Replay this file")),
     el("div", { class: "note" }, "IQ-ring segments are the continuous raw recording (newest first). Frequency and rate come from the file name."),
     el("h2", {}, "Receiver"),
-    rowW("Device", srcSel),
+    rowW("Receiver type", srcSel),
+    deviceRows(sdr),
     rowW("RTL-SDR ppm correction", ppm),
     rowW("Bin width", bin),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { ppm: +ppm.value }, analysis: { bin_hz: +bin.value } }) }, "Apply")),
@@ -1382,7 +1383,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello": {
-        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models;
+        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
         if (m.reset && m.reset.fmax) { S.fmin = m.reset.fmin; S.fmax = m.reset.fmax; }
@@ -1691,3 +1692,72 @@ async function abLoad(base, clip) {
     if (note) note.textContent = "";
   } catch (e) { if (note && gen === DT.abGen) note.textContent = String(e.message || e).slice(0, 80); }
 }
+
+// Receiver: which device (when several are connected) and a quick "is it working?" test.
+function deviceRows(sdr) {
+  const sel = el("select", { class: "sel" }, el("option", { value: "" }, "First one found"));
+  const out = el("div", { class: "note", style: "margin:4px 0 0" });
+  const load = async () => {
+    sel.disabled = true;
+    try {
+      const devs = (await (await fetch("/api/devices")).json()).filter(d => d.kind === sdr.source);
+      sel.replaceChildren(el("option", { value: "" }, devs.length ? "First one found" : "None detected"), ...devs.map(d => el("option", { value: d.id }, d.label)));
+      if (sdr.device && !devs.some(d => d.id === sdr.device)) sel.append(el("option", { value: sdr.device }, `${sdr.device} (not detected now)`));
+      sel.value = sdr.device || "";
+    } catch (e) {}
+    sel.disabled = false;
+  };
+  sel.addEventListener("change", () => patch({ sdr: { device: sel.value } }, 50));   // a receiver change restarts it
+  const test = el("button", { class: "btn", onclick: async () => {
+    test.disabled = true; out.className = "note"; out.textContent = "Testing…";
+    try {
+      const r = await (await fetch("/api/sdr/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source: sdr.source, device: sel.value }) })).json();
+      out.className = r.ok ? "note" : "err";
+      out.textContent = r.ok ? `${r.message || "Working"}: level ${r.level_dbfs} dBFS, clipping ${r.clipping_pct}% — ${r.verdict}.` : r.message;
+      if (r.ok) out.style.color = "var(--ok)";
+    } catch (e) { out.className = "err"; out.textContent = "Test failed."; }
+    test.disabled = false;
+  } }, "Test");
+  if (sdr.source !== "file") load();
+  return sdr.source === "file" ? el("span") : el("div", {},
+    el("div", { class: "row wide" }, el("label", {}, "Device"), sel),
+    el("div", { style: "display:flex;gap:6px;justify-content:flex-end;margin:4px 0 0" },
+      el("button", { class: "btn", title: "Look for connected devices again", onclick: load }, "Refresh"), test), out);
+}
+
+// ---------------- help ----------------
+function openHelp() {
+  const c = S.cfg || {}, root = (S.root || "the ghostbox folder").replace(/\/$/, "");
+  const p = (...k) => el("p", {}, ...k), b = t => el("strong", {}, t), code = t => el("code", {}, t);
+  const step = (n, title, ...body) => el("div", { class: "helpstep" }, el("div", { class: "helpn" }, String(n)), el("div", {}, el("h3", {}, title), ...body));
+  const close = () => { wrap.remove(); document.removeEventListener("keydown", key, true); };
+  const key = e => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
+  const box = el("div", { class: "dlg help" },
+    el("div", { class: "dlghead" }, el("strong", {}, "Getting started"), el("span", { style: "flex:1" }), el("button", { class: "btn", onclick: close }, "Close")),
+    p("This listens to a whole slice of the radio spectrum at once and picks out anything that sounds like a human voice. The quickest way to use it:"),
+    step(1, "Connect your receiver",
+      p("Plug in your HackRF or RTL-SDR, then open ", b("Settings › Receiver"), ". Choose the ", b("Receiver type"), ". If you have more than one device, pick it under ", b("Device"), ". Click ", b("Test"),
+        ": it should say it's receiving at a good level. If it says ", b("clipping"), ", lower the Gain at the top; if it says ", b("very quiet"), ", raise it or check the antenna.")),
+    step(2, "Choose how much to listen to",
+      p("The ", b("span"), " selector at the top sets how wide a slice you hear at once (a HackRF goes up to 20 MHz, an RTL-SDR to about 2.4 MHz). Wider covers more but needs more computer; 4 MHz is a good start. Watch ", b("CPU"),
+        " at the top right: it should stay below about 70%. If it says the computer can't keep up, pick a narrower span.")),
+    step(3, "Let it calibrate itself",
+      p("Open the ", b("Detector"), " tab and make sure ", b("Recalibrate automatically"), " is on. After a couple of minutes on a band it studies what it heard, works out which of its checks pick out voices best there, and sets its thresholds. It does this again whenever you retune, and whenever it hasn't caught anything for a while.")),
+    step(4, "Listen to what it finds",
+      p("The ", b("Detections"), " tab lists everything that sounded voice-like, newest first, with a confidence. Audio plays a few seconds behind live as each detection happens; click anywhere once to switch sound on. ",
+        b("Pause"), " (or the space bar) stops live playback, and the slider next to it is the volume. The bottom of the screen shows each voice's waveform and the sound's spectrum."),
+      p("Click a detection for everything about it: the full transcript, playback with a spectrogram, different ways to demodulate it, and downloads. If one sounds like the real thing, ", b("Tune to this detection"), " finds the clearest settings for it.")),
+    step(5, "Survey a wide range",
+      p("To find where the activity is, click ", b("Map"), ", then ", b("New"), ". Enter a range (for example 0.5–30 MHz), choose ", b("1 min"), " per step, and start it. It steps across the range, calibrates on each step, and transcribes what it finds; the map fills in as it goes. With a 4 MHz span, 0.5–30 MHz is 10 steps, about 12 minutes; give it longer if your computer is slow. Zoom with the scroll wheel, click a box or a sample for details, and use ", b("Tune here"), " to listen live.")),
+    step(6, "Keep what you found",
+      p("Everything is under ", code(root), ":"),
+      el("ul", {},
+        el("li", {}, code("recordings/"), " — saved detections: audio (WAV) and details (JSON). Detections at least ", b(`${Math.round(((c.record || {}).min_save_conf ?? 0.7) * 100)}%`), " confident are saved automatically; for others, click the save icon in the list before closing the app (the rest live in memory only)."),
+        el("li", {}, code("live_data/surveys/"), " — your surveys, with their clips."),
+        el("li", {}, code(((c.iq_ring || {}).dir || "iq_ring") + "/"), " — the raw radio recording. It's a rolling buffer: the oldest is deleted to make room, so download the ", b("IQ WAV"), " of anything important from its detail window."),
+        el("li", {}, code("live_data/presets/"), " — settings you saved.")),
+      p("To keep an investigation, copy those folders somewhere safe once you're done.")));
+  const wrap = el("div", { id: "helpWrap", class: "modalwrap", onclick: e => { if (e.target === wrap) close(); } }, box);
+  document.body.append(wrap); document.addEventListener("keydown", key, true);
+}
+$("#helpBtn").addEventListener("click", openHelp);

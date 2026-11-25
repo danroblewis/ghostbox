@@ -156,6 +156,15 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .svrow .t2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
 .svrow .btn{height:22px}
 #newSurvey{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:14vh 16px}
+#helpWrap{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:5vh 16px;overflow:auto}
+.help{width:min(720px,100%);line-height:1.5}
+.help p{margin:6px 0}
+.help ul{margin:6px 0;padding-left:18px}
+.help li{margin:4px 0}
+.help code{font:12px var(--mono);background:var(--field);padding:1px 4px;border-radius:var(--radius);overflow-wrap:anywhere}
+.helpstep{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;margin-top:14px}
+.helpstep h3{font-size:13.5px;margin:2px 0 2px}
+.helpn{width:22px;height:22px;border-radius:50%;border:1px solid var(--line-strong);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-2)}
 #detail{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px;overflow:auto}
 .dlg{width:min(900px,100%);background:var(--panel);border:1px solid var(--line-strong);border-radius:var(--radius);padding:14px 16px 16px;box-shadow:0 12px 40px rgba(0,0,0,.45)}
 .dlghead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-height:28px}
@@ -223,6 +232,7 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
   <div class="grp">
     <button id="pp" class="btn icon" title="Pause playback (Space)"><svg viewBox="0 0 8 8"><path d="M1.2 1h2v6h-2zM4.8 1h2v6h-2z"/></svg></button>
     <input id="vol" type="range" min="0" max="1.5" step="0.05" value="0.9" style="width:72px" title="Volume">
+    <button id="helpBtn" class="btn icon" title="How to use this">?</button>
   </div>
 </header>
 <main>

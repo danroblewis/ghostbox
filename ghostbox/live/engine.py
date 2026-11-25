@@ -476,6 +476,8 @@ class Engine:
         self.raw[: n - first] = x[first:]
         t_start = self.n_samples / self.fs
         self.n_samples += n
+        self.in_seen = time.time()                            # for the device test: samples are arriving
+        self.in_last = x[-min(n, 65536):]
         self._write_iq(x, t_start, cfg)
         if not self.oneshot and time.time() - self._last_prune > 5:
             self._last_prune = time.time()

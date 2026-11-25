@@ -148,6 +148,7 @@ def make_app(args):
         await sock.send_str(json.dumps({
             "type": "hello", "config": config.get(), "checks": CHECKS, "views": VIEWS,
             "asr_models": [[k, v[2]] for k, v in ASR_MODELS.items()],
+            "root": str(ROOT.resolve()),
             "presets": {k: v["label"] for k, v in PRESETS.items()},
             "sensitivity": SENSITIVITY, "epoch": eng.t_origin,
             "status": eng.status, "detections": eng.snapshot(),
@@ -262,6 +263,31 @@ def make_app(args):
             raise web.HTTPNotFound(text="view not recorded in this survey")
         return web.Response(body=np.ascontiguousarray(img, np.uint8).tobytes(), content_type="application/octet-stream",
                             headers={"X-Rows": str(img.shape[0]), "X-Cols": str(img.shape[1])})
+
+    async def get_devices(request):
+        from .sources import list_devices
+        return web.json_response(await asyncio.get_running_loop().run_in_executor(None, list_devices))
+
+    async def sdr_test(request):
+        """Is the receiver delivering samples, and at what level? The running device is checked
+        without opening it again (it's busy); any other device is opened for half a second."""
+        from .sources import level_report, test_device
+        b = await request.json()
+        c = config.get()
+        sdr = {**c["sdr"], **{k: v for k, v in b.items() if k in ("source", "device")}}
+        eng = state["engine"]
+        live = sdr["source"] == c["sdr"]["source"] and str(sdr.get("device") or "") == str(c["sdr"].get("device") or "")
+        if live and c["sdr"]["source"] != "file":
+            age = time.time() - getattr(eng, "in_seen", 0)
+            if age > 3:
+                err = (eng.status or {}).get("error") if isinstance(getattr(eng, "status", None), dict) else None
+                return web.json_response({"ok": False, "live": True, "message": "The receiver isn't delivering samples"
+                                          + (f": {err}" if err else " (is it plugged in?)")})
+            rep = level_report(np.asarray(eng.in_last))
+            return web.json_response({"ok": True, "live": True, **rep,
+                                      "message": f"Receiving {sdr['sample_rate'] / 1e6:g} MS/s now"})
+        res = await asyncio.get_running_loop().run_in_executor(None, test_device, sdr)
+        return web.json_response(res)
 
     async def get_detection(request):
         meta = await asyncio.get_running_loop().run_in_executor(None, state["engine"].detail, request.query.get("key", ""))
@@ -624,6 +650,8 @@ def make_app(args):
     app.router.add_get("/api/survey/preview", survey_preview)
     app.router.add_get("/api/survey/clip", survey_clip)
     app.router.add_get("/api/detection", get_detection)
+    app.router.add_get("/api/devices", get_devices)
+    app.router.add_post("/api/sdr/test", sdr_test)
     app.router.add_get("/api/iq", get_iq)
     app.router.add_get("/api/render", render)
     app.router.add_post("/api/tune_audio", tune_audio)

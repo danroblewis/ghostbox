@@ -161,11 +161,84 @@ def make_source(sdr):
         lna, vga = hackrf_gains(sdr.get("gain_db", 36))
         cmd = ["hackrf_transfer", "-r", "-", "-f", str(int(fc)), "-s", str(int(fs)),
                "-a", "1" if sdr.get("amp") else "0", "-l", str(lna), "-g", str(vga)]
+        if sdr.get("device"):
+            cmd += ["-d", str(sdr["device"])]
         return ProcSource(cmd, fs, fc, signed=True)
     if kind == "rtlsdr":
         cmd = ["rtl_sdr", "-f", str(int(fc)), "-s", str(int(fs)), "-g", str(sdr.get("gain_db", 0)),
-               "-p", str(int(sdr.get("ppm", 0))), "-"]
+               "-p", str(int(sdr.get("ppm", 0)))]
+        if sdr.get("device") not in (None, ""):
+            cmd += ["-d", str(sdr["device"])]
+        cmd += ["-"]
         return ProcSource(cmd, fs, fc, signed=False)
     if kind == "file":
         return FileSource(sdr["file"]["path"], fs, fc)
     raise ValueError(f"unknown source {kind}")
+
+
+def list_devices():
+    """Connected receivers: [{kind, id (serial or index for -d), label}]. A device in use by the live
+    receiver is still listed (HackRF) or may not be (some RTL-SDR builds can't enumerate it)."""
+    import re
+    out = []
+    try:
+        r = subprocess.run(["hackrf_info"], capture_output=True, text=True, timeout=8)
+        txt = r.stdout + r.stderr
+        for m in re.finditer(r"Index:\s*(\d+)\s*\n\s*Serial number:\s*([0-9a-fA-F]+)", txt):
+            serial = m.group(2).lstrip("0") or "0"
+            out.append({"kind": "hackrf", "id": m.group(2), "label": f"HackRF #{m.group(1)} (serial …{serial[-8:]})"})
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["rtl_test", "-t"], capture_output=True, text=True, timeout=6)
+        txt = r.stdout + r.stderr
+        for m in re.finditer(r"^\s*(\d+):\s*(.+?),\s*(.+?),\s*SN:\s*(\S+)", txt, re.M):
+            out.append({"kind": "rtlsdr", "id": m.group(1), "label": f"#{m.group(1)} {m.group(2)} {m.group(3)} (SN {m.group(4)})"})
+    except Exception:
+        pass
+    return out
+
+
+def test_device(sdr, seconds=0.5):
+    """Open a receiver briefly and read `seconds` of samples. Returns a plain-language result."""
+    fs = float(sdr["sample_rate"])
+    n = int(fs * seconds)
+    if sdr["source"] == "hackrf":
+        from .config import hackrf_gains
+        lna, vga = hackrf_gains(sdr.get("gain_db", 36))
+        cmd = ["hackrf_transfer", "-r", "-", "-n", str(n), "-f", str(int(sdr["center_hz"])), "-s", str(int(fs)),
+               "-a", "1" if sdr.get("amp") else "0", "-l", str(lna), "-g", str(vga)]
+        signed = True
+    elif sdr["source"] == "rtlsdr":
+        cmd = ["rtl_sdr", "-n", str(n), "-f", str(int(sdr["center_hz"])), "-s", str(int(fs)), "-g", str(sdr.get("gain_db", 0))]
+        signed = False
+    else:
+        return {"ok": False, "message": "A replay file isn't a device."}
+    if sdr.get("device") not in (None, ""):
+        cmd += ["-d", str(sdr["device"])]
+    cmd += ["-"]
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=10)
+    except FileNotFoundError:
+        return {"ok": False, "message": f"{cmd[0]} isn't installed."}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "message": "The device didn't deliver samples within 10 s."}
+    raw = np.frombuffer(r.stdout, np.uint8 if not signed else np.int8)
+    if len(raw) < 1000:
+        err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+        why = next((l for l in err if "fail" in l.lower() or "error" in l.lower() or "no " in l.lower()), err[-1] if err else "no samples")
+        return {"ok": False, "message": f"No samples: {why}"}
+    return {"ok": True, **level_report(_to_complex(raw, signed), time.time() - t0)}
+
+
+def level_report(x, took=None):
+    """Signal level (dBFS) and clipping of complex samples in [-1, 1]."""
+    x = x[:: max(1, len(x) // 200000)]
+    rms = float(np.sqrt(np.mean(np.abs(x) ** 2)) + 1e-12)
+    clip = float(np.mean((np.abs(x.real) > 0.98) | (np.abs(x.imag) > 0.98)))
+    db = 20 * np.log10(rms)
+    verdict = ("clipping: lower the gain" if clip > 0.002 else "very quiet: raise the gain or check the antenna" if db < -45
+               else "good level")
+    return {"level_dbfs": round(db, 1), "clipping_pct": round(100 * clip, 2), "verdict": verdict,
+            **({"took_s": round(took, 2)} if took is not None else {})}

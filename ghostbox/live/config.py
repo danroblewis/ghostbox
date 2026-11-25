@@ -110,6 +110,7 @@ for _c in CHECKS:
 DEFAULT = {
     "sdr": {
         "source": "hackrf",                 # hackrf | rtlsdr | file
+        "device": "",                       # which one if several are connected: HackRF serial / RTL-SDR index or serial ("" = first)
         "center_hz": 2.2e6,
         "sample_rate": 4e6,
         "fmin_hz": 520e3,                   # analysis/display crop (absolute Hz); null = whole capture
