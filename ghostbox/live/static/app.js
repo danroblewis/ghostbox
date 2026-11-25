@@ -822,6 +822,11 @@ function buildDetector() {
       slider("Clips per batch", ["whisper", "batch_size"], 1, 32, 1),
       slider("CPU threads", ["whisper", "cpu_threads"], 2, 16, 1),
       slider("Skip clips waiting longer than", ["whisper", "max_age_s"], 10, 600, 10, v => v + " s"),
+      el("div", { class: "row wide", style: "align-items:start" }, el("label", { title: "Removed from transcripts wherever they appear, ignoring case and punctuation. One per line." }, "Filtered phrases"),
+        (() => { const ta = el("textarea", { class: "field", rows: 6, style: "resize:vertical;min-height:90px;font:inherit;line-height:1.35" });
+          ta.value = (w.filter_phrases || []).join("\n");
+          ta.addEventListener("change", () => patch({ whisper: { filter_phrases: ta.value.split("\n").map(x => x.trim()).filter(Boolean) } }, 50));
+          return ta; })()),
       el("div", { class: "note" }, `Most confident clips are transcribed first. Done ${ws.done ?? 0}, skipped as stale ${ws.stale ?? 0}, dropped (queue full) ${ws.dropped ?? 0}.`),
       ws.error ? el("div", { class: "err" }, ws.error) : null));
   for (const stage of [1, 2]) {

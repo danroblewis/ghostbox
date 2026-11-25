@@ -36,8 +36,24 @@ STOCK = {"you", "thank you", "thanks", "thank you very much", "thanks for watchi
          "subtitles by the amara.org community", "thanks for watching and see you next time", "see you next time"}
 
 
-def strip_stock(text):
-    """Remove stock sentences ("The end.", "Thank you.") wherever they appear; keep the rest."""
+def _phrase_re(phrase):
+    """A user phrase as a pattern that ignores case, punctuation, apostrophes and spaces between
+    its letters ("who's" = "whos", "Dragon Ball" = "dragonball"), matching whole words only."""
+    chars = [c for c in phrase.lower() if c.isalnum()]
+    if not chars:
+        return None
+    return re.compile(r"(?<![A-Za-z0-9])" + r"[\W_]*".join(re.escape(c) for c in chars) + r"(?![A-Za-z0-9])",
+                      re.IGNORECASE)
+
+
+def strip_stock(text, phrases=()):
+    """Remove the user's phrases wherever they occur, then stock sentences ("The end.", "Thank
+    you.") that make up a whole sentence; keep the rest."""
+    for ph in phrases:
+        rx = _phrase_re(ph)
+        if rx is not None:
+            text = rx.sub(" ", text)
+    text = re.sub(r"\s+([,.!?…])", r"\1", re.sub(r"\s{2,}", " ", text)).strip(" ,;:-")
     parts = re.split(r"(?<=[.!?…])\s+", text.strip())
     keep = [p for p in parts if p and not is_stock_phrase(p)]
     return " ".join(keep).strip()
@@ -159,7 +175,7 @@ class Transcriber:
         lang = None if cfg["language"] in ("", "auto") else cfg["language"]
         out = []
         for it, (raw, doubt) in zip(items, eng.transcribe([it["audio"] for it in items], lang)):
-            text = strip_stock(raw)                        # training-data filler ("The end.") is dropped
+            text = strip_stock(raw, cfg.get("filter_phrases", ()))   # training-data filler is dropped
             out.append({"text": text, "no_speech_prob": 1.0 if not text else float(doubt),
                         **({"filtered": raw} if raw != text else {}),
                         "language": eng.language, "model": cfg["model"]})

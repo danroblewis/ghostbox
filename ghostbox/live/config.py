@@ -162,6 +162,9 @@ DEFAULT = {
         "cpu_threads": 8,
         "max_queue": 64,                    # beyond this the least confident clip is dropped
         "max_age_s": 120,                   # clips waiting longer than this are skipped
+        "filter_phrases": [                 # removed wherever they appear (on top of the built-in list)
+            "Thank you very much for your continued support.", "dragonball", "Piaw", "Click on the top",
+            "discontinue eligibility", "I'm gonna be the one who's gonna be the one"],
     },
     "checks": {c["id"]: dict(c["default"]) for c in CHECKS},
 }

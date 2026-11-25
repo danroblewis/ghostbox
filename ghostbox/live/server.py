@@ -295,13 +295,20 @@ def make_app(args):
             m["confidence"] = {k: v for k, v in m["confidence"].items() if k != "history"}
             metas.append(m)
         metas.sort(key=lambda m: m.get("utc_start", ""), reverse=True)
-        for m in metas:                                    # older saves: drop Whisper's stock phrases too
-            for f in ("transcript", "chain_transcript"):
+        phrases = config.get()["whisper"].get("filter_phrases", [])
+        for m in metas:                                    # re-filter from the original text, so edits to
+            for f in ("transcript", "chain_transcript"):   # the phrase list apply to saved ones too
                 t = m.get(f)
-                if t and t.get("text") and "filtered" not in t:
-                    clean = strip_stock(t["text"])
-                    if clean != t["text"]:
-                        m[f] = {**t, "text": clean, "filtered": t["text"], **({"no_speech_prob": 1.0} if not clean else {})}
+                src = t and (t.get("filtered") or t.get("text"))
+                if src:
+                    clean = strip_stock(src, phrases)
+                    if clean != t.get("text") or (clean == src and "filtered" in t):
+                        m[f] = {k: v for k, v in t.items() if k != "filtered"}
+                        m[f]["text"] = clean
+                        if clean != src:
+                            m[f]["filtered"] = src
+                        if not clean:
+                            m[f]["no_speech_prob"] = 1.0
         q = q.strip().lower()
         out, matched = [], 0
         for m in metas:
