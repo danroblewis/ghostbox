@@ -756,8 +756,8 @@ class Engine:
             if len(ch["members"]) < 2 or not (w["enabled"] and w["chains"]) or not self.transcriber:
                 continue
             parts = []
-            for _, audio, _, _ in sorted(ch["members"], key=lambda m: m[0]):
-                parts += [audio, np.zeros(int(0.12 * AUDIO_FS), np.float32)]
+            for m in sorted(ch["members"], key=lambda m: m[0]):    # (t0, audio, track id, meta path, key)
+                parts += [m[1], np.zeros(int(0.12 * AUDIO_FS), np.float32)]
             self.transcriber.submit({"kind": "chain", "id": cid, "chain": cid, "audio": np.concatenate(parts),
                                      "members": [m[2] for m in ch["members"]],
                                      "keys": [m[4] for m in ch["members"]],
