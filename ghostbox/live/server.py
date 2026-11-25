@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
+import numpy as np
 
 from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
@@ -248,8 +249,19 @@ def make_app(args):
                 raise web.HTTPNotFound()
             res = await asyncio.get_running_loop().run_in_executor(None, sv.load, f)
         else:
-            res = await asyncio.get_running_loop().run_in_executor(None, sv.public)
+            res = await asyncio.get_running_loop().run_in_executor(None, sv.meta)
         return web.json_response({"state": sv.state, "result": res}, dumps=lambda o: json.dumps(o, default=float))
+
+    async def survey_image(request):
+        """One view of a survey as raw uint8 [rows, columns] (meta says the shape)."""
+        f, view = request.query.get("file") or None, request.query.get("view", "power")
+        if (f and not SAFE.match(f)) or not SAFE.match(view):
+            raise web.HTTPNotFound()
+        img = await asyncio.get_running_loop().run_in_executor(None, state["survey"].image, view, f)
+        if img is None:
+            raise web.HTTPNotFound(text="view not recorded in this survey")
+        return web.Response(body=np.ascontiguousarray(img, np.uint8).tobytes(), content_type="application/octet-stream",
+                            headers={"X-Rows": str(img.shape[0]), "X-Cols": str(img.shape[1])})
 
     async def start_survey(request):
         b = await request.json()
@@ -460,6 +472,7 @@ def make_app(args):
     app.router.add_get("/api/survey", get_survey)
     app.router.add_post("/api/survey", start_survey)
     app.router.add_post("/api/survey/stop", stop_survey)
+    app.router.add_get("/api/survey/image", survey_image)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)

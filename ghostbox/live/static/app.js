@@ -26,6 +26,7 @@ const hms = d => `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeco
 const clockTime = t => S.epoch ? hms(new Date((S.epoch + t) * 1000)) : "";
 
 // ---------------- state ----------------
+var SV = { state: { state: "idle" }, meta: null, file: null, imgs: {}, saved: [], open: false };
 const S = {
   cfg: null, checks: [], presets: {}, sens: {}, views: [], status: {},
   epoch: 0, fmin: 0, fmax: 1, fr: 25, hop: 1, lag: 2.75,
@@ -58,7 +59,7 @@ function setTheme(name) {
   if (name === "nightvision" && S.cmap !== "red") { lsSet("gb_cmap_day", S.cmap); setCmap("red"); }
   else if (name !== "nightvision" && S.cmap === "red") setCmap(lsGet("gb_cmap_day", "magma"));
 }
-function setCmap(name) { S.cmap = name; lsSet("gb_cmap", name); $("#cmap").value = name; repaintAll(); }
+function setCmap(name) { S.cmap = name; lsSet("gb_cmap", name); $("#cmap").value = name; repaintAll(); if (SV.open) drawSurvey(); }
 
 // ---------------- colour maps ----------------
 const CMAPS = {
@@ -885,7 +886,6 @@ function tuneCard() {
 }
 
 // ---------------- band survey ----------------
-const SV = { state: { state: "idle" }, result: null, layer: "det", saved: [] };
 function surveyControls() {
   const sdr = S.cfg.sdr, fs = sdr.sample_rate, step = fs * 0.8;
   const defLo = +lsGet("gb_sv_lo", sdr.source === "rtlsdr" ? 24 : 0.5), defHi = +lsGet("gb_sv_hi", 30);
@@ -917,7 +917,7 @@ function surveyControls() {
     el("div", { class: "row wide" }, el("label", {}, "Time per step"), dwell),
     est,
     el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn,
-      SV.result || running ? el("button", { class: "btn", onclick: () => openSurvey() }, "Show map") : null, savedSel),
+      SV.meta || running || SV.saved.length ? el("button", { class: "btn", onclick: () => openSurvey(SV.meta || running ? undefined : SV.saved[0]) }, "Show map") : null, savedSel),
     msg);
 }
 async function loadSurveyList() {
@@ -925,115 +925,167 @@ async function loadSurveyList() {
 }
 async function openSurvey(file) {
   const r = await (await fetch("/api/survey" + (file ? "?file=" + encodeURIComponent(file) : ""))).json();
-  if (r.result) SV.result = r.result;
-  SV.open = true; drawSurvey();
+  if (!r.result) return;
+  const same = SV.meta && SV.file === (file || null) && SV.meta.started === r.result.started;
+  SV.meta = r.result; SV.file = file || null; SV.open = true;
+  if (!same) { SV.imgs = {}; SV.v0 = r.result.lo; SV.v1 = r.result.hi; SV.sel = null; SV.hl = null; }
+  else if (!SV.file) SV.imgs = {};                         // a running survey grew: refetch images
+  drawSurvey();
 }
 function onSurvey(m) {
   const was = SV.state.state; SV.state = m;
-  if (m.steps_done || (m.state !== "running" && was === "running")) {
-    fetch("/api/survey").then(r => r.json()).then(r => { if (r.result) SV.result = r.result; if (SV.open) drawSurvey(); });
-    if (m.state !== "running") loadSurveyList().then(() => { if ($("#detector").classList.contains("active")) buildDetector(); });
-  }
+  if (SV.open && !SV.file && (m.steps_done || (m.state !== "running" && was === "running"))) openSurvey();
+  if (m.state !== "running" && was === "running") loadSurveyList().then(() => { if ($("#detector").classList.contains("active")) buildDetector(); });
   const t = $("#svStatus"); if (t) t.textContent = m.state === "running" ? m.message || "" : "";
   if (!$("#detector").contains(document.activeElement) && m.state !== "running") buildDetector();
 }
-function surveyGoTo(lo, hi) {
-  const res = SV.result, step = res ? res.step_hz : S.cfg.sdr.sample_rate * 0.8, c = (lo + hi) / 2;
-  patch({ sdr: { center_hz: Math.round(c), fmin_hz: Math.round(c - step / 2), fmax_hz: Math.round(c + step / 2) } }, 50);
+function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); }
+function surveyTune(f) {
+  const step = SV.meta ? SV.meta.step_hz : S.cfg.sdr.sample_rate * 0.8;
+  patch({ sdr: { center_hz: Math.round(f), fmin_hz: Math.round(f - step / 2), fmax_hz: Math.round(f + step / 2) } }, 50);
   closeSurvey();
 }
-function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); }
-function drawSurvey() {
-  const res = SV.result; let p = $("#survey");
-  if (!SV.open) return;
-  if (!p) { p = el("div", { id: "survey" }); $("#wfwrap").append(p); }
-  p.replaceChildren();
-  const run = SV.state.state === "running";
-  const head = el("div", { class: "svhead" },
-    el("strong", {}, "Survey"),
-    res ? el("span", { class: "t2" }, `${fmtFshort(res.lo)} – ${fmtFshort(res.hi)} · ${res.dwell_s} s per step · ${res.source} · ${(res.started || "").replace("T", " ").slice(0, 16)}`) : el("span", { class: "t2" }, "Waiting for the first step…"),
-    el("span", { id: "svStatus", class: "t3" }, run ? SV.state.message || "" : ""),
-    el("span", { style: "flex:1" }),
-    (() => { const s = el("select", { class: "sel" }, el("option", { value: "det" }, "Detector picks"), el("option", { value: "pow" }, "Power only"));
-      s.value = SV.layer; s.addEventListener("change", () => { SV.layer = s.value; drawSurvey(); }); return s; })(),
-    el("button", { class: "btn", onclick: closeSurvey }, "Close"));
-  p.append(head);
-  if (!res || !res.steps || !res.steps.length) return;
-  const span = res.hi - res.lo, ncols = Math.round(span / res.col_hz), rows = res.rows;
-  // ---- map: power (dimmed in "Detector picks") with the detector's candidates in the mark colour
-  const map = el("canvas", { class: "svmap" }), axis = el("div", { class: "svaxis" });
-  const off = document.createElement("canvas"); off.width = ncols; off.height = rows;
-  const octx = off.getContext("2d"), img = octx.createImageData(ncols, rows), d = img.data;
-  const lut = makeColLUT(), cs = getComputedStyle(document.documentElement);
-  const mark = (cs.getPropertyValue("--mark").trim() || "#e3a33b").replace("#", "");
-  const mr = parseInt(mark.slice(0, 2), 16), mg = parseInt(mark.slice(2, 4), 16), mb = parseInt(mark.slice(4, 6), 16);
-  const dim = SV.layer === "det" ? 0.45 : 1;
-  for (const st of res.steps) {
-    const pw = b64bytes(st.pow), dt = b64bytes(st.det), c0 = Math.round((st.lo - res.lo) / res.col_hz), w = st.cols;
-    for (let r = 0; r < rows; r++) for (let c = 0; c < w; c++) {
-      const x = c0 + c; if (x >= ncols) continue;
-      const k = (r * ncols + x) * 4, v = pw[r * w + c], q = dt[r * w + c] / 255;
-      let R = lut[v * 4] * dim, G = lut[v * 4 + 1] * dim, B = lut[v * 4 + 2] * dim;
-      if (SV.layer === "det" && q > 0) { const a = 0.35 + 0.65 * q; R = R * (1 - a) + mr * a; G = G * (1 - a) + mg * a; B = B * (1 - a) + mb * a; }
-      d[k] = R; d[k + 1] = G; d[k + 2] = B; d[k + 3] = 255;
+// The survey follows the toolbar: View picks the map, the colour map applies, Min confidence filters the boxes.
+function surveyView() { return SV.meta && SV.meta.views.includes(S.view) ? S.view : "power"; }
+async function surveyImage(view) {
+  const key = view + "|" + S.cmap;
+  if (SV.imgs[key]) return SV.imgs[key];
+  const r = await fetch(`/api/survey/image?view=${encodeURIComponent(view)}` + (SV.file ? "&file=" + encodeURIComponent(SV.file) : ""));
+  if (!r.ok) return null;
+  const bytes = new Uint8Array(await r.arrayBuffer()), rows = +r.headers.get("X-Rows"), cols = +r.headers.get("X-Cols");
+  // automatic brightness, like the waterfall: noise floor (20th percentile) .. peaks (99.8th)
+  const smp = []; for (let i = 0; i < bytes.length; i += 37) smp.push(bytes[i]); smp.sort((a, b) => a - b);
+  const lo = smp[Math.floor(smp.length * 0.2)] || 0, hi = Math.max(lo + 8, smp[Math.floor(smp.length * 0.998)] || 255);
+  const base = makeColLUT(), lut = new Uint8ClampedArray(256 * 4);
+  for (let v = 0; v < 256; v++) { const i = Math.max(0, Math.min(255, Math.round((v - lo) / (hi - lo) * 255))); lut.set(base.subarray(i * 4, i * 4 + 4), v * 4); }
+  const parts = [];
+  let c0 = 0;
+  for (const st of SV.meta.steps) {                         // one canvas per step (keeps canvases small)
+    const w = st.cols, c = document.createElement("canvas"); c.width = w; c.height = rows;
+    const g = c.getContext("2d"), img = g.createImageData(w, rows);
+    for (let y = 0; y < rows; y++) for (let x = 0; x < w; x++) {
+      const v = bytes[y * cols + c0 + x], k = (y * w + x) * 4;
+      img.data[k] = lut[v * 4]; img.data[k + 1] = lut[v * 4 + 1]; img.data[k + 2] = lut[v * 4 + 2]; img.data[k + 3] = 255;
     }
+    g.putImageData(img, 0, 0); parts.push({ cv: c, st }); c0 += w;
   }
-  octx.putImageData(img, 0, 0);
-  // ---- per-cell chart
-  const chart = el("canvas", { class: "svchart" });
-  const tip = el("div", { class: "svtip" });
-  p.append(el("div", { class: "svmapwrap" }, map, tip), axis, chart);
-  const cells = res.cells || [];
-  const lists = el("div", { class: "svlists" });
-  if (res.suggest) {
-    const L = (title, ids, fmt, empty) => el("div", {}, el("h3", {}, title),
-      ...(ids.length ? ids.map(i => { const c = cells[i]; return el("div", { class: "svrow", onclick: () => surveyGoTo(c.lo, c.hi) },
-        el("span", { class: "num" }, `${fmtFshort(c.lo)} – ${fmtFshort(c.hi)}`), el("span", { class: "t2" }, fmt(c)), el("button", { class: "btn" }, "Listen")); })
-        : [el("div", { class: "note" }, empty)]));
-    lists.append(
-      L("Most activity", res.suggest.activity, c => `${c.detections_per_min}/min shown · ${c.candidates_per_min}/min tracked`, "Nothing tracked anywhere."),
-      L("Most voice-like", res.suggest.voice, c => `${c.voice_like_per_min}/min above ${Math.round((res.floor ?? 0.3) * 100)}% · best ${Math.round((c.voice_max || 0) * 100)}%`, `Nothing scored above the ${Math.round((res.floor ?? 0.3) * 100)}% voice-likeness floor.`),
-      L("Quietest", res.suggest.quiet, c => `${c.candidates_per_min}/min tracked · noise ${c.floor_db >= 0 ? "+" : ""}${c.floor_db.toFixed(1)} dB`, ""));
-    p.append(lists);
-  } else p.append(el("div", { class: "note" }, "Suggestions appear when the survey finishes."));
-  requestAnimationFrame(() => {
-    const W = map.clientWidth, H = map.clientHeight, dpr = devicePixelRatio || 1;
-    map.width = W * dpr; map.height = H * dpr;
-    const ctx = map.getContext("2d"); ctx.imageSmoothingEnabled = true; ctx.drawImage(off, 0, 0, map.width, map.height);
-    // step boundaries
-    ctx.strokeStyle = "rgba(255,255,255,.12)"; ctx.lineWidth = dpr;
-    for (const st of res.steps) { const x = (st.lo - res.lo) / span * map.width; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, map.height); ctx.stroke(); }
-    // axis ticks
-    const nt = Math.max(2, Math.floor(W / 110)), stepHz = niceStep(span / nt);
-    axis.replaceChildren(); for (let f = Math.ceil(res.lo / stepHz) * stepHz; f <= res.hi; f += stepHz)
-      axis.append(el("span", { style: `left:${(f - res.lo) / span * 100}%` }, (f / 1e6).toFixed(stepHz < 1e5 ? 2 : stepHz < 1e6 ? 1 : 0)));
-    // chart: tracked (muted) and shown (mark) per cell; suggested cells underlined
-    const CH = chart.clientHeight; chart.width = W * dpr; chart.height = CH * dpr; const g = chart.getContext("2d");
-    const mx = Math.max(1e-9, ...cells.map(c => c.candidates_per_min));
-    const cw = res.cell_hz / span * chart.width;
-    const sug = new Set(res.suggest ? [...res.suggest.activity, ...res.suggest.voice, ...res.suggest.quiet] : []);
-    cells.forEach(c => {
-      const x = (c.lo - res.lo) / span * chart.width, h1 = c.candidates_per_min / mx * (chart.height - 6 * dpr), h2 = c.detections_per_min / mx * (chart.height - 6 * dpr);
-      g.fillStyle = cs.getPropertyValue("--line-strong"); g.fillRect(x + dpr, chart.height - h1, cw - 2 * dpr, h1);
-      g.fillStyle = cs.getPropertyValue("--mark"); g.fillRect(x + dpr, chart.height - h2, cw - 2 * dpr, h2);
-      if (c.voice_like_per_min > 0) { g.fillStyle = cs.getPropertyValue("--ok"); g.fillRect(x + dpr, 0, cw - 2 * dpr, 3 * dpr); }
-      if (sug.has(c.i)) { g.fillStyle = cs.getPropertyValue("--text-3"); g.fillRect(x + dpr, chart.height - dpr, cw - 2 * dpr, dpr); }
-    });
-  });
-  const hover = (e, el_) => {
-    const r = el_.getBoundingClientRect(), f = res.lo + (e.clientX - r.left) / r.width * span;
-    const c = cells.find(c => f >= c.lo && f < c.hi);
-    tip.style.display = ""; tip.style.left = Math.min(r.width - 230, e.clientX - r.left + 12) + "px";
-    tip.textContent = `${fmtF(f)}` + (c ? ` · ${c.candidates_per_min}/min tracked · ${c.detections_per_min}/min shown · ${Math.round(c.occupancy * 100)}% occupied` + (c.voice_max != null ? ` · best voice ${Math.round(c.voice_max * 100)}%` : "") : "") + " · click to listen";
-    return { f, c };
-  };
-  for (const cv of [map, chart]) {
-    cv.addEventListener("mousemove", e => hover(e, cv));
-    cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
-    cv.addEventListener("click", e => { const { f, c } = hover(e, cv); c ? surveyGoTo(c.lo, c.hi) : surveyGoTo(f - 5e4, f + 5e4); });
-  }
+  return (SV.imgs[key] = parts);
 }
-function niceStep(x) { const p = 10 ** Math.floor(Math.log10(x)); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= x) return m * p; return 10 * p; }
+const svTracks = () => (SV.meta ? SV.meta.steps.flatMap((st, si) => st.tracks.map(t => ({ ...t, step: si }))) : []);
+function drawSurvey() {
+  if (!SV.open) return;
+  let p = $("#survey");
+  if (!p) {
+    p = el("div", { id: "survey" }); $("#wfwrap").append(p);
+    const head = el("div", { class: "svhead" },
+      el("strong", {}, "Survey"), el("span", { id: "svInfo", class: "t2" }), el("span", { id: "svStatus", class: "t3" }),
+      el("span", { style: "flex:1" }), el("span", { id: "svSel", class: "num t2" }),
+      el("button", { id: "svTune", class: "btn primary", style: "display:none", onclick: () => SV.sel != null && surveyTune(SV.sel) }, "Tune here"),
+      el("button", { class: "btn", title: "Show the whole range (or double-click the map)", onclick: () => { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); } }, "Fit"),
+      el("button", { class: "btn", onclick: closeSurvey }, "Close"));
+    const map = el("canvas", { id: "svMap", class: "svmap" }), chart = el("canvas", { id: "svChart", class: "svchart" });
+    p.append(head, el("div", { class: "svmapwrap" }, map, el("div", { id: "svTip", class: "svtip" })), el("div", { id: "svAxis", class: "svaxis" }), chart,
+      el("div", { class: "svsamples" }, el("h3", {}, "Best samples"), el("div", { id: "svSamples" })));
+    for (const c of [map, chart]) surveyInteract(c);
+  }
+  const m = SV.meta, run = SV.state.state === "running";
+  $("#svInfo").textContent = m ? `${fmtFshort(m.lo)} – ${fmtFshort(m.hi)} · ${m.dwell_s} s per step · ${m.source} · ${(m.started || "").replace("T", " ").slice(0, 16)}`
+    + (S.view !== surveyView() ? ` · “${(S.views.find(v => v.id === S.view) || {}).label || S.view}” wasn't recorded; showing power` : "") : "";
+  $("#svStatus").textContent = run ? SV.state.message || "" : "";
+  renderSurvey(); renderSamples();
+}
+async function renderSurvey() {
+  const m = SV.meta, map = $("#svMap"); if (!m || !map) return;
+  const gen = SV.gen = (SV.gen || 0) + 1;                  // only the newest render draws (images load async)
+  const parts = await surveyImage(surveyView()); if (!parts || !$("#svMap") || gen !== SV.gen) return;
+  const dpr = devicePixelRatio || 1, W = map.clientWidth;
+  map.width = W * dpr; map.height = map.clientHeight * dpr;
+  const g = map.getContext("2d"), span = SV.v1 - SV.v0, X = f => (f - SV.v0) / span * map.width;
+  const cs = getComputedStyle(document.documentElement), mark = cs.getPropertyValue("--mark");
+  g.fillStyle = cs.getPropertyValue("--wf-bg"); g.fillRect(0, 0, map.width, map.height);
+  for (const { cv: c, st } of parts) {
+    const a = Math.max(st.lo, SV.v0), b = Math.min(st.hi, SV.v1); if (b <= a) continue;
+    const sx = (a - st.lo) / (st.hi - st.lo) * st.cols, sw = (b - a) / (st.hi - st.lo) * st.cols;
+    g.imageSmoothingEnabled = (X(b) - X(a)) / sw < 3;      // crisp columns when zoomed in
+    g.drawImage(c, sx, 0, Math.max(0.5, sw), c.height, X(a), 0, X(b) - X(a), map.height);
+  }
+  g.strokeStyle = "rgba(255,255,255,.14)"; g.lineWidth = dpr;
+  for (const st of m.steps) { const x = X(st.lo); if (x > 0 && x < map.width) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, map.height); g.stroke(); } }
+  // detector picks as boxes, filtered by Min confidence
+  const pad = 1500, Y = t => t / m.dwell_s * map.height;
+  for (const t of svTracks()) {
+    if (t.conf < S.minConf) continue;
+    const x0 = X(t.fmin - pad), x1 = X(t.fmax + pad); if (x1 < 0 || x0 > map.width) continue;
+    const w = Math.max(3 * dpr, x1 - x0), y0 = Y(t.t0), y1 = Math.max(y0 + 3 * dpr, Y(t.t1));
+    g.strokeStyle = mark; g.lineWidth = (SV.hl === t.id ? 2.5 : 1.2) * dpr; g.globalAlpha = 0.5 + 0.5 * t.conf;
+    g.strokeRect(x0 + (x1 - x0 - w) / 2, y0, w, y1 - y0); g.globalAlpha = 1;
+  }
+  if (SV.sel != null) { g.strokeStyle = cs.getPropertyValue("--text"); g.setLineDash([4 * dpr, 4 * dpr]); g.lineWidth = dpr; g.beginPath(); g.moveTo(X(SV.sel), 0); g.lineTo(X(SV.sel), map.height); g.stroke(); g.setLineDash([]); }
+  // frequency axis
+  const axis = $("#svAxis"), nt = Math.max(2, Math.floor(W / 110)), stepHz = svStep(span / nt), dec = Math.max(0, Math.min(4, -Math.floor(Math.log10(stepHz / 1e6) + 1e-9)));
+  axis.replaceChildren();
+  for (let f = Math.ceil(SV.v0 / stepHz) * stepHz; f <= SV.v1; f += stepHz)
+    axis.append(el("span", { style: `left:${(f - SV.v0) / span * 100}%` }, (f / 1e6).toFixed(dec)));
+  // activity per slice of what's on screen: tracked (grey) and at Min confidence (mark); green = voice-like
+  const chart = $("#svChart"); chart.width = W * dpr; chart.height = chart.clientHeight * dpr;
+  const cg = chart.getContext("2d"), nb = Math.max(10, Math.floor(W / 9)), bw = span / nb, mins = m.dwell_s / 60;
+  const all = new Array(nb).fill(0), shown = new Array(nb).fill(0), voice = new Array(nb).fill(false);
+  for (const t of svTracks()) { const b = Math.floor((t.f - SV.v0) / bw); if (b < 0 || b >= nb) continue; all[b]++; if (t.conf >= S.minConf) shown[b]++; if ((t.vad || 0) >= (m.floor ?? 0.3)) voice[b] = true; }
+  const mx = Math.max(1, ...all), bx = chart.width / nb;
+  for (let b = 0; b < nb; b++) {
+    const h1 = all[b] / mx * (chart.height - 5 * dpr), h2 = shown[b] / mx * (chart.height - 5 * dpr);
+    cg.fillStyle = cs.getPropertyValue("--line-strong"); cg.fillRect(b * bx + dpr, chart.height - h1, bx - 2 * dpr, h1);
+    cg.fillStyle = mark; cg.fillRect(b * bx + dpr, chart.height - h2, bx - 2 * dpr, h2);
+    if (voice[b]) { cg.fillStyle = cs.getPropertyValue("--ok"); cg.fillRect(b * bx + dpr, 0, bx - 2 * dpr, 3 * dpr); }
+  }
+  SV.bins = { nb, bw, all, shown, mins };
+  $("#svSel").textContent = SV.sel != null ? fmtF(SV.sel) : "";
+  $("#svTune").style.display = SV.sel != null ? "" : "none";
+}
+function surveyInteract(c) {
+  let drag = null;
+  const fAt = e => { const r = c.getBoundingClientRect(); return SV.v0 + (e.clientX - r.left) / r.width * (SV.v1 - SV.v0); };
+  c.addEventListener("wheel", e => {                         // zoom the frequency axis around the cursor
+    e.preventDefault(); const m = SV.meta; if (!m) return;
+    const f = fAt(e), k = Math.exp(e.deltaY * 0.0015), span = Math.min(m.hi - m.lo, Math.max(5e3, (SV.v1 - SV.v0) * k));
+    const r = (f - SV.v0) / (SV.v1 - SV.v0);
+    SV.v0 = Math.max(m.lo, Math.min(m.hi - span, f - r * span)); SV.v1 = SV.v0 + span; renderSurvey();
+  }, { passive: false });
+  c.addEventListener("pointerdown", e => { drag = { x: e.clientX, v0: SV.v0, v1: SV.v1, moved: false }; c.setPointerCapture(e.pointerId); });
+  c.addEventListener("pointermove", e => {
+    const tip = $("#svTip"), m = SV.meta; if (!m) return;
+    if (drag) {
+      const dx = e.clientX - drag.x; if (Math.abs(dx) > 3) drag.moved = true;
+      if (drag.moved) { const span = drag.v1 - drag.v0, df = -dx / c.getBoundingClientRect().width * span;
+        SV.v0 = Math.max(m.lo, Math.min(m.hi - span, drag.v0 + df)); SV.v1 = SV.v0 + span; renderSurvey(); }
+      tip.style.display = "none"; return;
+    }
+    const f = fAt(e), r = c.getBoundingClientRect(), B = SV.bins, b = B ? Math.floor((f - SV.v0) / B.bw) : -1;
+    tip.style.display = ""; tip.style.left = Math.max(0, Math.min(r.width - 300, e.clientX - r.left + 12)) + "px";
+    tip.textContent = fmtF(f) + (B && b >= 0 && b < B.nb ? ` · ${(B.all[b] / B.mins).toFixed(1)}/min tracked · ${(B.shown[b] / B.mins).toFixed(1)}/min ≥ ${Math.round(S.minConf * 100)}%` : "");
+  });
+  c.addEventListener("pointerup", e => { if (drag && !drag.moved) { SV.sel = fAt(e); renderSurvey(); } drag = null; });
+  c.addEventListener("pointerleave", () => { $("#svTip").style.display = "none"; });
+  c.addEventListener("dblclick", () => { SV.v0 = SV.meta.lo; SV.v1 = SV.meta.hi; renderSurvey(); });
+}
+function renderSamples() {
+  const box = $("#svSamples"); if (!box || !SV.meta) return;
+  const floor = SV.meta.floor ?? 0.3;
+  const best = svTracks().filter(t => t.clips && t.clips.length && t.conf >= S.minConf)
+    .sort((a, b) => b.conf * (0.5 + (b.vad || 0)) - a.conf * (0.5 + (a.vad || 0))).slice(0, 10);
+  if (!best.length) { box.replaceChildren(el("div", { class: "note" }, `No recorded detections at or above ${Math.round(S.minConf * 100)}% confidence.`)); return; }
+  box.replaceChildren(...best.map(t => {
+    const key = "sv:" + t.id, tx = S.tx.get(t.id);
+    return el("div", { class: "svrow det", "data-key": key, title: "Show it on the map",
+      onclick: () => { SV.hl = t.id; SV.sel = t.f; const w = 60e3; SV.v0 = Math.max(SV.meta.lo, t.f - w); SV.v1 = Math.min(SV.meta.hi, t.f + w); renderSurvey(); } },
+      (() => { const b = el("button", { class: "play", title: "Play", onclick: e => { e.stopPropagation(); togglePlay(key, null, { clip: t.clips[0] }); } }); b.innerHTML = ICON_PLAY; return b; })(),
+      el("span", { class: "num" }, fmtF(t.f)),
+      el("span", { class: "t2" }, tx && tx.text ? `“${tx.text}”` : `step ${t.step + 1} · ${t.t0.toFixed(1)} s`),
+      el("span", { class: "num t2", title: "ML voice score" }, t.vad != null ? `voice ${Math.round(t.vad * 100)}%` : ""),
+      el("span", { class: "num", style: t.vad != null && t.vad >= floor ? "color:var(--ok)" : "" }, Math.round(t.conf * 100) + "%"));
+  }));
+}
+function svStep(x) { const p = 10 ** Math.floor(Math.log10(x)); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= x) return m * p; return 10 * p; }
 // Readiness: the server says how much continuous IQ exists for this band; between polls the
 // count ticks up locally once a second (the ring grows in real time), so the timer moves smoothly.
 function readyBlock() {
@@ -1192,6 +1244,7 @@ function setMinConf(v) {
   S.minConf = v; lsSet("gb_minconf", v);
   $("#minConf").value = Math.round(v * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(v * 100) + "%";
   renderLive(); clearTimeout(confTimer); confTimer = setTimeout(() => loadPage(true), 250);
+  if (SV.open) { renderSurvey(); renderSamples(); }
 }
 $("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
 $("#caps").checked = lsGet("gb_caps", "1") === "1";
@@ -1201,6 +1254,7 @@ let WS = null;
 function setView(mode) {
   S.view = mode; lsSet("gb_view", mode); $("#view").value = mode;
   S.chunks.clear(); loadScale(); LUT = makeLUT();
+  if (SV.open) drawSurvey();
   if (WS && WS.readyState === 1) WS.send(JSON.stringify({ type: "view", mode }));
   const top = topTime(); if (top !== null) fetchHistory(top - cv.clientHeight / S.pps - 30, top + 5);
 }

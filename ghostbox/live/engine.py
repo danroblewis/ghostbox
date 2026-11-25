@@ -180,6 +180,7 @@ class Engine:
         column); they don't affect which candidates are found or their confidence."""
         self.score_all = set(score_all)
         self.on_hop = None                       # (engine, cfg, tb) after each hop's tracking (band survey)
+        self.on_maps = None                      # (engine, ts, {view: [frames, bins] in 0..1}) each hop
         self.show_conf = 0.0                     # what counts as "caught something" for auto-recalibration
         self.last_hit = time.time()
         self.config = config
@@ -447,6 +448,8 @@ class Engine:
         if not len(ts):
             return
         width = int(cfg["display"]["width"])
+        if self.on_maps is not None:
+            self.on_maps(self, ts, dict([("score", comb), ("novelty", ev)] + list(scores.items()) + list(extra_views)))
         for mode, a in [("score", comb), ("novelty", ev)] + list(scores.items()) + list(extra_views):
             K = a.shape[1]
             pool = max(1, -(-K // width))
