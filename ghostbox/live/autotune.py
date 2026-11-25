@@ -181,8 +181,10 @@ class AutoTune:
             self._set(progress=0.95, message=f"Searching settings over {len(boxes)} candidates…")
             res = optimise(boxes, dur / 60, per_min, cfg["checks"])
             self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
+            live_detect = {**TUNE_DETECT, "max_tracks": 16, "max_candidates": 8,   # the analysis pass is wide open;
+                           "threshold": res["capture_threshold"]}                      # live keeps CPU in check
             patch = {"checks": {i: {"weight": w, "enabled": w > 0} for i, w in res["weights"].items()},
-                     "detect": {**TUNE_DETECT, "threshold": res["capture_threshold"]}}
+                     "detect": live_detect}
             self.apply(patch)
             band = [fc - fs / 2, fc + fs / 2]
             if cfg["sdr"].get("fmin_hz") is not None:

@@ -105,6 +105,7 @@ class Track:
         self.out = []                    # processed playback audio [(t_start, float32)]: denoise + gain + fades
         self.den, self.gain = None, SmoothGain()
         self.audio_t0 = None             # stream time where this track's audio (incl. pre-roll) starts
+        self.vad_p, self.vad_t = np.zeros(0, np.float32), -1e18   # incremental ML voice scores
         self.agc = None
         self.seg_start = t               # recording segment start
         self.seg_index = 0
@@ -262,7 +263,10 @@ class Engine:
                     continue
                 misses = 0
                 self._src = src
+                self.timing = {}
+                t_a = time.time()
                 self._ingest(x, cfg)
+                self.timing["ingest"] = time.time() - t_a
                 self._analyze(cfg)
                 # load = all work for this second of signal (conversion + processing) / its duration.
                 # Time spent blocked waiting for samples isn't work; conversion happens inside read().
@@ -274,6 +278,7 @@ class Engine:
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
                                "tracks": len(self.tracks), "vad": stage2.vad_available(),
                                "storage": self.storage,
+                               "timing": {k: round(v, 3) for k, v in getattr(self, "timing", {}).items()},
                                "progress": (src.sent / src.total) if getattr(src, "total", None) else None,
                                "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
                                            "queue": self.transcriber.qsize(), "busy": self.transcriber.busy,
@@ -354,8 +359,13 @@ class Engine:
     def _raw_span(self, s0, s1):
         """Absolute sample range [s0, s1) from the ring (must still be held)."""
         s0 = max(s0, self.n_samples - self.raw_keep)
-        idx = np.arange(s0, s1) % self.raw_keep
-        return self.raw[idx], s0
+        s1 = min(s1, self.n_samples)
+        if s1 <= s0:
+            return self.raw[:0], s0
+        a, b = s0 % self.raw_keep, s1 % self.raw_keep           # a slice, or two when it wraps
+        if a < b:
+            return self.raw[a:b], s0
+        return np.concatenate([self.raw[a:], self.raw[:b]]), s0
 
     # ---------------- analysis ----------------
     def _analyze(self, cfg):
@@ -372,7 +382,9 @@ class Engine:
             return
         sl = slice(idx[0], idx[-1] + 1)
         self.analyzed_until = float(T[idx[-1]])
+        t_s1 = time.time()
         scores, comb = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=set(stage1.STAGE1), pool=self.pool)
+        self.timing["stage1"] = time.time() - t_s1
         ts = T[sl]
 
         # novelty: subtract a slow per-bin baseline (always-on emitters cancel)
@@ -389,13 +401,17 @@ class Engine:
             w = int(2 * det["prominence_hz"] / self.df) | 1
             ev -= beta * uniform_filter1d(ev, size=w, axis=1, mode="nearest")
         ev = np.clip(ev, 0, None)
+        t_v = time.time()
         self._view_rows(scores, comb, ev, ts, cfg)
+        self.timing["views"] = time.time() - t_v
 
         with self.lock:
             for i, t in enumerate(ts):
                 cands = self._candidates(ev[i], det)
                 self._track_step(t, cands, ev[i], comb[i], {c: s[i] for c, s in scores.items()}, det)
+            t_t = time.time()
             self._tracks_audio_and_stage2(cfg, float(ts[0]) - 0.5 / self.fr, float(ts[-1]) + 0.5 / self.fr)
+            self.timing["tracks"] = time.time() - t_t
 
     def _candidates(self, row, det):
         thr = det["candidate_threshold"]
@@ -459,7 +475,22 @@ class Engine:
             t_to = tr.t_last + post if ending else min(tb, tr.t_last + 0.5 / self.fr)
             if t_to - t_from > 0.02:
                 jobs.append((tr, t_from, t_to, ending))
+        self.timing["tracks_n"] = len(self.tracks)
         list(self.pool.map(lambda j: self._demod_track(j[0], j[1], j[2], cfg, j[3]), jobs))
+        # per-candidate checks for every track in parallel too (~20 ms per track per second each)
+        def s2job(tr):
+            audio, iq = self._recent(tr.audio, 3.0), self._recent(tr.iq, 3.0)
+            if not len(audio):
+                return {}, {}
+            vad = None
+            if enabled.get("vad"):                       # incremental: only score audio not seen before
+                for t, a in tr.audio:
+                    if t > tr.vad_t + 1e-6:
+                        tr.vad_p = np.concatenate([tr.vad_p, stage2.vad_probs(a)])[-int(3.0 * AUDIO_FS / 512):]
+                        tr.vad_t = t
+                vad = tr.vad_p
+            return stage2.run(audio, iq, checks, enabled, vad=vad)
+        s2_results = dict(zip([id(t) for t in self.tracks], self.pool.map(s2job, self.tracks)))
         for tr in self.tracks:
             ended = tb - tr.t_last > det["track_gap_s"]
             # stage 2 on the last 3 s, stage 1 averaged over the last 1 s of the track
@@ -469,9 +500,7 @@ class Engine:
                 for c, v in fr[3].items():
                     s1.setdefault(c, []).append(v)
             s1 = {c: float(np.mean(v)) for c, v in s1.items()}
-            audio = self._recent(tr.audio, 3.0)
-            iq = self._recent(tr.iq, 3.0)
-            s2, info = stage2.run(audio, iq, checks, enabled) if len(audio) else ({}, {})
+            s2, info = s2_results[id(tr)]
             tr.scores = {**s1, **s2}
             tr.info = {**info, "evidence": round(float(np.mean([fr[2] for fr in recent])) if recent else 0, 3)}
             g = stage1.geo_mean({k: np.array(v) for k, v in tr.scores.items()}, weights)
@@ -637,6 +666,7 @@ class Engine:
     def _write_recording(self, meta, pcm16, iq, stem, cfg):
         out = self.root / cfg["record"]["dir"]
         out.mkdir(parents=True, exist_ok=True)
+        self._no_index(out)
         wavfile.write(out / f"{stem}.wav", AUDIO_FS, pcm16)
         files = {"wav": f"{stem}.wav"}
         if iq is not None:
@@ -760,6 +790,14 @@ class Engine:
             self.iq_file.close()
         self.iq_file = None
 
+    @staticmethod
+    def _no_index(d):
+        """macOS: a .metadata_never_index file stops Spotlight indexing (and burning CPU on) this folder."""
+        try:
+            (d / ".metadata_never_index").touch(exist_ok=True)
+        except OSError:
+            pass
+
     def _write_iq(self, x, t_start, cfg):
         ring = cfg["iq_ring"]
         if (not ring["enabled"] or self.storage["paused"]
@@ -771,6 +809,7 @@ class Engine:
             self._prune(cfg)                       # trim on every new segment, so the cap can't overshoot
             d = self.root / ring["dir"]
             d.mkdir(parents=True, exist_ok=True)
+            self._no_index(d)
             utc = datetime.fromtimestamp(self.t_origin + t_start, timezone.utc)
             name = f"{utc:%Y%m%d-%H%M%S}_{self.fc / 1e6:g}MHz_{self.fs / 1e6:g}Msps.cs8"
             self.iq_file = open(d / name, "wb")

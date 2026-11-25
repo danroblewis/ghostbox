@@ -993,7 +993,7 @@ function setStatus(s) {
   st.className = ok && !behind ? "" : "bad";
   const paused = ok && s.storage && s.storage.paused;
   if (paused) st.className = "bad";
-  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: lower the sample rate or narrow the analysis range" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue || w.busy ? ` · transcribing ${w.queue} queued${w.rate ? `, ${w.rate}/s` : ""}` : ""}${s.error ? " · " + s.error : ""}`
+  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: choose a smaller span (top bar), narrow the analysis range (Settings), or raise the detector thresholds" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue || w.busy ? ` · transcribing ${w.queue} queued${w.rate ? `, ${w.rate}/s` : ""}` : ""}${s.error ? " · " + s.error : ""}`
     : `${s.state}${s.error ? ": " + s.error : ""}`;
   st.title = st.textContent;
 }

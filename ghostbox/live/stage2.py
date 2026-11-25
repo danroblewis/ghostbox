@@ -10,7 +10,10 @@ from scipy.signal import welch
 STAGE2 = ("comb", "pitch_motion", "shape", "voicing", "rhythm", "am_phase", "vad")
 FS = 16000
 
+import threading
+
 _vad = {"model": None, "error": None}
+_local = threading.local()          # one Silero model per worker thread: it carries per-clip state
 
 
 def vad_available():
@@ -50,7 +53,26 @@ def _pitch_track(audio, f0_min, f0_max):
     return r, f0, energy
 
 
-def run(audio, iq, cfg_checks, enabled):
+def vad_probs(audio):
+    """Silero speech probability per 32 ms block (512 samples at 16 kHz)."""
+    if not vad_available():
+        return np.zeros(0, np.float32)
+    import torch
+    n = len(audio) // 512 * 512
+    if n == 0:
+        return np.zeros(0, np.float32)
+    a = np.clip(audio[:n] / (np.abs(audio[:n]).max() + 1e-9), -1, 1).astype(np.float32)
+    with torch.no_grad():
+        model = getattr(_local, "vad", None)
+        if model is None:
+            from silero_vad import load_silero_vad
+            model = _local.vad = load_silero_vad()
+        model.reset_states()
+        return np.array([float(model(torch.from_numpy(a[i:i + 512]), FS)) for i in range(0, n, 512)], np.float32)
+
+
+def run(audio, iq, cfg_checks, enabled, vad=None):
+    """vad: precomputed speech probabilities for this audio (incremental, per track); else computed here."""
     """audio: float32 16 kHz demodulated voice; iq: complex64 16 kHz narrowband around the carrier."""
     out, info = {}, {}
     if len(audio) < FS // 2:
@@ -109,13 +131,7 @@ def run(audio, iq, cfg_checks, enabled):
         out["am_phase"] = float(np.clip(z / c["am_phase"]["full_z"], 0, 1))
 
     if enabled.get("vad") and vad_available():
-        import torch
-        n = len(audio) // 512 * 512
-        a = np.clip(audio[:n] / (np.abs(audio[:n]).max() + 1e-9), -1, 1).astype(np.float32)
-        with torch.no_grad():
-            _vad["model"].reset_states()
-            probs = [float(_vad["model"](torch.from_numpy(a[i:i + 512]), FS)) for i in range(0, n, 512)]
-        probs = np.sort(probs)
+        probs = np.sort(vad if vad is not None else vad_probs(audio))
         out["vad"] = float(probs[len(probs) // 2:].mean()) if len(probs) else 0.0
     return out, info
 
