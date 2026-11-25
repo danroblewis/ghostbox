@@ -199,7 +199,7 @@ function draw() {
   // detections
   const now = nowS(), chains = new Map();
   for (const d of S.dets.values()) {
-    if (d.box.conf < S.minConf && !d.playing.some(([a, z]) => now >= a && now <= z)) { d.box._rect = null; continue; }
+    if (!audible(d)) { d.box._rect = null; continue; }      // below the filter: not drawn, not heard
     const b = d.box; const y0 = (top - b.t1) * pps, y1 = (top - b.t0) * pps;
     if (y1 < -20 || y0 > H + 20) { d.box._rect = null; continue; }
     const pad = Math.max(5 * dpr, xOf(b.fmin + 3400) - xOf(b.fmin));
@@ -261,6 +261,7 @@ function draw() {
   drawScope();
   if (Math.random() < 0.01) evictChunks(top);
   updateRowProgress();
+  updateVoiceGains();
 }
 function caption(text, x, y, doubtful, playing, color) {
   const dpr = devicePixelRatio;
@@ -376,9 +377,21 @@ $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) mast
 // ---------------- audio scope: a lane per voice + log-frequency spectrogram of the mix ----------------
 const SCOPE = { an: null, img: null, lo: -100, hi: -40 };
 const scv = $("#scope"), sctx = scv.getContext("2d");
+const confOf = d => Math.max(d.box.conf_max ?? 0, d.box.conf ?? 0);
+const audible = d => confOf(d) >= S.minConf;
+// Each voice has its own gain node; it follows the Min confidence filter while it plays, so a
+// detection below the filter stays silent and one that rises above it partway fades in.
+function updateVoiceGains() {
+  if (!AC) return;
+  for (const d of S.dets.values()) {
+    if (!d.vnode) continue;
+    const target = audible(d) ? 1 : 0;
+    if (d.gainTarget !== target) { d.gainTarget = target; d.vnode.gain.setTargetAtTime(target, AC.currentTime, 0.03); }
+  }
+}
 function playingVoices() {
   const now = nowS(), out = [];
-  for (const d of S.dets.values()) if (d.playing.some(([a, z]) => now >= a && now <= z)) out.push(d);
+  for (const d of S.dets.values()) if (audible(d) && d.playing.some(([a, z]) => now >= a && now <= z)) out.push(d);
   return out.sort((a, b) => b.box.conf - a.box.conf).slice(0, 4);
 }
 const F_LO = 80, F_HI = 4000;
@@ -478,6 +491,7 @@ function playAt(d, buf, tStart, rate) {                     // buf: AudioBuffer 
   const src = AC.createBufferSource(); src.buffer = buf.duration !== undefined ? buf : pcmBuffer(buf, rate);
   if (!d.vnode) {                                          // one analyser per voice, so each can be drawn on its own
     d.vnode = AC.createGain(); d.an = AC.createAnalyser(); d.an.fftSize = 1024;
+    d.gainTarget = audible(d) ? 1 : 0; d.vnode.gain.value = d.gainTarget;
     d.vnode.connect(d.an); d.an.connect(streamOut());
   }
   src.connect(d.vnode); src.start(AC.currentTime + Math.max(0, when - now), skip);
@@ -621,7 +635,7 @@ function renderLive() {
   if (liveTimer) return;
   liveTimer = setTimeout(() => {
     liveTimer = null;
-    const ds = [...S.dets.values()].filter(d => !d.ended && d.box.detected !== false && d.box.conf >= S.minConf).sort((a, b) => b.box.t0 - a.box.t0);
+    const ds = [...S.dets.values()].filter(d => !d.ended && d.box.detected !== false && audible(d)).sort((a, b) => b.box.t0 - a.box.t0);
     $("#liveList").replaceChildren(...ds.map(d => {
       const b = d.box;
       return rowFor({ key: detKey(d), f: (b.fmin + b.fmax) / 2, t: clockTime(b.t0), conf: b.conf, tx: S.tx.get(b.id), live: true,

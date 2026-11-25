@@ -132,6 +132,7 @@ class Track:
                 "fmin": fc + min(fr), "fmax": fc + max(fr),
                 "path": [[round(t, 3), fc + f] for t, f in self.path[-200:]],
                 "conf": round(self.conf, 3),
+                "conf_max": round(max([c for _, c in self.conf_hist] or [self.conf]), 3),
                 "scores": {k: round(v, 3) for k, v in self.scores.items()},
                 "info": self.info, "wavs": list(self.wavs), "clips": list(self.clips), "detected": self.detected,
                 "audio_t0": self.audio_t0 if self.audio_t0 is not None else self.t0}
