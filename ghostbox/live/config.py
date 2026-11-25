@@ -101,8 +101,9 @@ DEFAULT = {
     "audio": {"delay_s": 4.0, "bandwidth_hz": 3400},
     "record": {"enabled": True, "dir": "recordings", "save_iq": True, "max_s": 60.0,
                "max_mb": 2000},                 # ring buffer: oldest recordings deleted beyond this
-    "iq_ring": {"enabled": True, "dir": "iq_ring", "max_gb": 4.0, "segment_s": 10,
+    "iq_ring": {"enabled": False, "dir": "iq_ring", "max_gb": 4.0, "segment_s": 10,
                 "record_replays": False},       # continuous raw IQ, oldest segments deleted beyond max_gb
+    "storage": {"min_free_gb": 10.0},           # disk guard: below this, trim the IQ ring, then pause writing
     "display": {"width": 1200, "dyn_range_db": 60.0, "history_min": 20},
     "whisper": {
         "enabled": True,

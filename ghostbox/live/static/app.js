@@ -547,6 +547,12 @@ async function buildSDR() {
   const ppm = num(sdr.ppm ?? 0, 1), bin = el("select", { class: "sel" }, ...[62.5, 125, 250, 500].map(b => el("option", { value: b }, b + " Hz")));
   bin.value = c.analysis.bin_hz;
   const apply = async (p) => { await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) }); await fetch("/api/restart", { method: "POST" }); };
+  const usage = el("div", { class: "note mono", style: "margin-top:0" }, "measuring…");
+  fetch("/api/storage").then(r => r.json()).then(u => {
+    const gb = b => (b / 1e9).toFixed(b < 1e9 ? 2 : 1) + " GB";
+    usage.textContent = `IQ ring ${gb(u.iq_ring)} / ${c.iq_ring.max_gb} GB · recordings ${gb(u.recordings)} · captures ${gb(u.captures)} · disk free ${gb(u.free)}${u.paused ? " · WRITING PAUSED (low disk)" : ""}`;
+    if (u.paused) usage.style.color = "var(--bad)";
+  });
   const themeSel = el("select", { class: "sel" }, ...THEMES.map(([k, l]) => el("option", { value: k }, l)));
   themeSel.value = lsGet("gb_theme", "midnight"); themeSel.addEventListener("change", () => setTheme(themeSel.value));
   root.append(
@@ -563,12 +569,15 @@ async function buildSDR() {
     rowW("RTL-SDR ppm correction", ppm),
     rowW("Bin width", bin),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { ppm: +ppm.value }, analysis: { bin_hz: +bin.value } }) }, "Apply")),
-    el("h2", {}, "Storage (ring buffers)"),
+    el("h2", {}, "Storage"),
+    usage,
     el("div", { class: "row wide" }, el("label", {}, "Record raw IQ continuously"), toggle(c.iq_ring.enabled, v => patch({ iq_ring: { enabled: v } }))),
     slider("IQ ring size", ["iq_ring", "max_gb"], 0.5, 100, 0.5, v => v + " GB"),
+    el("div", { class: "row wide" }, el("label", {}, "Keep a small IQ clip with each recording"), toggle(c.record.save_iq, v => patch({ record: { save_iq: v } }))),
     slider("Recordings size", ["record", "max_mb"], 100, 20000, 100, v => (v >= 1000 ? (v / 1000).toFixed(1) + " GB" : v + " MB")),
-    slider("Waterfall history", ["display", "history_min"], 2, 60, 1, v => v + " min"),
-    el("div", { class: "note" }, "When a ring is full the oldest files are deleted. At 4 MS/s raw IQ is 8 MB/s (4 GB ≈ 8 min)."));
+    slider("Always keep free on disk", ["storage", "min_free_gb"], 1, 100, 1, v => v + " GB"),
+    slider("Waterfall history (memory)", ["display", "history_min"], 2, 60, 1, v => v + " min"),
+    el("div", { class: "note" }, `Rings delete their oldest files when full. Raw IQ is 2 bytes per sample: ${(2 * sdr.sample_rate / 1e6).toFixed(0)} MB/s at the current rate, so ${c.iq_ring.max_gb} GB holds about ${Math.round(c.iq_ring.max_gb * 1e9 / (2 * sdr.sample_rate))} s. If free disk space drops below the limit, the IQ ring is trimmed further and then all writing pauses (detection keeps running).`));
 }
 
 // ---------------- waterfall toolbar ----------------
@@ -616,7 +625,9 @@ function setStatus(s) {
   const w = s.whisper || {};
   const behind = ok && s.load > 1;
   st.className = ok && !behind ? "" : "bad";
-  st.textContent = ok ? `CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: lower the sample rate or narrow the analysis range" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue ? ` · transcribing ${w.queue}` : ""}${s.error ? " · " + s.error : ""}`
+  const paused = ok && s.storage && s.storage.paused;
+  if (paused) st.className = "bad";
+  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: lower the sample rate or narrow the analysis range" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue ? ` · transcribing ${w.queue}` : ""}${s.error ? " · " + s.error : ""}`
     : `${s.state}${s.error ? ": " + s.error : ""}`;
   st.title = st.textContent;
 }

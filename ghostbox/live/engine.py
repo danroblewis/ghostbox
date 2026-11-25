@@ -17,6 +17,7 @@ waterfall.
 import base64
 import collections
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
@@ -142,6 +143,7 @@ class Engine:
         self.box_hist = []                          # finished detections still inside the history window
         self.iq_file, self.iq_seg_t0 = None, None
         self._last_prune = 0.0
+        self.storage = {"paused": False, "free_gb": None}   # disk guard state
         self.chains = {}                            # hop chain id -> finished member clips
         self.transcriber = Transcriber(config, emit)
         self.pool = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
@@ -253,6 +255,7 @@ class Engine:
                                "fc": self.fc, "t": self.n_samples / self.fs, "load": round(load, 2),
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
                                "tracks": len(self.tracks), "vad": stage2.vad_available(),
+                               "storage": self.storage,
                                "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
                                            "queue": self.transcriber.q.qsize()}}
                 self.emit({"type": "status", **self.status})
@@ -274,7 +277,7 @@ class Engine:
         t_start = self.n_samples / self.fs
         self.n_samples += n
         self._write_iq(x, t_start, cfg)
-        if time.time() - self._last_prune > 30:
+        if time.time() - self._last_prune > 5:
             self._last_prune = time.time()
             self._prune(cfg)
         x = x - x.mean()
@@ -534,6 +537,8 @@ class Engine:
     # ---------------- recordings ----------------
     def _finish(self, tr, cfg, final):
         rec = cfg["record"]
+        if self.storage["paused"]:
+            rec = dict(rec, enabled=False)           # disk guard: keep detecting, stop writing
         seg_t0 = tr.seg_start
         audio = [(t, a) for t, a in tr.audio if t >= seg_t0 - 1e-6]
         iq = [(t, a) for t, a in tr.iq if t >= seg_t0 - 1e-6]
@@ -595,11 +600,13 @@ class Engine:
 
     def _write_iq(self, x, t_start, cfg):
         ring = cfg["iq_ring"]
-        if not ring["enabled"] or (cfg["sdr"]["source"] == "file" and not ring["record_replays"]):
+        if (not ring["enabled"] or self.storage["paused"]
+                or (cfg["sdr"]["source"] == "file" and not ring["record_replays"])):
             self._close_iq()
             return
         if self.iq_file is None or t_start - self.iq_seg_t0 >= ring["segment_s"]:
             self._close_iq()
+            self._prune(cfg)                       # trim on every new segment, so the cap can't overshoot
             d = self.root / ring["dir"]
             d.mkdir(parents=True, exist_ok=True)
             utc = datetime.fromtimestamp(self.t_origin + t_start, timezone.utc)
@@ -621,7 +628,12 @@ class Engine:
         self.iq_file.write(q.tobytes())
 
     def _prune(self, cfg):
-        """Ring-buffer limits: delete the oldest IQ segments / recordings beyond their size caps."""
+        """Ring-buffer limits and disk guard.
+
+        1. Delete the oldest IQ segments / recordings beyond their size caps. The IQ cap reserves room
+           for the segment being written, so ring + current segment never exceeds max_gb.
+        2. If free disk space is below storage.min_free_gb, delete more of the IQ ring (it is a cache);
+           if that isn't enough, pause all writing (IQ ring and recordings) until space comes back."""
         def enforce(d, max_bytes, group):
             if not d.exists():
                 return
@@ -639,6 +651,25 @@ class Engine:
                 for p in ps:
                     total -= p.stat().st_size
                     p.unlink(missing_ok=True)
-        enforce(self.root / cfg["iq_ring"]["dir"], cfg["iq_ring"]["max_gb"] * 1e9, lambda p: p.stem)
+        seg_bytes = 2 * self.fs * cfg["iq_ring"]["segment_s"] if hasattr(self, "fs") else 0
+        iq_dir = self.root / cfg["iq_ring"]["dir"]
+        enforce(iq_dir, max(0.0, cfg["iq_ring"]["max_gb"] * 1e9 - seg_bytes), lambda p: p.stem)
         enforce(self.root / cfg["record"]["dir"], cfg["record"]["max_mb"] * 1e6,
                 lambda p: p.stem.replace("_iq16k", ""))
+        min_free = cfg.get("storage", {}).get("min_free_gb", 10.0) * 1e9
+        free = shutil.disk_usage(self.root).free
+        if free < min_free and iq_dir.exists():
+            for p in sorted((p for p in iq_dir.iterdir() if p.suffix == ".cs8"), key=lambda p: p.name):
+                if free >= min_free + 1e9:
+                    break
+                if self.iq_file and str(p) == self.iq_file.name:
+                    continue
+                size = p.stat().st_size
+                p.unlink(missing_ok=True)
+                p.with_suffix(".json").unlink(missing_ok=True)
+                free += size
+        free = shutil.disk_usage(self.root).free
+        paused = free < min_free
+        if paused and not self.storage["paused"]:
+            self._close_iq()
+        self.storage = {"paused": paused, "free_gb": round(free / 1e9, 1)}

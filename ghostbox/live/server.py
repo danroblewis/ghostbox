@@ -198,6 +198,18 @@ def make_app(args):
             raise web.HTTPNotFound()
         return web.FileResponse(p)
 
+    async def storage(request):
+        import shutil
+
+        def du(path):
+            return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) if path.exists() else 0
+        c = config.get()
+        disk = shutil.disk_usage(ROOT)
+        return web.json_response({
+            "iq_ring": du(ROOT / c["iq_ring"]["dir"]), "recordings": du(ROOT / c["record"]["dir"]),
+            "captures": du(ROOT / "captures"), "free": disk.free, "total": disk.total,
+            "paused": state["engine"].storage.get("paused", False)})
+
     async def capture_files(request):
         out = []
         for sub in ("captures", config.get()["iq_ring"]["dir"]):
@@ -217,6 +229,7 @@ def make_app(args):
     app.router.add_post("/api/restart", post_restart)
     app.router.add_get("/api/recordings", recordings)
     app.router.add_get("/api/captures", capture_files)
+    app.router.add_get("/api/storage", storage)
     app.router.add_get("/rec/{name}", rec_file)
     app.router.add_static("/static", STATIC)
     return app, token
