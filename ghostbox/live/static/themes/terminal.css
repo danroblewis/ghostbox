@@ -1,8 +1,0 @@
-/* Terminal: green phosphor on black, monospace everywhere, square corners. */
-:root{--switchknob:#000;--bg:#000;--surface:#030803;--surface2:#061006;--raise:#0a1a0a;--line:#0f2a0f;--line2:#1a4a1a;
---fg:#7dff7d;--dim:#3fbf3f;--faint:#237a23;--accent:#39ff14;--accent2:#b6ff9e;--good:#39ff14;--bad:#ff3b3b;
---play:#e5ff4d;--link:#b6ff9e;--onaccent:#001a00;--knob:#39ff14;
---sans:"JetBrains Mono",ui-monospace,Menlo,monospace;
---r:0;--rc:0;--rk:0;--rp:0;
---wfbg:#000;--grid:rgba(57,255,20,.09);--gridtext:rgba(125,255,125,.7);--tipbg:rgba(0,0,0,.92)}
-body{text-shadow:0 0 6px rgba(57,255,20,.25)}

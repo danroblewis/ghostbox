@@ -42,23 +42,29 @@ const cv = $("#wf"), ctx = cv.getContext("2d");
 const TH = {};                                          // canvas colours, read from the active theme
 function readTheme() {
   const cs = getComputedStyle(document.documentElement), v = k => cs.getPropertyValue(k).trim();
-  Object.assign(TH, { bg: v("--wfbg") || "#05070a", grid: v("--grid") || "rgba(255,255,255,.07)", text: v("--gridtext") || "#ccc",
-    play: v("--play") || "#ffcc4d", link: v("--link") || "#6ee7d8", accent: v("--accent") || "#9d8cff", tip: v("--tipbg") || "rgba(0,0,0,.8)",
-    mono: v("--mono") || "ui-monospace,monospace", sans: v("--sans") || "system-ui,sans-serif" });
+  Object.assign(TH, { bg: v("--wf-bg") || "#0c0d0e", grid: v("--wf-grid") || "rgba(255,255,255,.06)", text: v("--wf-label") || "#aaa",
+    mark: v("--mark") || "#e3a33b", accent: v("--accent") || "#ddd", panel: v("--panel") || "#1b1c1e",
+    fg: v("--text") || "#e4e4e2", fg2: v("--text-2") || "#a2a3a3",
+    mono: v("--mono") || "ui-monospace,monospace", sans: v("--font") || "system-ui,sans-serif" });
 }
 readTheme();
-const THEMES = [["midnight", "Midnight"], ["ember", "Ember"], ["terminal", "Terminal"], ["nord", "Nord"], ["paper", "Paper (light)"], ["synthwave", "Synthwave"], ["graphite", "Graphite"]];
+const THEMES = [["instrument", "Instrument (dark)"], ["daylight", "Daylight"], ["nightvision", "Night vision (red)"]];
 function setTheme(name) {
+  if (!THEMES.some(([k]) => k === name)) name = "instrument";
   lsSet("gb_theme", name);
   const link = $("#themeCss"); link.onload = readTheme; link.href = `/static/themes/${name}.css`;
+  // night vision only works if the waterfall is red too; remember the user's map to restore later
+  if (name === "nightvision" && S.cmap !== "red") { lsSet("gb_cmap_day", S.cmap); setCmap("red"); }
+  else if (name !== "nightvision" && S.cmap === "red") setCmap(lsGet("gb_cmap_day", "magma"));
 }
+function setCmap(name) { S.cmap = name; lsSet("gb_cmap", name); $("#cmap").value = name; repaintAll(); }
 
 // ---------------- colour maps ----------------
 const CMAPS = {
   magma: [[0, 4, 4, 16], [0.25, 50, 18, 92], [0.5, 150, 40, 110], [0.75, 245, 110, 60], [1, 252, 250, 180]],
   viridis: [[0, 68, 1, 84], [0.25, 59, 82, 139], [0.5, 33, 145, 140], [0.75, 94, 201, 98], [1, 253, 231, 37]],
-  ice: [[0, 0, 0, 8], [0.35, 10, 40, 120], [0.65, 40, 150, 220], [0.85, 160, 230, 250], [1, 255, 255, 255]],
-  gray: [[0, 0, 0, 0], [1, 255, 255, 255]],
+  gray: [[0, 0, 0, 0], [1, 235, 235, 235]],
+  red: [[0, 0, 0, 0], [0.45, 90, 6, 3], [0.8, 200, 30, 20], [1, 255, 70, 50]],
 };
 function makeLUT() {
   const stops = CMAPS[S.cmap] || CMAPS.magma, base = new Uint8ClampedArray(256 * 4);
@@ -75,6 +81,7 @@ function makeLUT() {
   }
   return out;
 }
+if (!CMAPS[S.cmap]) S.cmap = "magma";                   // e.g. a map from an older version
 let LUT = makeLUT();
 
 // ---------------- waterfall chunks ----------------
@@ -165,26 +172,28 @@ function draw() {
     const x0 = xOf(b.fmin) - pad, x1 = xOf(b.fmax) + pad;
     const playing = d.playing.some(([a, z]) => now >= a && now <= z);
     d.box._rect = [x0 / dpr, y0 / dpr, x1 / dpr, y1 / dpr];
-    const hue = 50 - 50 * Math.min(1, Math.max(0, (b.conf - 0.3) / 0.6));
+    const k = Math.min(1, Math.max(0, b.conf));
     ctx.save();
-    if (playing) { ctx.shadowColor = TH.play; ctx.shadowBlur = 22 * dpr; ctx.globalAlpha = 0.22; ctx.fillStyle = TH.play; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.globalAlpha = 1; }
-    ctx.strokeStyle = playing ? TH.play : `hsla(${hue},100%,62%,.95)`;
-    ctx.lineWidth = (playing ? 2.5 : 1.4) * dpr; ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.strokeStyle = TH.mark;
+    if (playing) { ctx.globalAlpha = 0.16; ctx.fillStyle = TH.mark; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); }
+    ctx.globalAlpha = playing ? 1 : 0.35 + 0.65 * k;
+    ctx.lineWidth = (playing ? 2 : 1 + k * 0.6) * dpr; ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
     ctx.restore();
     if (b.path && b.path.length > 1 && b.fmax - b.fmin > 500) {
-      ctx.strokeStyle = `hsla(${hue},100%,75%,.9)`; ctx.lineWidth = 1.5 * dpr; ctx.beginPath();
+      ctx.strokeStyle = TH.mark; ctx.lineWidth = 1.2 * dpr; ctx.beginPath();
       b.path.forEach(([t, f], i) => { const x = xOf(f), y = (top - t) * pps; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
       ctx.stroke();
     }
     const ly = Math.max(14 * dpr, y0 + 11 * dpr);
-    ctx.fillStyle = playing ? TH.play : `hsla(${hue},100%,78%,1)`;
-    ctx.fillText(`${fmtFshort((b.fmin + b.fmax) / 2)} ${(b.conf * 100).toFixed(0)}%`, x1 + 5 * dpr, ly);
+    ctx.fillStyle = TH.mark; ctx.globalAlpha = playing ? 1 : 0.55 + 0.45 * k;
+    ctx.fillText(`${fmtFshort((b.fmin + b.fmax) / 2)}  ${(b.conf * 100).toFixed(0)}%`, x1 + 5 * dpr, ly);
+    ctx.globalAlpha = 1;
     const tx = S.tx.get(b.id);
     if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, x1 + 5 * dpr, ly + 16 * dpr, tx.no_speech_prob > 0.6, playing);
     if (!chains.has(b.chain)) chains.set(b.chain, []);
     chains.get(b.chain).push(b);
   }
-  ctx.save(); ctx.setLineDash([3 * dpr, 4 * dpr]); ctx.strokeStyle = TH.link; ctx.lineWidth = 1.2 * dpr;
+  ctx.save(); ctx.setLineDash([2 * dpr, 4 * dpr]); ctx.strokeStyle = TH.mark; ctx.globalAlpha = 0.6; ctx.lineWidth = dpr;
   for (const list of chains.values()) {
     list.sort((a, b) => a.t0 - b.t0);
     for (let i = 1; i < list.length; i++) {
@@ -196,22 +205,21 @@ function draw() {
   if ($("#caps").checked) for (const [cid, list] of chains) {
     const tx = S.chainTx.get(cid); if (!tx || !tx.text || list.length < 2) continue;
     const b = list[list.length - 1];
-    caption(`⛓ “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 16 * dpr, tx.no_speech_prob > 0.6, false, TH.link);
+    caption(`Chain: “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 16 * dpr, tx.no_speech_prob > 0.6, false);
   }
   // playback line (draggable): the stream time being heard right now
   const yPlay = (top - (now - S.offset - S.delay)) * pps;
   if (yPlay >= -2 && yPlay <= H + 2) {
-    ctx.save(); ctx.strokeStyle = TH.play; ctx.globalAlpha = dragging ? 1 : 0.85; ctx.lineWidth = (dragging ? 2 : 1.3) * dpr;
-    ctx.setLineDash([7 * dpr, 5 * dpr]); ctx.beginPath(); ctx.moveTo(0, yPlay); ctx.lineTo(W, yPlay); ctx.stroke(); ctx.setLineDash([]);
-    const label = `▶ ${S.delay.toFixed(2)} s behind live`; const lw = ctx.measureText(label).width;
-    ctx.globalAlpha = 1; ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(W - lw - 22 * dpr, yPlay - 10 * dpr, lw + 14 * dpr, 20 * dpr);
-    ctx.lineWidth = dpr; ctx.strokeRect(W - lw - 22 * dpr, yPlay - 10 * dpr, lw + 14 * dpr, 20 * dpr);
-    ctx.fillStyle = TH.play; ctx.fillText(label, W - lw - 15 * dpr, yPlay + 4 * dpr);
+    ctx.save(); ctx.strokeStyle = TH.mark; ctx.globalAlpha = dragging ? 1 : 0.8; ctx.lineWidth = (dragging ? 1.5 : 1) * dpr;
+    ctx.setLineDash([6 * dpr, 4 * dpr]); ctx.beginPath(); ctx.moveTo(0, yPlay); ctx.lineTo(W, yPlay); ctx.stroke(); ctx.setLineDash([]);
+    const label = `Playback  −${S.delay.toFixed(2)} s`; const lw = ctx.measureText(label).width;
+    ctx.globalAlpha = 1; ctx.fillStyle = TH.bg; ctx.fillRect(W - lw - 18 * dpr, yPlay - 9 * dpr, lw + 12 * dpr, 18 * dpr);
+    ctx.fillStyle = TH.mark; ctx.fillText(label, W - lw - 12 * dpr, yPlay + 4 * dpr);
     ctx.restore();
   }
   if (!S.follow) {
-    ctx.fillStyle = TH.accent;
-    ctx.fillText(`⏸ history · ${(liveTop() - top).toFixed(0)} s before live`, 6 * dpr, H - 26 * dpr);
+    ctx.fillStyle = TH.text;
+    ctx.fillText(`History — ${(liveTop() - top).toFixed(0)} s before live`, 6 * dpr, H - 26 * dpr);
   }
   ensureHistory(top, H / dpr);
   if (Math.random() < 0.01) evictChunks(top);
@@ -221,11 +229,11 @@ function caption(text, x, y, doubtful, playing, color) {
   const dpr = devicePixelRatio;
   if (text.length > 90) text = text.slice(0, 88) + "…”";
   ctx.save();
-  ctx.font = `italic ${(playing ? 13 : 12) * dpr}px ${TH.sans}`;
+  ctx.font = `${12 * dpr}px ${TH.sans}`;
   const w = ctx.measureText(text).width;
   if (x + w > cv.width - 6 * dpr) x = Math.max(4 * dpr, cv.width - w - 10 * dpr);
-  ctx.fillStyle = "rgba(5,7,10,.72)"; ctx.fillRect(x - 4 * dpr, y - 13 * dpr, w + 8 * dpr, 18 * dpr);
-  ctx.fillStyle = doubtful ? "rgba(170,178,190,.75)" : (color || (playing ? TH.play : "#fff"));
+  ctx.globalAlpha = 0.85; ctx.fillStyle = TH.bg; ctx.fillRect(x - 4 * dpr, y - 13 * dpr, w + 8 * dpr, 18 * dpr); ctx.globalAlpha = 1;
+  ctx.fillStyle = doubtful ? TH.text : (color || (playing ? TH.mark : TH.fg));
   ctx.fillText(text, x, y);
   ctx.restore();
 }
@@ -290,11 +298,11 @@ let AC = null, master = null;
 function ensureAudio() {
   if (!AC) { AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.connect(AC.destination); master.gain.value = +$("#vol").value; }
   AC.resume();
-  const b = $("#audioBtn"); b.textContent = "🔊 Audio on"; b.classList.remove("primary"); b.classList.add("on");
+  const b = $("#audioBtn"); b.textContent = "Audio on"; b.classList.remove("primary"); b.classList.add("on");
 }
 $("#audioBtn").addEventListener("click", () => {
   if (AC && AC.state === "running" && $("#audioBtn").classList.contains("on")) {
-    AC.suspend(); const b = $("#audioBtn"); b.textContent = "🔇 Muted"; b.classList.remove("on"); return;
+    AC.suspend(); const b = $("#audioBtn"); b.textContent = "Muted"; b.classList.remove("on"); return;
   }
   ensureAudio();
 });
@@ -350,17 +358,20 @@ function updateRowProgress() {
 }
 
 // ---------------- detections list (one line each) ----------------
+const ICON_PLAY = '<svg viewBox="0 0 8 8"><path d="M1.5 0.8 7 4 1.5 7.2z"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 8 8"><path d="M1.2 1h2v6h-2zM4.8 1h2v6h-2z"/></svg>';
 function rowFor({ key, f, t, conf, tx, pending, live, onJump, onPlay }) {
   const playing = S.playing && S.playing.key === key;
-  const hue = 50 - 50 * Math.min(1, Math.max(0, (conf - 0.3) / 0.6));
   let text = "", cls = "x none";
-  if (tx) { if (tx.text && tx.no_speech_prob <= 0.6) { text = `“${tx.text}”`; cls = "x"; } else if (tx.text) { text = `“${tx.text}”`; cls = "x doubt"; } else text = "no words"; }
-  else if (pending) text = "transcribing…";
-  const row = el("div", { class: "det", "data-key": key, title: `confidence ${(conf * 100).toFixed(0)}%`, onclick: onJump },
-    el("button", { class: "play" + (playing ? " on" : ""), title: playing ? "pause" : "play", onclick: e => { e.stopPropagation(); onPlay(); } }, playing ? "❚❚" : "▶"),
-    el("span", { class: "f" }, fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
-    live ? el("i", { class: "live", title: "live" }) : null);
-  row.style.setProperty("--h", hue); row.style.setProperty("--a", (0.05 + 0.4 * Math.max(0, Math.min(1, conf))).toFixed(3));
+  if (tx) { if (tx.text && tx.no_speech_prob <= 0.6) { text = `“${tx.text}”`; cls = "x"; } else if (tx.text) { text = `“${tx.text}”`; cls = "x doubt"; } else text = "No words"; }
+  else if (pending) text = "Transcribing…";
+  const btn = el("button", { class: "play" + (playing ? " on" : ""), title: playing ? "Pause" : "Play", onclick: e => { e.stopPropagation(); onPlay(); } });
+  btn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
+  const row = el("div", { class: "det", "data-key": key, title: live ? "Live — click to show on the waterfall" : "Click to show on the waterfall", onclick: onJump },
+    btn, el("span", { class: "f" }, fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
+    el("span", { class: "c" }, (conf * 100).toFixed(0)),
+    live ? el("i", { class: "live", title: "Live" }) : null);
+  row.style.setProperty("--a", (0.15 + 0.85 * Math.max(0, Math.min(1, conf))).toFixed(3));
   if (!playing) row.style.setProperty("--p", "0%");
   return row;
 }
@@ -386,7 +397,7 @@ function renderList() {
         onJump: () => { if (sameSession) jumpTo(r.stream_t1); }, onPlay: () => togglePlay(recKey(r), null, r) }));
     }
     list.replaceChildren(...rows);
-    $("#detCount").textContent = `${liveDets.length ? liveDets.length + " live · " : ""}${S.recs.length} saved`;
+    $("#detCount").textContent = `${liveDets.length ? liveDets.length + " live, " : ""}${S.recs.length} saved`;
   }, 200);
 }
 async function loadRecs() { S.recs = await (await fetch("/api/recordings")).json(); renderList(); }
@@ -554,7 +565,7 @@ async function buildSDR() {
     if (u.paused) usage.style.color = "var(--bad)";
   });
   const themeSel = el("select", { class: "sel" }, ...THEMES.map(([k, l]) => el("option", { value: k }, l)));
-  themeSel.value = lsGet("gb_theme", "midnight"); themeSel.addEventListener("change", () => setTheme(themeSel.value));
+  { const t = lsGet("gb_theme", "instrument"); themeSel.value = THEMES.some(([k]) => k === t) ? t : "instrument"; } themeSel.addEventListener("change", () => setTheme(themeSel.value));
   root.append(
     el("h2", {}, "Appearance"),
     rowW("Theme (this browser)", themeSel),
@@ -595,7 +606,7 @@ $("#sreset").addEventListener("click", () => {
   $("#smin").value = S.smin; $("#smax").value = S.smax; fillRange($("#smin")); fillRange($("#smax")); saveScale(); repaintAll();
 });
 $("#cmap").value = S.cmap;
-$("#cmap").addEventListener("change", e => { S.cmap = e.target.value; lsSet("gb_cmap", S.cmap); repaintAll(); });
+$("#cmap").addEventListener("change", e => setCmap(e.target.value));
 $("#caps").checked = lsGet("gb_caps", "1") === "1";
 $("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
 let WS = null;

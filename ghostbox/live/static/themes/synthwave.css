@@ -1,7 +1,0 @@
-/* Synthwave: deep purple night, hot pink and cyan, pill-shaped everything. */
-:root{--bg:#120624;--surface:#1a0b33;--surface2:#241045;--raise:#2f1657;--line:#3a1d6b;--line2:#552a96;
---fg:#fbe9ff;--dim:#c9a7e8;--faint:#8462ad;--accent:#ff3cac;--accent2:#2de2e6;--good:#2de2e6;--bad:#ff5e5e;
---play:#ffe66d;--link:#2de2e6;--onaccent:#200016;--knob:#fff;
---r:18px;--rc:999px;--rk:50%;--rp:999px;
---wfbg:#0b0318;--grid:rgba(255,60,172,.10);--gridtext:rgba(251,233,255,.65);--tipbg:rgba(18,6,36,.92)}
-#top{background:linear-gradient(90deg,#1a0b33,#2a0d3f 60%,#1a0b33)}

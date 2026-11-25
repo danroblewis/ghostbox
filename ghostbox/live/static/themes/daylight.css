@@ -1,0 +1,10 @@
+/* Daylight — for bright rooms and daytime use. Paper-white panels, deep blue accent.
+   The waterfall stays dark: it is a measurement display, not chrome. */
+:root{
+  --bg:#f3f3f1; --panel:#ffffff; --field:#ffffff; --hover:rgba(0,0,0,.025);
+  --line:#e2e2df; --line-strong:#c9c9c5;
+  --text:#1c1d1f; --text-2:#55585c; --text-3:#8b8e92;
+  --accent:#1f56b3; --accent-text:#ffffff;
+  --mark:#c27a12; --alarm:#c4302b; --ok:#2f7d32;
+  --wf-bg:#0e0f10; --wf-grid:rgba(255,255,255,.07); --wf-label:rgba(240,240,238,.65);
+}

@@ -1,0 +1,10 @@
+/* Night vision — red only, dim, for dark investigations: red light preserves dark adaptation
+   (the same reason astronomers use red displays). Pairs with the Red colour map. */
+:root{
+  --bg:#000000; --panel:#070000; --field:#0d0101; --hover:rgba(255,40,30,.04);
+  --line:#2a0604; --line-strong:#420a07;
+  --text:#d0281d; --text-2:#93190f; --text-3:#5e0f09;
+  --accent:#d0281d; --accent-text:#000000;
+  --mark:#ff3a2a; --alarm:#ff3a2a; --ok:#93190f;
+  --wf-bg:#000000; --wf-grid:rgba(208,40,29,.12); --wf-label:rgba(208,40,29,.75);
+}

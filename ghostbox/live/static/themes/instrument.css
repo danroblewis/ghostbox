@@ -1,0 +1,9 @@
+/* Instrument — default. Neutral graphite like bench test equipment; amber marker for detections. */
+:root{
+  --bg:#141516; --panel:#1b1c1e; --field:#232427; --hover:rgba(255,255,255,.03);
+  --line:#2a2c2f; --line-strong:#3a3d41;
+  --text:#e4e4e2; --text-2:#a2a3a3; --text-3:#6d6f71;
+  --accent:#d8dad6; --accent-text:#141516;
+  --mark:#e3a33b; --alarm:#e5534b; --ok:#57ab5a;
+  --wf-bg:#0c0d0e; --wf-grid:rgba(255,255,255,.06); --wf-label:rgba(228,228,226,.55);
+}
