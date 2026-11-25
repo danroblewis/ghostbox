@@ -57,32 +57,44 @@ need the DVB kernel driver blacklisted (`dvb_usb_rtl28xxu`) and the udev rules s
 
 ## Install
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+Requires [uv](https://docs.astral.sh/uv/) (it fetches a suitable Python itself) and the receiver
+tools above. One command installs the `ghostbox` command with everything the default settings use,
+including the ML voice detector and Whisper speech recognition:
+
+```sh
+uv tool install git+https://github.com/danroblewis/spiritbox-sdr.git
+```
+
+The first install downloads about 140 MB (mostly PyTorch) and takes about 900 MB on disk; Whisper's
+speech model (about 140 MB for the default) downloads the first time something is transcribed. Then:
+
+```sh
+ghostbox --list-devices                       # what's connected
+ghostbox --device hackrf --open               # start, and open the page in your browser
+```
+
+Data (settings, recordings, the IQ recording, surveys) goes in the folder you run it from, or the
+one given with `--data-dir`. To update later: `uv tool upgrade ghostbox`; to remove: `uv tool uninstall ghostbox`.
+
+Optional extra speech engines:
+
+| extra | adds | for |
+|---|---|---|
+| `transformers` | transformers | Moonshine and wav2vec2 transcription |
+| `vosk` | vosk | Vosk transcription |
+| `plots` | matplotlib | the offline analysis script `ghostbox.analyze` |
+| `all` | all of the above | |
+
+e.g. `uv tool install "ghostbox[all] @ git+https://github.com/danroblewis/spiritbox-sdr.git"`.
+
+### From a clone (for development)
 
 ```sh
 git clone https://github.com/danroblewis/spiritbox-sdr.git
 cd spiritbox-sdr
-uv sync --extra recommended
+uv sync            # add --all-extras for the optional engines
+uv run ghostbox --open
 ```
-
-Extras (all optional; the detector and web app run on numpy, scipy and aiohttp alone):
-
-| extra | adds | used for |
-|---|---|---|
-| `vad` | torch, silero-vad | the ML voice detector check, calibration, "Tune to this detection" |
-| `whisper` | faster-whisper | transcription with Whisper (default engine; surveys use Whisper tiny) |
-| `transformers` | torch, transformers | Moonshine and wav2vec2 transcription |
-| `vosk` | vosk | Vosk transcription |
-| `plots` | matplotlib | the offline analysis script `ghostbox.analyze` |
-| `recommended` | `vad` + `whisper` | what the default settings use |
-| `all` | everything above | |
-
-`uv sync --all-extras` installs everything. Speech models download on first use. Without the
-`vad` extra the ML voice check scores nothing and calibration is much weaker; without a
-transcription engine, transcripts are simply missing.
-
-Alternatively, without cloning: `uv tool install "ghostbox[recommended] @ git+https://github.com/danroblewis/spiritbox-sdr"`;
-then choose where data goes with `--data-dir` (see below).
 
 ## Quick start
 

@@ -1520,20 +1520,22 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "faster-whisper" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "silero-vad" },
+    { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
 [package.optional-dependencies]
 all = [
-    { name = "faster-whisper" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "silero-vad" },
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "transformers", version = "5.20.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1544,46 +1546,31 @@ plots = [
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-recommended = [
-    { name = "faster-whisper" },
-    { name = "silero-vad" },
-    { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
 transformers = [
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "transformers", version = "5.20.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "transformers", version = "5.24.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-vad = [
-    { name = "silero-vad" },
-    { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
 vosk = [
     { name = "vosk" },
-]
-whisper = [
-    { name = "faster-whisper" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
-    { name = "faster-whisper", marker = "extra == 'whisper'", specifier = ">=1.0" },
-    { name = "ghostbox", extras = ["vad", "whisper"], marker = "extra == 'recommended'" },
-    { name = "ghostbox", extras = ["vad", "whisper", "transformers", "vosk", "plots"], marker = "extra == 'all'" },
+    { name = "faster-whisper", specifier = ">=1.0" },
+    { name = "ghostbox", extras = ["transformers", "vosk", "plots"], marker = "extra == 'all'" },
     { name = "matplotlib", marker = "extra == 'plots'", specifier = ">=3.7" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "scipy", specifier = ">=1.11" },
-    { name = "silero-vad", marker = "extra == 'vad'", specifier = ">=5.1" },
+    { name = "silero-vad", specifier = ">=5.1" },
+    { name = "torch", specifier = ">=2.1" },
     { name = "torch", marker = "extra == 'transformers'", specifier = ">=2.1" },
-    { name = "torch", marker = "extra == 'vad'", specifier = ">=2.1" },
     { name = "transformers", marker = "extra == 'transformers'", specifier = ">=4.48" },
     { name = "vosk", marker = "extra == 'vosk'", specifier = ">=0.3.44,!=0.3.45" },
 ]
-provides-extras = ["vad", "whisper", "transformers", "vosk", "plots", "recommended", "all"]
+provides-extras = ["transformers", "vosk", "plots", "vad", "whisper", "recommended", "all"]
 
 [[package]]
 name = "h11"

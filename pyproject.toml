@@ -18,28 +18,30 @@ classifiers = [
     "Topic :: Communications :: Ham Radio",
     "Topic :: Multimedia :: Sound/Audio :: Analysis",
 ]
-# The detector, demodulators and web server need only these. The ML voice detector and
-# speech recognition are optional extras (imported lazily; the app runs without them).
+# Everything the default settings use: the detector and web server (numpy, scipy, aiohttp), the
+# ML voice detector (torch + silero-vad: the voice check, calibration, "Tune to this detection")
+# and Whisper transcription (faster-whisper). Other speech engines are extras.
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "aiohttp>=3.9",
+    "torch>=2.1",
+    "silero-vad>=5.1",
+    "faster-whisper>=1.0",
 ]
 
 [project.optional-dependencies]
-# Silero voice-activity detector: the "ML voice detector" check, calibration and audio tuning.
-vad = ["torch>=2.1", "silero-vad>=5.1"]
-# Whisper transcription (the default speech-recognition engine; surveys use Whisper tiny).
-whisper = ["faster-whisper>=1.0"]
 # Moonshine and wav2vec2 speech recognition.
 transformers = ["torch>=2.1", "transformers>=4.48"]
 # Vosk speech recognition.
 vosk = ["vosk>=0.3.44,!=0.3.45"]   # 0.3.45 has no macOS wheels
 # Plots for the offline analysis script (ghostbox.analyze).
 plots = ["matplotlib>=3.7"]
-# What the default settings use: voice detector + Whisper.
-recommended = ["ghostbox[vad,whisper]"]
-all = ["ghostbox[vad,whisper,transformers,vosk,plots]"]
+# Kept so older install commands still work (these are now standard dependencies).
+vad = []
+whisper = []
+recommended = []
+all = ["ghostbox[transformers,vosk,plots]"]
 
 [project.scripts]
 ghostbox = "ghostbox.cli:main"
