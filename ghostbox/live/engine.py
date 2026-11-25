@@ -469,5 +469,7 @@ class Engine:
             "sdr": cfg["sdr"], "checks": cfg["checks"], "detect": cfg["detect"],
             "files": files,
         }
+        if cfg["sdr"]["source"] == "file":
+            meta["demo"] = f"Replay of {Path(cfg['sdr']['file']['path']).name} (not a live detection)"
         (out / f"{stem}.json").write_text(json.dumps(meta, indent=1, default=float))
         self.emit({"type": "recording", "meta": meta})
