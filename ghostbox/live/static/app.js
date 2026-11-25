@@ -1596,19 +1596,56 @@ function dtTick() {
 // A/B: the same clip re-rendered from its IQ with another demodulator, noise reduction or voice band.
 function abControls(base, clip) {
   const au = S.cfg.audio;
-  DT.ab = { demod: "rec", denoise: au.denoise !== false, band: au.voice_band !== false };
+  DT.ab = { demod: "rec", denoise: au.denoise !== false, band: au.voice_band !== false }; DT.tunedUrl = null;
   const seg = (items, key) => el("div", { class: "abseg" }, ...items.map(([v, l]) => el("button", { class: "btn" + (DT.ab[key] === v ? " on" : ""), "data-v": String(v),
     onclick: e => { DT.ab[key] = v; e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
   const note = el("span", { id: "abNote", class: "t3", style: "font-size:12px" });
-  return el("div", { class: "abrow" },
+  const tuneOut = el("div", { id: "tuneOut", class: "tuneout" });
+  const tuneBtn = el("button", { class: "btn primary", onclick: () => tuneThis(base, clip, tuneBtn) }, "Tune to this detection");
+  return el("div", {}, el("div", { class: "abrow" },
     el("span", { class: "t2" }, "Listen as"),
     seg([["rec", "Recorded"], ["auto", "Auto"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["suppressed", "No carrier"], ["sync_sb", "Sync sideband"]], "demod"),
     el("span", { class: "t2" }, "Noise reduction"), seg([[true, "On"], [false, "Off"]], "denoise"),
-    el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note);
+    el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note),
+    el("div", { style: "display:flex;gap:10px;align-items:center;margin-top:10px" }, tuneBtn,
+      el("span", { class: "t3", style: "font-size:12px" }, "Finds the demodulation and filtering that make this one signal most voice-like.")),
+    tuneOut);
+}
+async function tuneThis(base, clip, btn) {
+  const out = $("#tuneOut"); btn.disabled = true; btn.textContent = "Tuning…";
+  out.replaceChildren(el("div", { class: "note" }, "Trying detectors, carrier fine-tuning, voice bands and noise reduction on this clip…"));
+  try {
+    const q = Object.fromEntries(new URLSearchParams(base));
+    const r = await fetch("/api/tune_audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(q) });
+    if (!r.ok) throw new Error(await r.text());
+    const res = await r.json(), b = res.best, pct = v => v < 0.01 ? "under 1%" : (v * 100).toFixed(v > 0.99 ? 2 : 0) + "%";
+    const desc = [b.label + (b.mode && b.offset ? `, carrier ${b.offset > 0 ? "+" : ""}${Math.round(b.offset)} Hz` : ""),
+      b.lo ? `voice band ${b.lo}–${b.hi} Hz` : "no band filter",
+      b.denoise ? `noise reduction ${b.strength <= 0.5 ? "gentle" : b.strength >= 1.5 ? "strong" : "normal"}` : "no noise reduction"].join(" · ");
+    DT.tunedUrl = `/api/render?${base}&demod=${b.demod}&mode=${b.mode}&offset=${b.offset}&band=${b.lo ? 1 : 0}` + (b.lo ? `&lo=${b.lo}&hi=${b.hi}` : "")
+      + `&denoise=${b.denoise ? 1 : 0}&strength=${b.strength}&floor=${b.floor}`;
+    DT.tunedApply = res.apply;
+    const onlyHere = b.mode !== 0;
+    out.replaceChildren(
+      el("div", { class: "tunebest" }, el("strong", {}, desc)),
+      el("div", { class: "note", style: "margin:2px 0 8px" }, `Voice score ${pct(res.score)} (your current settings: ${pct(res.baseline)}).`
+        + (res.score < 0.05 ? " Nothing here sounds like speech to the voice detector under any setting, so this choice is close to arbitrary." : "")
+        + (onlyHere ? ` It sounds best as ${b.mode > 0 ? "upper" : "lower"} sideband with its carrier fine-tuned, which only applies to this signal; "Use these settings" takes the filtering.` : "")),
+      el("div", { style: "display:flex;gap:8px" },
+        el("button", { class: "btn", onclick: () => { DT.ab.demod = "tuned"; document.querySelectorAll(".abseg button").forEach(x => x.classList.toggle("on", x.dataset.v === "tuned")); abLoad(base, clip); } }, "Listen"),
+        el("button", { class: "btn", onclick: e => { patch({ audio: DT.tunedApply }, 50); e.target.textContent = "Saved as your playback settings"; e.target.disabled = true; } }, "Use these settings")),
+      el("details", { style: "margin-top:8px" }, el("summary", { class: "t2" }, `All ${res.trials.length} trials`),
+        ...res.trials.map(t => el("div", { class: "kv sc" }, el("span", { class: "t2" }, `${t.stage}: ${t.label}`),
+          el("span", { class: "bar" }, el("i", { style: `width:${Math.round(t.score * 100)}%` })), el("span", { class: "num" }, (t.score * 100).toFixed(1))))));
+    const seg_ = document.querySelector(".abseg");                    // add "Tuned" to the A/B row
+    if (seg_ && !seg_.querySelector('[data-v="tuned"]')) seg_.append(el("button", { class: "btn", "data-v": "tuned", onclick: e => { DT.ab.demod = "tuned"; seg_.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === e.target)); abLoad(base, clip); } }, "Tuned"));
+  } catch (e) { out.replaceChildren(el("div", { class: "err" }, String(e.message || e).slice(0, 160))); }
+  btn.disabled = false; btn.textContent = "Tune again";
 }
 async function abLoad(base, clip) {
   const a = DT.ab, note = $("#abNote");
-  const url = a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false) && clip ? clip
+  const url = a.demod === "tuned" && DT.tunedUrl ? DT.tunedUrl
+    : a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false) && clip ? clip
     : `/api/render?${base}&demod=${a.demod === "rec" ? "" : a.demod}&denoise=${a.denoise ? 1 : 0}&band=${a.band ? 1 : 0}`;
   if (note) note.textContent = "Rendering…";
   const gen = DT.abGen = (DT.abGen || 0) + 1;

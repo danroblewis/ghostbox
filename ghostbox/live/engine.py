@@ -110,9 +110,8 @@ def iq_cut_wav(segs, t0, t1, f_center, rate=48000):
     return buf.getvalue(), start
 
 
-def render_segments(segs, t0, t1, pts, au, mode=0):
-    """Playback audio (int16, 16 kHz) of [t0, t1] from IQ-ring segments, demodulated and processed
-    exactly like live playback with audio settings `au`. pts: [[time, absolute frequency], ...]."""
+def load_iq(segs, t0, t1):
+    """Raw IQ of [t0, t1] from IQ-ring segments: (x complex64, start time, fs, fc) or None."""
     if not segs:
         return None
     parts, start, fs, fc = [], None, segs[0][0]["fs"], segs[0][0]["fc"]
@@ -125,16 +124,38 @@ def render_segments(segs, t0, t1, pts, au, mode=0):
             parts.append(np.asarray(raw[2 * a:2 * b]))
     if not parts:
         return None
-    x = _to_complex(np.concatenate(parts), True)
+    return _to_complex(np.concatenate(parts), True), start, fs, fc
+
+
+def detect_clip(iq, au, mode=0):
+    """Demodulated audio (before playback processing) from 16 kHz baseband IQ."""
+    if mode != 0:
+        s = np.convolve(iq, _ssb_taps(channel_hz(au), int(np.sign(mode))), mode="same")
+        env = (2 * s.real).astype(np.float32)
+    else:
+        det = detector_for(au, 0)
+        env = det.process(iq) if det is not None else np.abs(iq).astype(np.float32)
+    hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
+    return sosfilt(hp, env - env[:200].mean()).astype(np.float32)
+
+
+def baseband(loaded, pts, au, offset_hz=0.0):
+    """16 kHz complex baseband following the detection's frequency path (+ a fine offset)."""
+    x, start, fs, fc = loaded
     pts = np.array(pts, float)
     ts = start + np.arange(len(x)) / fs
-    f_off = pts[np.clip(np.searchsorted(pts[:, 0], ts, side="right") - 1, 0, len(pts) - 1), 1] - fc
-    iq, env = demod(x, fs, f_off, channel_hz(au), mode)
-    det = detector_for(au, mode)
-    if det is not None:
-        env = det.process(iq)
-    hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
-    audio = sosfilt(hp, env - env[:200].mean())
+    f_off = pts[np.clip(np.searchsorted(pts[:, 0], ts, side="right") - 1, 0, len(pts) - 1), 1] - fc + offset_hz
+    iq, _ = demod(x, fs, f_off, channel_hz(au), 0)
+    return iq
+
+
+def render_segments(segs, t0, t1, pts, au, mode=0, offset_hz=0.0):
+    """Playback audio (int16, 16 kHz) of [t0, t1] from IQ-ring segments, demodulated and processed
+    exactly like live playback with audio settings `au`. pts: [[time, absolute frequency], ...]."""
+    loaded = load_iq(segs, t0, t1)
+    if loaded is None:
+        return None
+    audio = detect_clip(baseband(loaded, pts, au, offset_hz), au, mode)
     audio = np.clip(render_clip(audio, au), -1, 1)
     return (audio * 32767).astype(np.int16)
 

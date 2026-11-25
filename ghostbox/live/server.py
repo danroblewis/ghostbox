@@ -285,6 +285,44 @@ def make_app(args):
             raise web.HTTPNotFound(text="this sample's IQ is no longer in the IQ ring")
         return segs, segs[0][0]["t0"], st, t
 
+    async def clip_source(q):
+        """(segments, t0, t1, path points, mode) of a detection (?key=) or survey sample (?survey=&track=)."""
+        au, eng, loop = config.get()["audio"], state["engine"], asyncio.get_running_loop()
+        pre, post = au.get("preroll_s", 0.5), au.get("postroll_s", 0.5)
+        if q.get("survey"):
+            if not SAFE.match(q["survey"]):
+                raise web.HTTPNotFound()
+            segs, base, st, t = survey_segments(q["survey"], int(q.get("track", -1)))
+            t0, t1 = base + t["iq_t"][0] - pre, base + t["iq_t"][1] + post
+            return segs, t0, t1, [[base + r, f] for r, f in t.get("path") or []] or [[t0, t["f"]]], t.get("mode", 0)
+        meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
+        if meta is None:
+            raise web.HTTPNotFound()
+        t0, t1 = meta["stream_t0"] - pre, meta["stream_t1"] + post
+        segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
+        if not segs:
+            raise web.HTTPNotFound(text="this detection's IQ is no longer in the IQ ring")
+        return segs, t0, t1, [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]], meta.get("mode", 0)
+
+    async def tune_audio(request):
+        """Search demodulation + filtering for this one detection (see audiotune)."""
+        from .audiotune import as_audio_settings, tune
+        from .engine import load_iq
+        q = dict(await request.json())
+        segs, t0, t1, pts, mode = await clip_source(q)
+        loop = asyncio.get_running_loop()
+
+        def job():
+            loaded = load_iq(segs, t0, t1)
+            if loaded is None:
+                return None
+            return tune(loaded, pts, config.get()["audio"], mode)
+        res = await loop.run_in_executor(None, job)
+        if res is None:
+            raise web.HTTPNotFound(text="no IQ for this detection")
+        res["apply"] = as_audio_settings(res["best"])
+        return web.json_response(res, dumps=lambda o: json.dumps(o, default=float))
+
     async def render(request):
         """A detection / survey sample re-rendered from the IQ ring with other audio settings, for A/B:
         ?demod=envelope|sync|sync_sb|auto &denoise=0|1 &band=0|1 (anything left out: as configured)."""
@@ -295,6 +333,10 @@ def make_app(args):
         for k, key in (("denoise", "denoise"), ("band", "voice_band")):
             if q.get(k) in ("0", "1"):
                 au[key] = q[k] == "1"
+        for k, key in (("lo", "voice_lo_hz"), ("hi", "voice_hi_hz"), ("strength", "denoise_strength"), ("floor", "denoise_floor_db")):
+            if q.get(k):
+                au[key] = float(q[k])
+        offset = float(q.get("offset") or 0.0)
         pre, post = au.get("preroll_s", 0.5), au.get("postroll_s", 0.5)
         if q.get("survey"):
             if not SAFE.match(q["survey"]):
@@ -313,7 +355,9 @@ def make_app(args):
                 raise web.HTTPNotFound(text="this detection's IQ is no longer in the IQ ring")
             pts = [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]]
             mode = meta.get("mode", 0)
-        pcm = await loop.run_in_executor(None, render_segments, segs, t0, t1, pts, au, mode)
+        if q.get("mode") in ("-1", "0", "1"):
+            mode = int(q["mode"])
+        pcm = await loop.run_in_executor(None, render_segments, segs, t0, t1, pts, au, mode, offset)
         if pcm is None:
             raise web.HTTPNotFound(text="no IQ in that time range")
         import io
@@ -574,6 +618,7 @@ def make_app(args):
     app.router.add_get("/api/detection", get_detection)
     app.router.add_get("/api/iq", get_iq)
     app.router.add_get("/api/render", render)
+    app.router.add_post("/api/tune_audio", tune_audio)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)
