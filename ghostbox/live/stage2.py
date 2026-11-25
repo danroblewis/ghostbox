@@ -78,6 +78,16 @@ def run(audio, iq, cfg_checks, enabled, vad=None):
     if len(audio) < FS // 2:
         return out, info
     c = cfg_checks
+    if not any(enabled.get(k) for k in ("comb", "pitch_motion", "voicing")):
+        # the pitch checks now run on the IQ in stage 1; only AM phase and the ML detector remain here
+        if enabled.get("am_phase"):
+            z = am_cross_z(iq)
+            info["am_phase_z"] = float(z)
+            out["am_phase"] = float(np.clip(z / c["am_phase"]["full_z"], 0, 1))
+        if enabled.get("vad") and vad_available():
+            probs = np.sort(vad if vad is not None else vad_probs(audio))
+            out["vad"] = float(probs[len(probs) // 2:].mean()) if len(probs) else 0.0
+        return out, info
     r, f0, energy = _pitch_track(audio, c["comb"]["f0_min"], c["comb"]["f0_max"])
     loud = energy > np.percentile(energy, 30) if len(energy) else energy.astype(bool)
     voiced = (r > 0.45) & loud

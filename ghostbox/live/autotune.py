@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import stage1
 from .config import CHECKS
 from .engine import Engine
 from .sources import FileSource
@@ -68,11 +69,20 @@ def pick_segments(root, cfg, minutes):
     return [p for _, p, _ in chosen], total
 
 
-def optimise(boxes, minutes, per_min, live_checks, n_random=600, seed=0):
-    ids = [c["id"] for c in CHECKS if c["id"] != "vad"]
+def optimise(boxes, minutes, per_min, live_checks, n_random=600, seed=0, available=None):
+    ids = [c["id"] for c in CHECKS if c["id"] != "vad" and (available is None or c["id"] in available)]
     X = np.array([[b["scores"].get(i, np.nan) for i in ids] for b in boxes], dtype=float)
     X = np.where(np.isnan(X), 0.5, X)                   # a check that couldn't run is neutral
-    L = np.log(np.maximum(X, 0.02))
+    cols = {i: X[:, j] for j, i in enumerate(ids)}
+
+    def conf_of(w, extra=None, extra_w=0.0):
+        """Confidence for weight vector w (AM/SSB families as alternatives, as live)."""
+        chk = {i: {"enabled": wi > 0, "weight": float(wi)} for i, wi in zip(ids, w)}
+        sc = dict(cols)
+        if extra is not None and extra_w > 0:
+            chk["vad"], sc["vad"] = {"enabled": True, "weight": extra_w}, extra
+        g = stage1.combine(sc, chk)
+        return np.zeros(len(boxes)) if g is None else g
     judge = np.array([b["scores"].get("vad", np.nan) for b in boxes], dtype=float)
     if np.all(np.isnan(judge)):                         # no ML judge available: fall back to the pitch comb
         judge = X[:, ids.index("comb")]
@@ -81,7 +91,7 @@ def optimise(boxes, minutes, per_min, live_checks, n_random=600, seed=0):
     K = int(max(3, min(n, round(per_min * minutes))))
 
     def evaluate(w):
-        conf = np.exp(L @ w / w.sum())
+        conf = conf_of(w)
         top = np.argsort(-conf)[:K]
         return float(judge[top].mean())
 
@@ -97,8 +107,8 @@ def optimise(boxes, minutes, per_min, live_checks, n_random=600, seed=0):
     # final confidence as the live detector will compute it (including the ML check at its own weight)
     vad = live_checks["vad"]
     w_vad = vad["weight"] if vad["enabled"] else 0.0
-    vad_s = np.log(np.maximum(np.nan_to_num(np.array([b["scores"].get("vad", 0.5) for b in boxes], float), nan=0.5), 0.02))
-    conf_full = np.exp((L @ w_best + w_vad * vad_s) / (w_best.sum() + w_vad))
+    vad_s = np.nan_to_num(np.array([b["scores"].get("vad", 0.5) for b in boxes], float), nan=0.5)
+    conf_full = conf_of(w_best, vad_s, w_vad)
     order = np.sort(conf_full)[::-1]
     show = float(order[K - 1])
     capture = float(order[min(n, 3 * K) - 1])
@@ -154,6 +164,10 @@ class AutoTune:
             tcfg["detect"].update(TUNE_DETECT)
             for c in CHECKS:                            # compute every check; candidate search uses stage 1
                 cc = tcfg["checks"][c["id"]]
+                if c["id"] == "slide" and not cc["enabled"]:
+                    continue                            # several times the CPU: only if you use it
+                if c["id"] == "profile":
+                    continue                            # learned live, not from a few minutes of replay
                 cc["enabled"], cc["weight"] = True, max(cc["weight"], 0.5)
             tcfg["whisper"]["enabled"] = False
             tcfg["record"]["enabled"] = False
@@ -179,7 +193,8 @@ class AutoTune:
                 raise RuntimeError(f"Only {len(boxes)} candidate signals in {dur / 60:.1f} min: this band is nearly silent "
                                    "even at the most permissive settings.")
             self._set(progress=0.95, message=f"Searching settings over {len(boxes)} candidates…")
-            res = optimise(boxes, dur / 60, per_min, cfg["checks"])
+            avail = {c["id"] for c in CHECKS if tcfg["checks"][c["id"]]["enabled"]}
+            res = optimise(boxes, dur / 60, per_min, cfg["checks"], available=avail)
             self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
             live_detect = {**TUNE_DETECT, "max_tracks": 16, "max_candidates": 8,   # the analysis pass is wide open;
                            "threshold": res["capture_threshold"]}                      # live keeps CPU in check

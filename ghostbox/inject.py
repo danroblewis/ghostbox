@@ -11,9 +11,12 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import butter, firwin, oaconvolve, resample_poly, sosfiltfilt
+from scipy.signal import butter, firwin, hilbert, oaconvolve, resample_poly, sosfiltfilt
 
 from .iq import load_cu8, parse_name, save_cu8
+
+
+AUDIO_SSB = 16000
 
 
 def load_voice(wav_path, fs):
@@ -95,6 +98,15 @@ def main():
     station = oaconvolve(x[a:b] * shift, taps, mode="same") * np.conj(shift)
     x[a:b] += args.station_depth * voice_segment(v, int(1 * fs), b - a) * station
     events.append({"kind": "station_am", "t0": 25, "t1": 29.5, "path": [[25, off], [29.5, off]]})
+
+    # E: single-sideband (upper) voice, no carrier
+    a, b = span(25, 29.5)
+    v = voice_segment(load_voice(args.voice_wav, AUDIO_SSB)[0], int(4 * AUDIO_SSB), int(4.5 * AUDIO_SSB))
+    analytic = hilbert(v).astype(np.complex64)                    # audio with only positive frequencies
+    up = resample_poly(analytic, int(fs // 1000), AUDIO_SSB // 1000)[: b - a]
+    t = np.arange(a, a + len(up)) / fs
+    x[a:a + len(up)] += (amp * 1.5 * up * np.exp(2j * np.pi * 250e3 * t)).astype(np.complex64)
+    events.append({"kind": "ssb_usb", "t0": 25, "t1": 29.5, "path": [[25, 250e3], [29.5, 250e3]]})
 
     out = Path(args.out) if args.out else Path(args.capture).with_name(Path(args.capture).stem + "_inj.cu8")
     save_cu8(out, x)

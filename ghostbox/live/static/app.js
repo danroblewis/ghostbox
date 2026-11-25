@@ -829,11 +829,16 @@ function buildDetector() {
       el("div", { class: "note" }, `Most confident clips are transcribed first. Done ${ws.done ?? 0}, skipped as stale ${ws.stale ?? 0}, dropped (queue full) ${ws.dropped ?? 0}.`),
       ws.error ? el("div", { class: "err" }, ws.error) : null));
   for (const stage of [1, 2]) {
-    root.append(el("h2", {}, stage === 1 ? "Whole-band checks (every frequency, from IQ)" : "Per-candidate checks (demodulated)"));
+    root.append(el("h2", {}, stage === 1 ? "Whole-band IQ checks" : "Per-detection checks"),
+      el("div", { class: "note", style: "margin-top:-4px" }, stage === 1
+        ? "Every frequency at once, straight from the IQ. Each has a waterfall view; only enabled checks are computed. AM and SSB checks are alternatives: whichever fits a signal better counts."
+        : "Run on each detected candidate."));
     for (const ch of S.checks.filter(x => x.stage === stage)) {
       const cc = c.checks[ch.id];
       const card = el("div", { class: "card" + (cc.enabled ? "" : " off") },
-        el("div", { class: "hd" }, toggle(cc.enabled, v => { patch(setPath(["checks", ch.id, "enabled"], v)); card.classList.toggle("off", !v); }), ch.label),
+        el("div", { class: "hd" }, toggle(cc.enabled, v => { patch(setPath(["checks", ch.id, "enabled"], v)); card.classList.toggle("off", !v); }), ch.label,
+          ch.family ? el("span", { class: "tag", title: "Alternative modulation hypothesis" }, ch.family === "dsb" ? "AM" : "SSB")
+            : ch.id === "profile" && S.status.profile ? el("span", { class: "tag" }, `learned ${S.status.profile.learned_min} min`) : null),
         el("div", { class: "desc" }, ch.desc),
         slider("Weight", ["checks", ch.id, "weight"], 0, 3, 0.05, v => v.toFixed(2)),
         ...ch.params.map(p => slider(p.label, ["checks", ch.id, p.key], p.min, p.max, p.step)));
@@ -1020,6 +1025,20 @@ function setView(mode) {
 }
 $("#view").addEventListener("change", e => setView(e.target.value));
 
+// Waterfall views: only checks that are enabled are computed, so only those are listed.
+function availableViews() {
+  return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].enabled));
+}
+function buildViewList() {
+  const vs = availableViews(), sel = $("#view");
+  const opts = [...vs.filter(v => !v.check).map(v => el("option", { value: v.id }, v.label))];
+  const checks = vs.filter(v => v.check);
+  if (checks.length) opts.push(el("optgroup", { label: "Detector maps (enabled checks)" }, ...checks.map(v => el("option", { value: v.id }, v.label))));
+  sel.replaceChildren(...opts);
+  if (!vs.some(v => v.id === S.view)) { if (S.view !== "power") setView("power"); }
+  else sel.value = S.view;
+}
+
 function switchTab(name) {
   document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === name));
@@ -1059,8 +1078,8 @@ function connect() {
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
         if (m.reset && m.reset.fmax) { S.fmin = m.reset.fmin; S.fmax = m.reset.fmax; }
-        $("#view").replaceChildren(...m.views.map(v => el("option", { value: v.id }, v.label)));
-        if (!m.views.some(v => v.id === S.view)) S.view = "power";
+        buildViewList();
+        if (!availableViews().some(v => v.id === S.view)) S.view = "power";
         $("#view").value = S.view; loadScale(); LUT = makeLUT();
 
         setStatus(m.status || {});
@@ -1071,7 +1090,7 @@ function connect() {
         break;
       }
       case "config": {
-        S.cfg = m.config; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
+        S.cfg = m.config; buildViewList(); S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         buildTop(); if (!$("#detector").contains(document.activeElement)) buildDetector(); break;
       }
       case "reset": if (m.fmax) { S.fmin = m.fmin; S.fmax = m.fmax; } break;

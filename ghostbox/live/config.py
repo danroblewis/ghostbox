@@ -13,24 +13,61 @@ import json
 import threading
 from pathlib import Path
 
+# family: "dsb" (ordinary AM) and "ssb" are alternative modulation hypotheses: within a family the
+# checks combine as usual, and the better-fitting family counts. Checks without a family always count.
+# stage 1 = whole-band IQ checks (every frequency at once; each has a waterfall view, computed only when
+# enabled). stage 2 = per-detection checks (run on each candidate track).
 CHECKS = [
-    # ---------- stage 1: whole band, every frequency bin, straight from IQ ----------
-    {"id": "twinning", "stage": 1, "label": "Sideband twinning",
-     "desc": "Upper and lower sidebands rise and fall together (AM's mirror-image sidebands).",
+    # ---------- stage 1: modulation (alternatives) ----------
+    {"id": "twinning", "stage": 1, "family": "dsb", "label": "Sideband twinning",
+     "desc": "AM: upper and lower sidebands rise and fall together (mirror-image sidebands).",
      "default": {"enabled": True, "weight": 1.0}, "params": []},
+    {"id": "slide", "stage": 1, "family": "dsb", "label": "Sliding twinning",
+     "desc": "AM twinning measured along slanted lines, so a voice drifting in frequency builds evidence instead of smearing. Costs several times the CPU of plain twinning.",
+     "default": {"enabled": False, "weight": 1.0, "max_khz_s": 100, "steps": 3},
+     "params": [{"key": "max_khz_s", "label": "fastest slide (kHz/s)", "min": 10, "max": 300, "step": 10},
+                {"key": "steps", "label": "slide rates each way", "min": 1, "max": 6, "step": 1}]},
+    {"id": "mirror", "stage": 1, "family": "dsb", "label": "Fine mirror",
+     "desc": "AM: bin-by-bin mirror image of the sideband spectrum around the carrier. Only matches at the exact centre.",
+     "default": {"enabled": True, "weight": 1.0}, "params": []},
+    {"id": "carrier", "stage": 1, "family": "dsb", "label": "Carrier present",
+     "desc": "AM: a carrier line stands above its own sideband level. Turn off to allow carrierless (DSB-SC) voices.",
+     "default": {"enabled": True, "weight": 0.7, "full_db": 15.0},
+     "params": [{"key": "full_db", "label": "dB above sidebands for full score", "min": 3, "max": 30, "step": 1}]},
+    {"id": "ssb", "stage": 1, "family": "ssb", "label": "Single-sideband voice",
+     "desc": "SSB: a voice-band rhythm on one side of a (suppressed) carrier only. The alternative to the AM checks; whichever fits better counts.",
+     "default": {"enabled": True, "weight": 1.0, "full_db": 8.0},
+     "params": [{"key": "full_db", "label": "one-sidedness for full score (dB)", "min": 3, "max": 20, "step": 1}]},
+    # ---------- stage 1: speech evidence ----------
     {"id": "syllabic", "stage": 1, "label": "Syllable rhythm",
      "desc": "Sideband loudness pulses in the syllable band (2-10 Hz) above the noise level.",
      "default": {"enabled": True, "weight": 1.0, "band_lo": 2.0, "band_hi": 10.0, "full_scale": 8.0},
      "params": [{"key": "band_lo", "label": "band low (Hz)", "min": 0.5, "max": 6, "step": 0.5},
                 {"key": "band_hi", "label": "band high (Hz)", "min": 6, "max": 12, "step": 0.5},
                 {"key": "full_scale", "label": "x noise for full score", "min": 2, "max": 30, "step": 1}]},
-    {"id": "mirror", "stage": 1, "label": "Fine mirror",
-     "desc": "Bin-by-bin mirror image of the sideband spectrum around the carrier. Only matches at the exact centre.",
-     "default": {"enabled": True, "weight": 1.0}, "params": []},
-    {"id": "carrier", "stage": 1, "label": "Carrier present",
-     "desc": "A carrier line stands above its own sideband level. Turn off to allow carrierless (DSB-SC) voices.",
-     "default": {"enabled": True, "weight": 0.7, "full_db": 15.0},
-     "params": [{"key": "full_db", "label": "dB above sidebands for full score", "min": 3, "max": 30, "step": 1}]},
+    {"id": "rhythm", "stage": 1, "label": "4 Hz syllable peak",
+     "desc": "Loudness changes at the syllable rate (3-6 Hz) but hardly faster (8-12 Hz): true of speech, not of noise, which changes at every rate.",
+     "default": {"enabled": True, "weight": 0.7}, "params": []},
+    {"id": "comb", "stage": 1, "label": "Pitch comb",
+     "desc": "Evenly spaced harmonic lines around a carrier, spaced by a human voice pitch: measured from the raw IQ at fine resolution, for every frequency at once.",
+     "default": {"enabled": True, "weight": 1.0, "f0_min": 75, "f0_max": 350},
+     "params": [{"key": "f0_min", "label": "pitch min (Hz)", "min": 50, "max": 150, "step": 5},
+                {"key": "f0_max", "label": "pitch max (Hz)", "min": 200, "max": 500, "step": 10}]},
+    {"id": "pitch_motion", "stage": 1, "label": "Pitch movement",
+     "desc": "The comb's pitch glides smoothly over a few semitones (speech), not fixed (tones) or stepped (music).",
+     "default": {"enabled": True, "weight": 0.7, "range_st": 4.0},
+     "params": [{"key": "range_st", "label": "semitone range for full score", "min": 1, "max": 12, "step": 0.5}]},
+    {"id": "voicing", "stage": 1, "label": "Voiced/unvoiced alternation",
+     "desc": "The pitch comb comes and goes several times a second (vowels vs consonants and gaps).",
+     "default": {"enabled": True, "weight": 0.7}, "params": []},
+    {"id": "shape", "stage": 1, "label": "Speech spectral shape",
+     "desc": "Sideband energy is strongest near the carrier and falls toward 3.4 kHz (formant-shaped), unlike flat noise.",
+     "default": {"enabled": True, "weight": 0.7}, "params": []},
+    {"id": "envstat", "stage": 1, "label": "Loudness range",
+     "desc": "Syllables and pauses make the sideband loudness swing by tens of dB; noise swings a few. Strong for SSB and loud voices, but weak AM voices (carrier present) don't swing enough, so it's off by default.",
+     "default": {"enabled": False, "weight": 0.5, "full_db": 12.0},
+     "params": [{"key": "full_db", "label": "dB above 8 dB for full score", "min": 4, "max": 30, "step": 1}]},
+    # ---------- stage 1: rejection ----------
     {"id": "ring", "stage": 1, "label": "FM rejection (ring)",
      "desc": "Rejects signals whose loudness also pulses 4.5-8 kHz out (wideband FM). Off in the AM broadcast band.",
      "default": {"enabled": False, "weight": 1.0, "lo_hz": 4500, "hi_hz": 8000},
@@ -41,33 +78,34 @@ CHECKS = [
      "default": {"enabled": True, "weight": 1.0, "lo_hz": 20000, "hi_hz": 60000},
      "params": [{"key": "lo_hz", "label": "inner (Hz)", "min": 8000, "max": 50000, "step": 1000},
                 {"key": "hi_hz", "label": "outer (Hz)", "min": 20000, "max": 200000, "step": 5000}]},
-    # ---------- stage 2: per track, on the demodulated voice candidate ----------
-    {"id": "comb", "stage": 2, "label": "Pitch comb",
-     "desc": "Harmonic comb from vocal-fold pitch (autocorrelation peak in the human pitch range).",
-     "default": {"enabled": True, "weight": 1.0, "f0_min": 75, "f0_max": 350},
-     "params": [{"key": "f0_min", "label": "pitch min (Hz)", "min": 50, "max": 150, "step": 5},
-                {"key": "f0_max", "label": "pitch max (Hz)", "min": 200, "max": 500, "step": 10}]},
-    {"id": "pitch_motion", "stage": 2, "label": "Pitch movement",
-     "desc": "Pitch glides smoothly over a few semitones (speech), not fixed (tones) or stepped (music).",
-     "default": {"enabled": True, "weight": 0.7, "range_st": 4.0},
-     "params": [{"key": "range_st", "label": "semitone range for full score", "min": 1, "max": 12, "step": 0.5}]},
-    {"id": "shape", "stage": 2, "label": "Speech spectral shape",
-     "desc": "Energy concentrated below 1 kHz, falling toward 3.4 kHz (long-term speech spectrum).",
+    # ---------- stage 1: long-term ----------
+    {"id": "profile", "stage": 1, "label": "Unusual for this band",
+     "desc": "Learns what each frequency normally looks like (over hours, saved per band, no IQ kept) and scores how unusual the current evidence is. Neutral until it has learned for a while.",
+     "default": {"enabled": True, "weight": 0.5, "tau_h": 2.0, "warmup_min": 10, "full_z": 4.0},
+     "params": [{"key": "tau_h", "label": "memory (hours)", "min": 0.25, "max": 24, "step": 0.25},
+                {"key": "warmup_min", "label": "learn before scoring (min)", "min": 1, "max": 120, "step": 1},
+                {"key": "full_z", "label": "standard deviations for full score", "min": 1, "max": 10, "step": 0.5}]},
+    # ---------- stage 2: per detection ----------
+    {"id": "comod", "stage": 2, "label": "Cross-channel co-modulation",
+     "desc": "Another frequency pulses with the same syllable rhythm (at once or shortly after): one voice spread across, or hopping between, channels. Co-modulated detections are joined into one chain.",
+     "default": {"enabled": True, "weight": 0.5, "min_khz": 20, "max_lag_s": 0.5},
+     "params": [{"key": "min_khz", "label": "minimum separation (kHz)", "min": 5, "max": 500, "step": 5},
+                {"key": "max_lag_s", "label": "largest delay (s)", "min": 0, "max": 2, "step": 0.1}]},
+    {"id": "hop", "stage": 2, "label": "Hop continuity",
+     "desc": "When a voice hops, the new channel continues the old one's pitch. Scores only detections that start a hop.",
      "default": {"enabled": True, "weight": 0.7}, "params": []},
-    {"id": "voicing", "stage": 2, "label": "Voiced/unvoiced alternation",
-     "desc": "Switches between harmonic (vowels) and non-harmonic (consonants, gaps) several times a second.",
-     "default": {"enabled": True, "weight": 0.7}, "params": []},
-    {"id": "rhythm", "stage": 2, "label": "Pause rhythm",
-     "desc": "Loudness rhythm peaking near 4 Hz with short pauses between words.",
-     "default": {"enabled": True, "weight": 0.7}, "params": []},
-    {"id": "am_phase", "stage": 2, "label": "AM phase coherence",
-     "desc": "Cross-term test: carrier/sideband pairs in phase (AM) rather than anti-phase (FM) or random (noise).",
+    {"id": "am_phase", "stage": 2, "family": "dsb", "label": "AM phase coherence",
+     "desc": "AM: carrier/sideband pairs in phase (AM) rather than anti-phase (FM) or random (noise).",
      "default": {"enabled": True, "weight": 0.7, "full_z": 8.0},
      "params": [{"key": "full_z", "label": "noise sigmas for full score", "min": 2, "max": 30, "step": 1}]},
     {"id": "vad", "stage": 2, "label": "ML voice detector (Silero)",
      "desc": "Neural voice-activity detector run only on the demodulated candidates.",
      "default": {"enabled": True, "weight": 1.0}, "params": []},
 ]
+FAMILIES = {}
+for _c in CHECKS:
+    if _c.get("family"):
+        FAMILIES.setdefault(_c["family"], []).append(_c["id"])
 
 DEFAULT = {
     "sdr": {
@@ -124,18 +162,13 @@ DEFAULT = {
     "checks": {c["id"]: dict(c["default"]) for c in CHECKS},
 }
 
-# Waterfall views: power plus the detector's internal maps (all scaled 0..1 except power).
-VIEWS = [
-    {"id": "power", "label": "Power (dB)"},
-    {"id": "score", "label": "AM-voice score (stage 1 combined)"},
-    {"id": "novelty", "label": "Novelty evidence (what triggers candidates)"},
-    {"id": "twinning", "label": "Check: sideband twinning"},
-    {"id": "syllabic", "label": "Check: syllable rhythm"},
-    {"id": "mirror", "label": "Check: fine mirror"},
-    {"id": "carrier", "label": "Check: carrier present"},
-    {"id": "broadband", "label": "Check: broadband-pulse rejection"},
-    {"id": "ring", "label": "Check: FM rejection (ring)"},
-]
+# Waterfall views: power, the combined score, novelty, and one per stage-1 check (plus the sparse
+# co-modulation map). Only enabled checks are computed, so the UI lists only those.
+VIEWS = ([{"id": "power", "label": "Power (dB)"},
+          {"id": "score", "label": "AM-voice score (combined)"},
+          {"id": "novelty", "label": "Novelty evidence (what triggers candidates)"}]
+         + [{"id": c["id"], "label": c["label"], "check": True} for c in CHECKS if c["stage"] == 1]
+         + [{"id": "comod", "label": "Cross-channel co-modulation", "check": True}])
 
 PRESETS = {
     "am_hackrf": {"label": "AM broadcast (HackRF)",

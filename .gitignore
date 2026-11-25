@@ -18,3 +18,4 @@ venv/
 live_data/
 recordings/
 iq_ring/
+.claude/

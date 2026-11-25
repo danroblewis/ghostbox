@@ -38,6 +38,8 @@ from . import stage1, stage2
 from .config import CHECKS
 from .sources import _to_complex, make_source
 from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, fade, render_clip
+from .profile import BandProfile
+from .vad_batch import vad_probs_batch
 from .transcribe import Transcriber
 
 AUDIO_FS = 16000
@@ -65,9 +67,24 @@ def _oscillator(f_offset, n, fs, L=4096):
     return out
 
 
-def demod(x, fs, f_offset, bw_hz):
+_SSB = {}
+
+
+def _ssb_taps(bw_hz, side):
+    """Complex band-pass keeping one side of the carrier: 150 Hz .. bw on the upper (+1) or lower (-1) side."""
+    key = (round(bw_hz), side)
+    if key not in _SSB:
+        half = (bw_hz - 150) / 2
+        n = np.arange(129) - 64
+        h = firwin(129, half, fs=AUDIO_FS) * np.exp(side * 2j * np.pi * (150 + half) * n / AUDIO_FS)
+        _SSB[key] = h.astype(np.complex64)
+    return _SSB[key]
+
+
+def demod(x, fs, f_offset, bw_hz, mode=0):
     """Mix x (complex, at fs) down by f_offset (scalar or per-sample Hz), decimate to 16 kHz.
-    Returns (narrowband complex IQ at 16 kHz, AM envelope at 16 kHz)."""
+    mode 0: AM (envelope). +1/-1: upper/lower single sideband (product detector: keep one side,
+    take the real part). Returns (narrowband complex IQ at 16 kHz, audio at 16 kHz)."""
     y = x * _oscillator(f_offset, len(x), fs)
     d1 = max(1, int(fs // 160000))
     n = len(y) // d1 * d1
@@ -79,6 +96,9 @@ def demod(x, fs, f_offset, bw_hz):
     if key not in _LP:
         _LP[key] = firwin(129, bw_hz, fs=AUDIO_FS).astype(np.float32)
     y = np.convolve(y, _LP[key], mode="same").astype(np.complex64)
+    if mode:
+        s = np.convolve(y, _ssb_taps(bw_hz, int(np.sign(mode))), mode="same")
+        return y, (2 * s.real).astype(np.float32)
     return y, np.abs(y).astype(np.float32)
 
 
@@ -111,6 +131,20 @@ class Track:
         self.seg_index = 0
         self.wavs = []                   # recording files for click-to-play
         self.clips = []                  # playable URLs (saved WAV or in-memory clip)
+        self.modes = []                  # per frame: 0 AM, +1 USB, -1 LSB (from stage 1)
+        self.pitch = []                  # per frame: (t, f0_hz, comb strength) at this track's frequency
+        self.hop_ref = None              # pitch where the previous hop of this chain ended
+
+    def mode(self):
+        recent = self.modes[-25:]
+        if not recent:
+            return 0
+        s = sum(recent)
+        return int(np.sign(s)) if abs(s) > len(recent) / 2 else 0
+
+    def f0_over(self, t_from, t_to, min_c=0.15):
+        v = [f for t, f, c in self.pitch if t_from <= t <= t_to and c >= min_c and f > 0]
+        return float(np.median(v)) if len(v) >= 3 else None
 
     def add(self, t, f, score, checks):
         self.t_last = t
@@ -135,6 +169,7 @@ class Track:
                 "conf_max": round(max([c for _, c in self.conf_hist] or [self.conf]), 3),
                 "scores": {k: round(v, 3) for k, v in self.scores.items()},
                 "info": self.info, "wavs": list(self.wavs), "clips": list(self.clips), "detected": self.detected,
+                "mode": {0: "am", 1: "usb", -1: "lsb"}[self.mode()],
                 "audio_t0": self.audio_t0 if self.audio_t0 is not None else self.t0}
 
 
@@ -159,6 +194,7 @@ class Engine:
         self._last_prune = 0.0
         self.storage = {"paused": False, "free_gb": None}   # disk guard state
         self.chains = {}                            # hop chain id -> finished member clips
+        self.comod = None                           # latest co-modulation candidates / pairs
         self.transcriber = Transcriber(config, emit, on_result=self._on_transcript) if transcribe else None
         self.pool = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
         self.lock = threading.RLock()                # re-entrant: _finish runs inside locked analysis
@@ -209,6 +245,13 @@ class Engine:
         self.raw_keep = int(self.fs * (an["window_s"] + 4))
         self.raw = np.zeros(self.raw_keep, np.complex64)
         self.spec, self.spec_t = [], []
+        self.pitch_spec = []                        # per hop: (C, F0) [frames, kept bins] or None
+        self._fine_setup()
+        self.comod_view = None
+        if getattr(self, "profile", None):
+            self.profile.maybe_save(force=True)
+        pkey = BandProfile.key(self.fc, self.fs, an["bin_hz"], self.f_lo, self.f_hi)
+        self.profile = BandProfile(self.root / "live_data" / "profiles" / pkey, len(self.f))
         self.baseline = None
         self.wf_lo = None
         self.analyzed_until = self.n_samples / self.fs
@@ -222,6 +265,38 @@ class Engine:
         self.chains = {}
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
                    "frame_rate": self.fr, "t": self.n_samples / self.fs})
+
+    def _fine_setup(self):
+        """Fine (25 Hz) spectrum layout for the pitch comb: which fine bins feed each kept coarse bin."""
+        self.fine_n = self.frame_len                         # one 40 ms segment per 25 fps frame
+        self.fine_df = self.fs / self.fine_n
+        ff = np.fft.fftshift(np.fft.fftfreq(self.fine_n, 1 / self.fs))
+        margin = 3400 + 100
+        lo, hi = float(self.f[0]) - self.df / 2, float(self.f[-1]) + self.df / 2
+        self.fine_sel = np.flatnonzero((ff >= lo - margin) & (ff <= hi + margin))
+        fsel = ff[self.fine_sel]
+        # for each kept coarse bin, the fine bins within it (contiguous): reduceat start indices
+        starts = np.searchsorted(fsel, self.f - self.df / 2)
+        self.fine_starts = np.clip(starts, 0, len(fsel) - 1)
+
+    def _pitch_maps(self, x, cfg):
+        """Comb strength and pitch per kept coarse bin, for each 40 ms frame of x."""
+        ch = cfg["checks"]
+        n = len(x) // self.fine_n
+        frames = x[: n * self.fine_n].reshape(n, self.fine_n)
+        win = np.hanning(self.fine_n).astype(np.float32)
+
+        def job(rows):
+            X = np.fft.fftshift(np.fft.fft(frames[rows] * win, axis=1), axes=1)[:, self.fine_sel]
+            C, F0 = stage1.pitch_frames((X.real ** 2 + X.imag ** 2).astype(np.float32),
+                                        ch["comb"]["f0_min"], ch["comb"]["f0_max"], df=self.fine_df)
+            Cc = np.maximum.reduceat(C, self.fine_starts, axis=1)
+            w = np.maximum(C, 1e-6)                                # pitch: comb-weighted within each coarse bin
+            Fc = np.add.reduceat(w * F0, self.fine_starts, axis=1) / np.add.reduceat(w, self.fine_starts, axis=1)
+            return Cc.astype(np.float32), Fc.astype(np.float32)
+
+        parts = list(self.pool.map(job, [slice(i, min(n, i + 5)) for i in range(0, n, 5)]))
+        return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
 
     def _run(self):
         src = None
@@ -279,6 +354,7 @@ class Engine:
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
                                "tracks": len(self.tracks), "vad": stage2.vad_available(),
                                "storage": self.storage,
+                               "profile": {"learned_min": round(self.profile.learned_s / 60, 1)} if getattr(self, "profile", None) else None,
                                "timing": {k: round(v, 3) for k, v in getattr(self, "timing", {}).items()},
                                "progress": (src.sent / src.total) if getattr(src, "total", None) else None,
                                "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
@@ -292,6 +368,8 @@ class Engine:
                 time.sleep(1)
         if src:
             src.stop()
+        if getattr(self, "profile", None) and not self.oneshot:
+            self.profile.maybe_save(force=True)
         self.done.set()
 
     # ---------------- ingest: raw ring + spectrogram + waterfall ----------------
@@ -313,10 +391,18 @@ class Engine:
         ts = t_start + (np.arange(len(P)) + 0.5) / self.fr
         self.spec.append(P)
         self.spec_t.append(ts)
+        ch = cfg["checks"]
+        if any(ch[k]["enabled"] for k in stage1.PITCH) and self.fine_n * self.fr == int(self.fs):
+            t_p = time.time()
+            self.pitch_spec.append(self._pitch_maps(x, cfg))
+            self.timing["pitch"] = time.time() - t_p
+        else:
+            self.pitch_spec.append(None)
         nkeep = int(cfg["analysis"]["window_s"] * self.fr)
         while sum(len(p) for p in self.spec) - len(self.spec[0]) >= nkeep:
             self.spec.pop(0)
             self.spec_t.pop(0)
+            self.pitch_spec.pop(0)
         self._waterfall(P, ts, cfg)
 
     def _waterfall(self, P, ts, cfg):
@@ -343,13 +429,13 @@ class Engine:
                 h.popleft()
         self.emit(msg)
 
-    def _view_rows(self, scores, comb, ev, ts, cfg):
-        """Waterfall rows for the detector's internal maps (values 0..1 -> 0..255), always computed
-        so every view has history."""
+    def _view_rows(self, scores, comb, ev, ts, cfg, extra_views=()):
+        """Waterfall rows for the detector's maps (values 0..1 -> 0..255): the combined score, novelty,
+        and every check that was computed (only enabled checks are), so each view has history."""
         if not len(ts):
             return
         width = int(cfg["display"]["width"])
-        for mode, a in [("score", comb), ("novelty", ev)] + list(scores.items()):
+        for mode, a in [("score", comb), ("novelty", ev)] + list(scores.items()) + list(extra_views):
             K = a.shape[1]
             pool = max(1, -(-K // width))
             pad = (-K) % pool
@@ -384,9 +470,32 @@ class Engine:
         sl = slice(idx[0], idx[-1] + 1)
         self.analyzed_until = float(T[idx[-1]])
         t_s1 = time.time()
-        scores, comb = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=set(stage1.STAGE1), pool=self.pool)
+        ch = cfg["checks"]
+        pitch = None
+        if all(p is not None for p in self.pitch_spec) and self.pitch_spec:
+            pitch = (np.concatenate([p[0] for p in self.pitch_spec]), np.concatenate([p[1] for p in self.pitch_spec]))
+        scores, comb, extra = stage1.run_blocks(P, self.df, self.fr, cfg, sl, pool=self.pool, pitch=pitch)
         self.timing["stage1"] = time.time() - t_s1
         ts = T[sl]
+
+        # learned band profile: how unusual is this evidence for these frequencies?
+        prof = ch["profile"]
+        prof_map = self.profile.score(comb, prof["full_z"]) if prof["enabled"] else None
+        if prof["enabled"]:
+            if not self.oneshot:
+                self.profile.update(comb, self.fr, prof["tau_h"])
+                self.profile.maybe_save()
+            if self.profile.learned_s >= prof["warmup_min"] * 60:
+                scores["profile"] = prof_map
+                comb = stage1.combine(scores, ch).astype(np.float32)
+
+        # cross-channel co-modulation among the strongest candidates
+        comod_map = None
+        self.comod = None
+        if ch["comod"]["enabled"]:
+            t_c = time.time()
+            comod_map = self._comodulation(extra["env"], comb, sl, cfg)
+            self.timing["comod"] = time.time() - t_c
 
         # novelty: subtract a slow per-bin baseline (always-on emitters cancel)
         alpha = float(det["novelty"])
@@ -403,16 +512,68 @@ class Engine:
             ev -= beta * uniform_filter1d(ev, size=w, axis=1, mode="nearest")
         ev = np.clip(ev, 0, None)
         t_v = time.time()
-        self._view_rows(scores, comb, ev, ts, cfg)
+        views = []
+        if comod_map is not None:
+            views.append(("comod", comod_map))
+        if prof_map is not None and "profile" not in scores:
+            views.append(("profile", prof_map))
+        self._view_rows(scores, comb, ev, ts, cfg, views)
         self.timing["views"] = time.time() - t_v
 
+        mode, f0r, cr = extra["mode"], extra.get("f0"), extra.get("c")
         with self.lock:
             for i, t in enumerate(ts):
                 cands = self._candidates(ev[i], det)
-                self._track_step(t, cands, ev[i], comb[i], {c: s[i] for c, s in scores.items()}, det)
+                self._track_step(t, cands, ev[i], comb[i], {c: s[i] for c, s in scores.items()}, det,
+                                 mode[i], None if f0r is None else f0r[i], None if cr is None else cr[i])
             t_t = time.time()
             self._tracks_audio_and_stage2(cfg, float(ts[0]) - 0.5 / self.fr, float(ts[-1]) + 0.5 / self.fr)
             self.timing["tracks"] = time.time() - t_t
+
+    def _comodulation(self, env, comb, sl, cfg):
+        """Pairs of candidate frequencies whose syllable-band loudness moves together (at once or
+        up to max_lag later). The band-wide common movement is removed first, so broadband
+        pulsing doesn't count. Returns a sparse [frames, bins] map; keeps pairs for chain merging."""
+        prm = cfg["checks"]["comod"]
+        T, K = env.shape
+        win = min(T, int(2.5 * self.fr))
+        e = env[sl.stop - win: sl.stop] if sl.stop >= win else env[:win]
+        e = e - np.median(e, axis=1, keepdims=True)              # remove the common (broadband) movement
+        strength = comb.max(axis=0)
+        order = np.argsort(strength)[::-1]
+        sep = max(1, int(cfg["detect"]["min_sep_hz"] / self.df))
+        cands = []
+        for k in order[:400]:
+            if strength[k] < cfg["detect"]["candidate_threshold"] or len(cands) >= 40:
+                break
+            if all(abs(int(k) - j) >= sep for j in cands):
+                cands.append(int(k))
+        out = np.zeros_like(comb)
+        if len(cands) < 2:
+            return out
+        X = e[:, cands]
+        X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+        nfft = 1 << int(np.ceil(np.log2(2 * win)))
+        F = np.fft.rfft(X, nfft, axis=0)
+        L = int(prm["max_lag_s"] * self.fr)
+        best = np.zeros((len(cands), len(cands)), np.float32)
+        lag_at = np.zeros_like(best)
+        for i in range(len(cands)):
+            xc = np.fft.irfft(F[:, i:i + 1] * np.conj(F), nfft, axis=0) / win   # corr of i with every j
+            lags = np.r_[np.arange(0, L + 1), np.arange(-L, 0)]
+            seg = xc[lags]                                         # [lags, cands]
+            j = np.argmax(seg, axis=0)
+            best[i] = seg[j, np.arange(len(cands))]
+            lag_at[i] = lags[j] / self.fr
+        far = np.abs(self.f[cands][:, None] - self.f[cands][None, :]) >= prm["min_khz"] * 1e3
+        best = np.where(far, best, 0)
+        score = np.clip((best.max(axis=1) - 0.3) / 0.5, 0, 1)
+        for k, s in zip(cands, score):
+            out[:, max(0, k - 1): k + 2] = s
+        pairs = [(self.f[cands[i]], self.f[cands[j]], float(best[i, j]), float(lag_at[i, j]))
+                 for i in range(len(cands)) for j in range(i + 1, len(cands)) if best[i, j] >= 0.6]
+        self.comod = {"f": self.f[cands].copy(), "score": score, "pairs": pairs}
+        return out
 
     def _candidates(self, row, det):
         thr = det["candidate_threshold"]
@@ -427,7 +588,7 @@ class Engine:
                 picks.append(int(k))
         return picks
 
-    def _track_step(self, t, cands, ev_row, comb_row, check_rows, det):
+    def _track_step(self, t, cands, ev_row, comb_row, check_rows, det, mode_row=None, f0_row=None, c_row=None):
         tol = det["max_slide_hz_s"] / self.fr + 4 * self.df
         used = set()
         for tr in sorted(self.tracks, key=lambda x: -x.conf):
@@ -445,26 +606,37 @@ class Engine:
                 used.add(best)
                 tr.add(t, float(self.f[best]), float(ev_row[best]),
                        {c: float(r[best]) for c, r in check_rows.items()})
+                self._track_extras(tr, t, best, mode_row, f0_row, c_row)
         for k in cands:
             if k in used or len(self.tracks) >= det["max_tracks"]:
                 continue
             if any(abs(self.f[k] - tr.frames[-1][1]) < det["min_sep_hz"] for tr in self.tracks):
                 continue
-            chain = None
-            for (t_end, ch) in self.ended:
+            chain, ref = None, None
+            for (t_end, ch, f0_end) in self.ended:
                 if 0 <= t - t_end <= det["link_hops_s"]:
-                    chain = ch
+                    chain, ref = ch, f0_end
             tr = Track(t, float(self.f[k]), float(ev_row[k]), chain)
+            tr.hop_ref = ref
             tr.frames[-1] = (t, float(self.f[k]), float(ev_row[k]),
                              {c: float(r[k]) for c, r in check_rows.items()})
+            self._track_extras(tr, t, k, mode_row, f0_row, c_row)
             self.tracks.append(tr)
+
+    @staticmethod
+    def _track_extras(tr, t, k, mode_row, f0_row, c_row):
+        if mode_row is not None:
+            tr.modes.append(int(mode_row[k]))
+            tr.modes = tr.modes[-200:]
+        if f0_row is not None:
+            tr.pitch.append((t, float(f0_row[k]), float(c_row[k])))
+            tr.pitch = tr.pitch[-500:]
 
     # ---------------- per track: audio, stage 2, confidence, events ----------------
     def _tracks_audio_and_stage2(self, cfg, ta, tb):
         det, checks = cfg["detect"], cfg["checks"]
         enabled = {c["id"]: checks[c["id"]]["enabled"] and checks[c["id"]]["weight"] > 0
                    for c in CHECKS if c["stage"] == 2}
-        weights = {k: v["weight"] for k, v in checks.items() if v["enabled"]}
         alive = []
         # demodulate every track's new audio in parallel (the heavy, full-rate part)
         jobs = []
@@ -478,19 +650,20 @@ class Engine:
                 jobs.append((tr, t_from, t_to, ending))
         self.timing["tracks_n"] = len(self.tracks)
         list(self.pool.map(lambda j: self._demod_track(j[0], j[1], j[2], cfg, j[3]), jobs))
-        # per-candidate checks for every track in parallel too (~20 ms per track per second each)
+        # ML voice scores: only audio not seen before, all tracks in one batched call
+        if enabled.get("vad") and stage2.vad_available():
+            new = [(tr, t, a) for tr in self.tracks for t, a in tr.audio if t > tr.vad_t + 1e-6]
+            if new:
+                for (tr, t, _), p in zip(new, vad_probs_batch([a for _, _, a in new])):
+                    tr.vad_p = np.concatenate([tr.vad_p, p])[-int(3.0 * AUDIO_FS / 512):]
+                    tr.vad_t = max(tr.vad_t, t)
+
         def s2job(tr):
             audio, iq = self._recent(tr.audio, 3.0), self._recent(tr.iq, 3.0)
             if not len(audio):
                 return {}, {}
-            vad = None
-            if enabled.get("vad"):                       # incremental: only score audio not seen before
-                for t, a in tr.audio:
-                    if t > tr.vad_t + 1e-6:
-                        tr.vad_p = np.concatenate([tr.vad_p, stage2.vad_probs(a)])[-int(3.0 * AUDIO_FS / 512):]
-                        tr.vad_t = t
-                vad = tr.vad_p
-            return stage2.run(audio, iq, checks, enabled, vad=vad)
+            return stage2.run(audio, iq, checks, {**enabled, "am_phase": enabled.get("am_phase") and tr.mode() == 0},
+                              vad=tr.vad_p if enabled.get("vad") else None)
         s2_results = dict(zip([id(t) for t in self.tracks], self.pool.map(s2job, self.tracks)))
         for tr in self.tracks:
             ended = tb - tr.t_last > det["track_gap_s"]
@@ -502,9 +675,22 @@ class Engine:
                     s1.setdefault(c, []).append(v)
             s1 = {c: float(np.mean(v)) for c, v in s1.items()}
             s2, info = s2_results[id(tr)]
+            s2 = dict(s2)
+            if enabled.get("comod") and self.comod is not None:  # nearest co-modulation candidate
+                d = np.abs(self.comod["f"] - tr.frames[-1][1])
+                if len(d) and d.min() <= 2 * self.df:
+                    s2["comod"] = float(self.comod["score"][int(d.argmin())])
+            if enabled.get("hop") and tr.hop_ref:                  # pitch continues across the hop
+                f0_new = tr.f0_over(tr.t0, tr.t0 + 0.6)
+                if f0_new:
+                    dst = abs(12 * np.log2(f0_new / tr.hop_ref))
+                    dst = min(dst, abs(dst - 12))                  # octave errors happen; don't count them
+                    s2["hop"] = float(np.exp(-(dst / 3.0) ** 2))
             tr.scores = {**s1, **s2}
-            tr.info = {**info, "evidence": round(float(np.mean([fr[2] for fr in recent])) if recent else 0, 3)}
-            g = stage1.geo_mean({k: np.array(v) for k, v in tr.scores.items()}, weights)
+            f0_now = tr.f0_over(tr.t_last - 1.0, tr.t_last)
+            tr.info = {**info, "evidence": round(float(np.mean([fr[2] for fr in recent])) if recent else 0, 3),
+                       **({"f0_median_hz": f0_now} if f0_now else {})}
+            g = stage1.combine({k: np.array(v) for k, v in tr.scores.items()}, checks)
             tr.conf = float(g) if g is not None else 0.0
             tr.conf_hist.append((round(tb, 2), round(tr.conf, 3)))
             dur = tr.t_last - tr.t0
@@ -517,7 +703,7 @@ class Engine:
                 if tr.t_last - tr.seg_start >= cfg["record"]["max_s"]:
                     self._finish(tr, cfg, final=False)
             if ended:
-                self.ended.append((tr.t_last, tr.chain))
+                self.ended.append((tr.t_last, tr.chain, tr.f0_over(tr.t_last - 0.6, tr.t_last)))
                 if tr.detected:
                     self._finish(tr, cfg, final=True)
                     box = tr.box(self.fc)
@@ -528,7 +714,20 @@ class Engine:
                 alive.append(tr)
         self.tracks = alive
         self.ended = [e for e in self.ended if tb - e[0] < 5]
+        self._merge_comod_chains()
         self._flush_chains(cfg, tb)
+
+    def _merge_comod_chains(self):
+        """Live tracks on strongly co-modulated frequencies are one voice: join their chains."""
+        if not self.comod or not self.comod["pairs"]:
+            return
+        for fa, fb, c, lag in self.comod["pairs"]:
+            ta = [t for t in self.tracks if abs(t.frames[-1][1] - fa) <= 2 * self.df]
+            tb_ = [t for t in self.tracks if abs(t.frames[-1][1] - fb) <= 2 * self.df]
+            for a in ta:
+                for b in tb_:
+                    c0 = min(a.chain, b.chain)
+                    a.chain = b.chain = c0
 
     def _flush_chains(self, cfg, tb):
         """A hop chain is finished when none of its tracks is alive and no new hop can link to it.
@@ -566,7 +765,7 @@ class Engine:
             return
         t_samp = (s0r + np.arange(len(x))) / self.fs
         f = tr.freq_at(t_samp)
-        iq, env = demod(x, self.fs, f, cfg["audio"]["bandwidth_hz"])
+        iq, env = demod(x, self.fs, f, cfg["audio"]["bandwidth_hz"], tr.mode())
         cut = int(round((s0 - s0r) / self.fs * AUDIO_FS))
         n = int(round((s1 - s0) / self.fs * AUDIO_FS))
         iq, env = iq[cut:cut + n], env[cut:cut + n]
