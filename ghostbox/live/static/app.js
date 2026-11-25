@@ -21,8 +21,9 @@ const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === 
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
 const b64bytes = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 const fillRange = r => r.style.setProperty("--fill", ((r.value - r.min) / (r.max - r.min) * 100) + "%");
-const TFMT = { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" };
-const clockTime = t => S.epoch ? new Date((S.epoch + t) * 1000).toLocaleTimeString([], TFMT) : "";
+const pad2 = n => String(n).padStart(2, "0");
+const hms = d => `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+const clockTime = t => S.epoch ? hms(new Date((S.epoch + t) * 1000)) : "";
 
 // ---------------- state ----------------
 const S = {
@@ -38,6 +39,19 @@ const S = {
   playing: null,                                        // {key, src, start, dur}
 };
 const cv = $("#wf"), ctx = cv.getContext("2d");
+const TH = {};                                          // canvas colours, read from the active theme
+function readTheme() {
+  const cs = getComputedStyle(document.documentElement), v = k => cs.getPropertyValue(k).trim();
+  Object.assign(TH, { bg: v("--wfbg") || "#05070a", grid: v("--grid") || "rgba(255,255,255,.07)", text: v("--gridtext") || "#ccc",
+    play: v("--play") || "#ffcc4d", link: v("--link") || "#6ee7d8", accent: v("--accent") || "#9d8cff", tip: v("--tipbg") || "rgba(0,0,0,.8)",
+    mono: v("--mono") || "ui-monospace,monospace", sans: v("--sans") || "system-ui,sans-serif" });
+}
+readTheme();
+const THEMES = [["midnight", "Midnight"], ["ember", "Ember"], ["terminal", "Terminal"], ["nord", "Nord"], ["paper", "Paper (light)"], ["synthwave", "Synthwave"], ["graphite", "Graphite"]];
+function setTheme(name) {
+  lsSet("gb_theme", name);
+  const link = $("#themeCss"); link.onload = readTheme; link.href = `/static/themes/${name}.css`;
+}
 
 // ---------------- colour maps ----------------
 const CMAPS = {
@@ -119,7 +133,7 @@ function draw() {
   requestAnimationFrame(draw);
   const dpr = devicePixelRatio, W = cv.clientWidth * dpr, H = cv.clientHeight * dpr;
   if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
-  ctx.fillStyle = "#05070a"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = TH.bg; ctx.fillRect(0, 0, W, H);
   const top = topTime(); if (top === null) return;
   const pps = S.pps * dpr, span = H / pps;
   ctx.imageSmoothingEnabled = false;
@@ -130,8 +144,8 @@ function draw() {
     ctx.drawImage(c.cv, x0, (top - tEnd) * pps, x1 - x0, c.n * c.dt * pps + 0.6);
   }
   // grid: clock times on the left, frequency across the top
-  ctx.font = `${11 * dpr}px "JetBrains Mono",ui-monospace,monospace`;
-  ctx.strokeStyle = "rgba(255,255,255,.07)"; ctx.fillStyle = "rgba(230,235,241,.6)"; ctx.lineWidth = 1;
+  ctx.font = `${11 * dpr}px ${TH.mono}`;
+  ctx.strokeStyle = TH.grid; ctx.fillStyle = TH.text; ctx.lineWidth = 1;
   const tick = span > 120 ? 30 : span > 50 ? 10 : 5;
   for (let t = Math.floor(top / tick) * tick; t > top - span; t -= tick) {
     const y = (top - t) * pps; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
@@ -153,8 +167,8 @@ function draw() {
     d.box._rect = [x0 / dpr, y0 / dpr, x1 / dpr, y1 / dpr];
     const hue = 50 - 50 * Math.min(1, Math.max(0, (b.conf - 0.3) / 0.6));
     ctx.save();
-    if (playing) { ctx.shadowColor = "#ffcc4d"; ctx.shadowBlur = 22 * dpr; ctx.fillStyle = "rgba(255,204,77,.22)"; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); }
-    ctx.strokeStyle = playing ? "#ffe08a" : `hsla(${hue},100%,62%,.95)`;
+    if (playing) { ctx.shadowColor = TH.play; ctx.shadowBlur = 22 * dpr; ctx.globalAlpha = 0.22; ctx.fillStyle = TH.play; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.globalAlpha = 1; }
+    ctx.strokeStyle = playing ? TH.play : `hsla(${hue},100%,62%,.95)`;
     ctx.lineWidth = (playing ? 2.5 : 1.4) * dpr; ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
     ctx.restore();
     if (b.path && b.path.length > 1 && b.fmax - b.fmin > 500) {
@@ -163,14 +177,14 @@ function draw() {
       ctx.stroke();
     }
     const ly = Math.max(14 * dpr, y0 + 11 * dpr);
-    ctx.fillStyle = playing ? "#ffe08a" : `hsla(${hue},100%,78%,1)`;
+    ctx.fillStyle = playing ? TH.play : `hsla(${hue},100%,78%,1)`;
     ctx.fillText(`${fmtFshort((b.fmin + b.fmax) / 2)} ${(b.conf * 100).toFixed(0)}%`, x1 + 5 * dpr, ly);
     const tx = S.tx.get(b.id);
     if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, x1 + 5 * dpr, ly + 16 * dpr, tx.no_speech_prob > 0.6, playing);
     if (!chains.has(b.chain)) chains.set(b.chain, []);
     chains.get(b.chain).push(b);
   }
-  ctx.save(); ctx.setLineDash([3 * dpr, 4 * dpr]); ctx.strokeStyle = "rgba(110,231,216,.8)"; ctx.lineWidth = 1.2 * dpr;
+  ctx.save(); ctx.setLineDash([3 * dpr, 4 * dpr]); ctx.strokeStyle = TH.link; ctx.lineWidth = 1.2 * dpr;
   for (const list of chains.values()) {
     list.sort((a, b) => a.t0 - b.t0);
     for (let i = 1; i < list.length; i++) {
@@ -182,21 +196,21 @@ function draw() {
   if ($("#caps").checked) for (const [cid, list] of chains) {
     const tx = S.chainTx.get(cid); if (!tx || !tx.text || list.length < 2) continue;
     const b = list[list.length - 1];
-    caption(`⛓ “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 16 * dpr, tx.no_speech_prob > 0.6, false, "#6ee7d8");
+    caption(`⛓ “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 16 * dpr, tx.no_speech_prob > 0.6, false, TH.link);
   }
   // playback line (draggable): the stream time being heard right now
   const yPlay = (top - (now - S.offset - S.delay)) * pps;
   if (yPlay >= -2 && yPlay <= H + 2) {
-    ctx.save(); ctx.strokeStyle = dragging ? "#ffe08a" : "rgba(255,204,77,.85)"; ctx.lineWidth = (dragging ? 2 : 1.3) * dpr;
+    ctx.save(); ctx.strokeStyle = TH.play; ctx.globalAlpha = dragging ? 1 : 0.85; ctx.lineWidth = (dragging ? 2 : 1.3) * dpr;
     ctx.setLineDash([7 * dpr, 5 * dpr]); ctx.beginPath(); ctx.moveTo(0, yPlay); ctx.lineTo(W, yPlay); ctx.stroke(); ctx.setLineDash([]);
     const label = `▶ ${S.delay.toFixed(2)} s behind live`; const lw = ctx.measureText(label).width;
-    ctx.fillStyle = "rgba(7,9,12,.8)"; ctx.fillRect(W - lw - 22 * dpr, yPlay - 10 * dpr, lw + 14 * dpr, 20 * dpr);
-    ctx.strokeStyle = "rgba(255,204,77,.85)"; ctx.lineWidth = dpr; ctx.strokeRect(W - lw - 22 * dpr, yPlay - 10 * dpr, lw + 14 * dpr, 20 * dpr);
-    ctx.fillStyle = "#ffcc4d"; ctx.fillText(label, W - lw - 15 * dpr, yPlay + 4 * dpr);
+    ctx.globalAlpha = 1; ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(W - lw - 22 * dpr, yPlay - 10 * dpr, lw + 14 * dpr, 20 * dpr);
+    ctx.lineWidth = dpr; ctx.strokeRect(W - lw - 22 * dpr, yPlay - 10 * dpr, lw + 14 * dpr, 20 * dpr);
+    ctx.fillStyle = TH.play; ctx.fillText(label, W - lw - 15 * dpr, yPlay + 4 * dpr);
     ctx.restore();
   }
   if (!S.follow) {
-    ctx.fillStyle = "rgba(157,140,255,.9)";
+    ctx.fillStyle = TH.accent;
     ctx.fillText(`⏸ history · ${(liveTop() - top).toFixed(0)} s before live`, 6 * dpr, H - 26 * dpr);
   }
   ensureHistory(top, H / dpr);
@@ -207,11 +221,11 @@ function caption(text, x, y, doubtful, playing, color) {
   const dpr = devicePixelRatio;
   if (text.length > 90) text = text.slice(0, 88) + "…”";
   ctx.save();
-  ctx.font = `italic ${(playing ? 13 : 12) * dpr}px Inter,system-ui,sans-serif`;
+  ctx.font = `italic ${(playing ? 13 : 12) * dpr}px ${TH.sans}`;
   const w = ctx.measureText(text).width;
   if (x + w > cv.width - 6 * dpr) x = Math.max(4 * dpr, cv.width - w - 10 * dpr);
   ctx.fillStyle = "rgba(5,7,10,.72)"; ctx.fillRect(x - 4 * dpr, y - 13 * dpr, w + 8 * dpr, 18 * dpr);
-  ctx.fillStyle = doubtful ? "rgba(170,178,190,.75)" : (color || (playing ? "#ffe08a" : "#fff"));
+  ctx.fillStyle = doubtful ? "rgba(170,178,190,.75)" : (color || (playing ? TH.play : "#fff"));
   ctx.fillText(text, x, y);
   ctx.restore();
 }
@@ -365,7 +379,7 @@ function renderList() {
     }
     for (const r of S.recs.slice(0, 250)) {
       const sameSession = r.epoch && Math.abs(r.epoch - S.epoch) < 1e-3;
-      const t = new Date(r.utc_start).toLocaleTimeString([], TFMT);
+      const t = hms(new Date(r.utc_start));
       const recent = Date.now() - new Date(r.utc_start).getTime() < 180e3;
       rows.push(rowFor({ key: recKey(r), f: r.freq_hz.mean, t, conf: r.confidence.max, tx: r.transcript,
         pending: recent && !r.transcript && r.confidence.max >= minConf && S.cfg && S.cfg.whisper.enabled,
@@ -468,11 +482,18 @@ $("#preset").addEventListener("change", async e => {
 // ---------------- detector tab ----------------
 function buildDetector() {
   const root = $("#detector"), c = S.cfg; root.replaceChildren();
+  const isActive = v => Object.entries(v.detect).every(([k, x]) => Math.abs(c.detect[k] - x) < 1e-9)
+    && Object.entries(v.checks).every(([id, o]) => Object.entries(o).every(([k, x]) => c.checks[id][k] === x));
   const seg = el("div", { class: "seg" }, ...Object.entries(S.sens).map(([k, v]) => el("button", {
-    onclick: async () => { await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ detect: v.detect, checks: v.checks }) }); }
+    class: isActive(v) ? "on" : "",
+    onclick: async e => {
+      e.currentTarget.blur();
+      const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ detect: v.detect, checks: v.checks }) });
+      S.cfg = await r.json(); buildDetector();
+    }
   }, v.label)));
   root.append(el("h2", {}, "Sensitivity"), seg,
-    el("div", { class: "note" }, "Ghost hunter and Everything let far more human-ish fragments through (expect more false alarms). Fine-tune below."));
+    el("div", { class: "note" }, "Sets thresholds, tracking limits and the voice-check weights in one click. Ghost hunter and Everything let far more human-ish fragments through (expect more false alarms). Checks you switched off stay off."));
   root.append(el("h2", {}, "Thresholds & tracking"),
     slider("Candidate threshold", ["detect", "candidate_threshold"], 0, 1, 0.01, v => v.toFixed(2)),
     slider("Detection threshold", ["detect", "threshold"], 0, 1, 0.01, v => v.toFixed(2)),
@@ -526,7 +547,11 @@ async function buildSDR() {
   const ppm = num(sdr.ppm ?? 0, 1), bin = el("select", { class: "sel" }, ...[62.5, 125, 250, 500].map(b => el("option", { value: b }, b + " Hz")));
   bin.value = c.analysis.bin_hz;
   const apply = async (p) => { await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) }); await fetch("/api/restart", { method: "POST" }); };
+  const themeSel = el("select", { class: "sel" }, ...THEMES.map(([k, l]) => el("option", { value: k }, l)));
+  themeSel.value = lsGet("gb_theme", "midnight"); themeSel.addEventListener("change", () => setTheme(themeSel.value));
   root.append(
+    el("h2", {}, "Appearance"),
+    rowW("Theme (this browser)", themeSel),
     el("h2", {}, "Analysis range"),
     rowW("From (MHz, blank = whole capture)", fmin), rowW("To (MHz, blank = whole capture)", fmax),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { fmin_hz: fmin.value === "" ? null : +fmin.value * 1e6, fmax_hz: fmax.value === "" ? null : +fmax.value * 1e6 } }) }, "Apply range")),
@@ -589,8 +614,11 @@ function setStatus(s) {
   const st = $("#status");
   st.className = ok ? "" : "bad";
   const w = s.whisper || {};
-  st.textContent = ok ? `CPU ${(s.load * 100).toFixed(0)}%${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue ? ` · transcribing ${w.queue}` : ""}${s.error ? " · " + s.error : ""}`
+  const behind = ok && s.load > 1;
+  st.className = ok && !behind ? "" : "bad";
+  st.textContent = ok ? `CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: lower the sample rate or narrow the analysis range" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue ? ` · transcribing ${w.queue}` : ""}${s.error ? " · " + s.error : ""}`
     : `${s.state}${s.error ? ": " + s.error : ""}`;
+  st.title = st.textContent;
 }
 
 // ---------------- websocket ----------------

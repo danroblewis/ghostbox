@@ -1,0 +1,6 @@
+/* Midnight: the default. Cool near-black, violet accent, soft corners. */
+:root{--bg:#07090c;--surface:#0e1217;--surface2:#141a21;--raise:#1b222b;--line:#232b35;--line2:#2e3844;
+--fg:#e6ebf1;--dim:#9aa5b4;--faint:#5d6876;--accent:#9d8cff;--accent2:#6ee7d8;--good:#5ad17a;--bad:#ff6b6b;
+--play:#ffcc4d;--link:#6ee7d8;--onaccent:#0b0820;--knob:#fff;
+--r:8px;--rc:7px;--rk:50%;--rp:999px;
+--wfbg:#05070a;--grid:rgba(255,255,255,.07);--gridtext:rgba(230,235,241,.6);--tipbg:rgba(7,9,12,.85)}

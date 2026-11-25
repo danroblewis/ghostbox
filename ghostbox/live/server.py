@@ -83,6 +83,12 @@ def make_app(args):
     async def on_cleanup(app):
         state["engine"].stop()
 
+    async def no_cache(request, response):
+        # the page changes often while we iterate; don't let browsers run stale JS/CSS
+        if request.path.startswith("/static/") or request.path == "/":
+            response.headers["Cache-Control"] = "no-cache"
+
+    app.on_response_prepare.append(no_cache)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 

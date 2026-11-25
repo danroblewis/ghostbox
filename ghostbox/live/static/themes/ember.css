@@ -1,0 +1,6 @@
+/* Ember: warm charcoal and amber, generous rounding. */
+:root{--bg:#0f0b08;--surface:#17110d;--surface2:#201812;--raise:#2a1f17;--line:#33261c;--line2:#4a3727;
+--fg:#f4e9dc;--dim:#c2a98e;--faint:#7d6550;--accent:#ff8a3d;--accent2:#ffd166;--good:#9bd36b;--bad:#ff5a4e;
+--play:#ffd166;--link:#ffb36b;--onaccent:#1a0d04;--knob:#fff4e6;
+--r:14px;--rc:11px;--rk:50%;--rp:999px;
+--wfbg:#0a0705;--grid:rgba(255,220,180,.07);--gridtext:rgba(244,233,220,.6);--tipbg:rgba(15,11,8,.9)}

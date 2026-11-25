@@ -1,0 +1,7 @@
+/* Paper: light theme, ink and indigo, crisp small corners. The waterfall stays dark (it's data). */
+:root{--shadek:.45;--bg:#f4f1ea;--surface:#fbf9f4;--surface2:#ffffff;--raise:#efe9dc;--line:#e2dccd;--line2:#cfc6b2;
+--fg:#1d1b17;--dim:#5e5747;--faint:#9a917c;--accent:#4f46e5;--accent2:#0f766e;--good:#15803d;--bad:#b91c1c;
+--play:#d97706;--link:#0f766e;--onaccent:#ffffff;--knob:#ffffff;
+--r:4px;--rc:4px;--rk:50%;--rp:999px;
+--wfbg:#0b0d10;--grid:rgba(255,255,255,.08);--gridtext:rgba(240,240,240,.7);--tipbg:rgba(251,249,244,.96)}
+input[type=range]::-webkit-slider-thumb,input[type=range]::-moz-range-thumb{border:1px solid var(--line2)}

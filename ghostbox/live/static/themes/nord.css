@@ -1,0 +1,6 @@
+/* Nord: arctic slate blues, frost accent, modest rounding. */
+:root{--bg:#242933;--surface:#2e3440;--surface2:#3b4252;--raise:#434c5e;--line:#3b4252;--line2:#4c566a;
+--fg:#eceff4;--dim:#d8dee9;--faint:#8892a6;--accent:#88c0d0;--accent2:#8fbcbb;--good:#a3be8c;--bad:#bf616a;
+--play:#ebcb8b;--link:#8fbcbb;--onaccent:#1e2530;--knob:#eceff4;
+--r:6px;--rc:5px;--rk:50%;--rp:999px;
+--wfbg:#1b1f27;--grid:rgba(236,239,244,.07);--gridtext:rgba(236,239,244,.6);--tipbg:rgba(36,41,51,.92)}

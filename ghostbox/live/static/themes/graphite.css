@@ -1,0 +1,6 @@
+/* Graphite: neutral greys, white accent, nearly square, very quiet. */
+:root{--bg:#0d0d0d;--surface:#141414;--surface2:#1b1b1b;--raise:#232323;--line:#262626;--line2:#353535;
+--fg:#ededed;--dim:#a3a3a3;--faint:#666;--accent:#f5f5f5;--accent2:#a3a3a3;--good:#8fd18f;--bad:#f07070;
+--play:#f5f5f5;--link:#bdbdbd;--onaccent:#111;--knob:#fff;
+--r:3px;--rc:2px;--rk:2px;--rp:3px;
+--wfbg:#080808;--grid:rgba(255,255,255,.06);--gridtext:rgba(237,237,237,.55);--tipbg:rgba(13,13,13,.92)}
