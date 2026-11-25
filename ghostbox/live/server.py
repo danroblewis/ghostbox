@@ -90,8 +90,9 @@ def make_app(args):
         return json.dumps({k: v for k, v in c["sdr"].items() if k != "file"}, sort_keys=True)
 
     async def auto_tune_loop():
-        """With auto-tune on: run after every receiver change once enough IQ has been recorded since
-        the change, and again every `every_min` minutes."""
+        """With automatic recalibration on: calibrate after every receiver change once `minutes` of IQ
+        has been recorded since it, and recalibrate whenever nothing has been caught for `minutes`
+        (including after a run that found too little: it simply tries again later)."""
         while True:
             await asyncio.sleep(10)
             try:
@@ -102,8 +103,9 @@ def make_app(args):
                 if not c["iq_ring"]["enabled"]:                # auto-tune needs the IQ recording
                     apply({"iq_ring": {"enabled": True}})
                     continue
+                eng.show_conf = tune.show_conf if tune.show_conf is not None else c["detect"]["threshold"]
                 changed = tune.auto_band != rx_signature(c)
-                due = at.get("every_min", 0) > 0 and time.time() - tune.last_run >= at["every_min"] * 60
+                due = time.time() - max(eng.last_hit, tune.last_end) >= at["minutes"] * 60
                 if not (changed or due):
                     continue
                 _, have = await asyncio.get_running_loop().run_in_executor(
@@ -359,8 +361,8 @@ def make_app(args):
         return web.json_response({"ready": reason is None, "reason": reason, "have_s": round(have, 1), "need_s": need,
                                   "segment_s": c["iq_ring"]["segment_s"], "auto": c["autotune"]["auto"],
                                   "tuned": state["tune"].auto_band == rx_signature(c),
-                                  "next_in_s": max(0, round(c["autotune"].get("every_min", 0) * 60 - (time.time() - state["tune"].last_run)))
-                                  if c["autotune"].get("every_min", 0) > 0 and state["tune"].last_run else None})
+                                  "recal_in_s": max(0, round(c["autotune"]["minutes"] * 60 - (time.time() - max(
+                                      state["engine"].last_hit, state["tune"].last_end))))})
 
     async def tune_revert(request):
         return web.json_response({"ok": state["tune"].revert()})

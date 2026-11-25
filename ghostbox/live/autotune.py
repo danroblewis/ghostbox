@@ -199,6 +199,8 @@ class AutoTune:
         self.prev = None
         self.auto_band = None                           # receiver settings of the last tune (any outcome)
         self.last_run = 0.0
+        self.last_end = 0.0                             # when the last run finished (any outcome)
+        self.show_conf = None                           # display threshold the last successful run chose
         self._lock = threading.Lock()
 
     def _set(self, **kw):
@@ -310,9 +312,12 @@ class AutoTune:
             band = [fc - fs / 2, fc + fs / 2]
             if cfg["sdr"].get("fmin_hz") is not None:
                 band = [cfg["sdr"]["fmin_hz"], cfg["sdr"]["fmax_hz"]]
+            self.show_conf = res["show_threshold"]
             self._set(state="done", progress=1.0, result={
                 **res, "minutes": round(dur / 60, 2), "candidates": len(boxes),
                 "candidates_per_min": round(len(boxes) / (dur / 60), 1), "per_min": per_min, "band": band},
                 message="Applied.")
         except Exception as e:
             self._set(state="error", message=str(e), progress=None)
+        finally:
+            self.last_end = time.time()

@@ -846,45 +846,36 @@ function buildDetector() {
   root.append(el("div", { style: "margin:14px 0 20px" }, el("button", { class: "btn", onclick: async () => { if (confirm("Reset every setting to its default?")) await fetch("/api/reset", { method: "POST" }); } }, "Reset all settings")));
 }
 
-// ---------------- auto-tune ----------------
+// ---------------- calibration (auto-tune) ----------------
 const TUNE = { state: { state: "idle" }, get minutes() { return S.cfg ? S.cfg.autotune.minutes : 2; } };
 function tuneCard() {
   const st = TUNE.state, running = st.state === "running", at = S.cfg.autotune;
   const mins = el("select", { class: "sel" }, ...[1, 2, 5, 10].map(m => el("option", { value: m }, m + " min")));
   mins.value = at.minutes; mins.addEventListener("change", () => { patch({ autotune: { minutes: +mins.value } }, 50); setTimeout(pollReady, 300); });
-  const every = el("select", { class: "sel" }, ...[[0, "Never"], [15, "Every 15 min"], [30, "Every 30 min"], [60, "Every hour"]].map(([v, l]) => el("option", { value: v }, l)));
-  every.value = at.every_min ?? 30; every.addEventListener("change", () => patch({ autotune: { every_min: +every.value } }, 50));
   const go = el("button", { id: "tuneGo", class: "btn primary", disabled: running || !(TUNE.ready && TUNE.ready.ready), onclick: async () => {
     await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: at.minutes, per_min: at.per_min }) });
-  } }, running ? "Analysing…" : "Auto-tune now");
+  } }, running ? "Calibrating…" : "Recalibrate now");
   const out = el("div", { class: "note", style: "margin:8px 0 0" });
-  if (running) out.textContent = `${st.message || ""}${st.progress != null ? ` (${Math.round(st.progress * 100)}%)` : ""}`;
-  else if (st.state === "error") { out.className = "err"; out.textContent = (st.auto ? "Automatic run: " : "") + st.message; }
+  if (running) out.textContent = st.message || "";
+  else if (st.state === "error") { out.className = "err"; out.textContent = st.message; }
   else if (st.state === "done" && st.result) {
-    const r = st.result, pct = v => Math.round(v * 100) + "%";
+    const r = st.result;
     out.style.color = "var(--text-2)";
-    const summary = r.kept_checks
-      ? `Analysed ${r.minutes} min: ${r.candidates} candidates, ${r.voice_like ? "only " + r.voice_like : "none"} at least ${pct(at.floor)} speech-like. Tracking and candidate finding fixed; check weights left as they were (nothing to learn them from). Showing the best ${r.per_min} per minute anyway (≥ ${pct(r.show_threshold)}).`
-      : `Analysed ${r.minutes} min: ${r.candidates} candidates, ${r.voice_like} at least ${pct(at.floor)} speech-like. Aiming for ${r.target_count} in that time, the top detections now score ${pct(r.score_after)} on the voice detector (was ${pct(r.score_before)}). Showing ≥ ${pct(r.show_threshold)}, keeping ≥ ${pct(r.capture_threshold)} in memory.`;
-    const rows = (r.decisions || []).map(d => el("div", { class: "row", style: "min-height:22px;grid-template-columns:minmax(0,1fr) 70px 70px" },
+    const rows = (r.decisions || []).map(d => el("div", { class: "row", style: "min-height:22px;grid-template-columns:minmax(0,1fr) 70px" },
       el("label", { title: d.label }, d.label),
-      el("span", { class: "num", style: `text-align:right;color:${d.on ? "var(--text)" : "var(--text-3)"}` }, d.on ? "× " + d.weight : "off"),
-      el("span", { class: "num t3", style: "text-align:right", title: "How much the top detections' voice score drops without this check" }, d.on ? (d.effect >= 0 ? "+" : "") + Math.round(d.effect * 100) : "")));
-    out.replaceChildren(el("div", {}, (st.auto ? "Automatic run. " : "") + summary),
-      rows.length ? el("details", { style: "margin-top:6px" }, el("summary", {}, "What it decided for each check"), ...rows) : "");
-  } else if (st.state === "reverted" || st.state === "quiet") out.textContent = (st.auto && st.state === "quiet" ? "Automatic run: " : "") + st.message;
+      el("span", { class: "num", style: `text-align:right;color:${d.on ? "var(--text)" : "var(--text-3)"}` }, d.on ? "× " + d.weight : "off")));
+    out.replaceChildren(el("div", {}, `Calibrated on ${r.candidates} candidates, ${r.voice_like} speech-like.`),
+      rows.length ? el("details", { style: "margin-top:6px" }, el("summary", {}, "Check settings chosen"), ...rows) : "");
+  } else if (st.state === "quiet" || st.state === "reverted") out.textContent = st.message;
   return el("div", { class: "card", style: "border-top:0;padding-top:0" },
-    el("h2", { style: "margin-top:12px" }, "Auto-tune"),
-    el("div", { class: "desc" }, "Learns from IQ recorded on this band since the last receiver change: tries every check on, off and at different weights, keeps what makes the top detections most speech-like (judged by the ML voice detector), switches off what doesn't help, and sets the thresholds."),
-    el("div", { class: "row wide" }, el("label", { title: "Runs after any receiver change once enough IQ is recorded, and on the schedule below" }, "Tune automatically"),
+    el("h2", { style: "margin-top:12px" }, "Calibration"),
+    el("div", { class: "row wide" }, el("label", { title: "Calibrates after any receiver change, and recalibrates whenever nothing is caught for the time below" }, "Recalibrate automatically"),
       toggle(!!at.auto, v => patch({ autotune: { auto: v }, ...(v ? { iq_ring: { enabled: true } } : {}) }, 50))),
-    el("div", { class: "row wide" }, el("label", {}, "Also re-tune"), every),
     el("div", { class: "row wide" }, el("label", {}, "Analyse the last"), mins),
     slider("Max detections per min", ["autotune", "per_min"], 1, 30, 1, v => v + " / min"),
     slider("Voice-likeness floor", ["autotune", "floor"], 0, 0.9, 0.05, v => Math.round(v * 100) + "%"),
     readyBlock(),
-    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go,
-      st.state === "done" ? el("button", { class: "btn", onclick: () => fetch("/api/autotune/revert", { method: "POST" }) }, "Revert") : null),
+    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go),
     out);
 }
 // Readiness: the server says how much continuous IQ exists for this band; between polls the
@@ -904,17 +895,17 @@ function tickReady() {
   box.style.display = r.ready && !running ? "none" : "";
   $("#tuneBarFill").style.width = (100 * have / r.need_s).toFixed(1) + "%";
   const txt = $("#tuneReadyTxt"), act = $("#tuneReadyAct");
-  if (r.reason === "file") { txt.textContent = "Auto-tune needs a live receiver: it learns from IQ recorded at the current frequency."; act.replaceChildren(); }
+  if (r.reason === "file") { txt.textContent = "Calibration needs a live receiver: it learns from IQ recorded at the current frequency."; act.replaceChildren(); }
   else if (r.reason === "off") {
     txt.textContent = `Raw IQ recording is off (${fmtMS(have)} of ${fmtMS(r.need_s)} recorded here).`;
     if (!act.firstChild) act.replaceChildren(el("button", { class: "btn", onclick: () => { patch({ iq_ring: { enabled: true } }, 50); r.reason = "recording"; r.at = Date.now(); } }, "Start recording IQ"));
   } else {
     const left = fmtMS(Math.max(0, r.need_s * 0.95 - have));
-    const nextIn = r.next_in_s != null ? Math.max(0, r.next_in_s - (Date.now() - r.at) / 1000) : null;
+    const recal = r.recal_in_s != null ? Math.max(0, r.recal_in_s - (Date.now() - r.at) / 1000) : null;
     txt.textContent = r.auto && r.tuned
-      ? (nextIn != null ? `Tuned for these settings. Next re-tune in ${fmtMS(nextIn)}.` : "Tuned for these settings. It runs again after any receiver change.")
-      : ready ? (r.auto ? "Enough recorded; auto-tune starts within 10 s." : "Ready.")
-      : `Recording since the last receiver change: ${fmtMS(have)} of ${fmtMS(r.need_s)} · ${r.auto ? "auto-tune runs in" : "ready in"} ${left}`;
+      ? (recal > 0 ? `Calibrated. Recalibrates if nothing is caught for ${fmtMS(recal)}.` : "Nothing caught lately; recalibrating shortly.")
+      : ready ? (r.auto ? "Enough recorded; calibrating within 10 s." : "Ready.")
+      : `Recording since the last receiver change: ${fmtMS(have)} of ${fmtMS(r.need_s)} · ${r.auto ? "calibrates in" : "ready in"} ${left}`;
     act.replaceChildren();
   }
   if (r.auto && r.tuned) box.style.display = "";

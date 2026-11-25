@@ -179,6 +179,8 @@ class Engine:
         score_all: check ids to compute for every track even when disabled (auto-tune needs every
         column); they don't affect which candidates are found or their confidence."""
         self.score_all = set(score_all)
+        self.show_conf = 0.0                     # what counts as "caught something" for auto-recalibration
+        self.last_hit = time.time()
         self.config = config
         self.emit = emit
         self.root = Path(root)
@@ -250,6 +252,7 @@ class Engine:
         # continuous timeline across receiver restarts: start this session at "now"
         self.n_samples = int(round((time.time() - self.t_origin) * self.fs))
         self.session_t0 = self.n_samples / self.fs              # when the current receiver settings began
+        self.last_hit = time.time()                              # last detection at/above show_conf (wall clock)
         self.raw_keep = int(self.fs * (an["window_s"] + 4))
         self.raw = np.zeros(self.raw_keep, np.complex64)
         self.spec, self.spec_t = [], []
@@ -707,6 +710,8 @@ class Engine:
                 tr.detected = True
                 self.emit({"type": "det", "box": tr.box(self.fc)})
             if tr.detected:
+                if tr.conf >= self.show_conf:
+                    self.last_hit = time.time()
                 self._emit_audio(tr)
                 self.emit({"type": "det_update", "box": tr.box(self.fc)})
                 if tr.t_last - tr.seg_start >= cfg["record"]["max_s"]:
