@@ -127,7 +127,14 @@ function ensureHistory(top, H) {
 
 // ---------------- time ----------------
 function liveTop() { return S.offset === null ? null : nowS() - S.offset - S.lag; }
-function topTime() { return S.follow ? liveTop() : S.viewTop; }
+// The playhead is the stream time being heard: live minus S.delay. Live listening is just a small delay;
+// clicking the waterfall moves the playhead anywhere in history and playback continues from there.
+// While following, the view keeps the playhead line S.lineY seconds below the top edge.
+function playheadTime() { return nowS() - S.offset - S.delay; }
+function topTime() {
+  const live = liveTop(); if (live === null) return null;
+  return S.follow ? Math.min(live, playheadTime() + S.lineY) : S.viewTop;
+}
 function syncClock(t) {
   if (typeof t !== "number") return;
   S.offsets.push(nowS() - t); if (S.offsets.length > 20) S.offsets.shift();
@@ -212,7 +219,9 @@ function draw() {
   if (yPlay >= -2 && yPlay <= H + 2) {
     ctx.save(); ctx.strokeStyle = TH.mark; ctx.globalAlpha = dragging ? 1 : 0.8; ctx.lineWidth = (dragging ? 1.5 : 1) * dpr;
     ctx.setLineDash([6 * dpr, 4 * dpr]); ctx.beginPath(); ctx.moveTo(0, yPlay); ctx.lineTo(W, yPlay); ctx.stroke(); ctx.setLineDash([]);
-    const label = `Playback  −${S.delay.toFixed(2)} s`; const lw = ctx.measureText(label).width;
+    const back = S.delay < 60 ? `−${S.delay.toFixed(2)} s` : `−${Math.floor(S.delay / 60)}:${pad2(Math.floor(S.delay % 60))}`;
+    const label = S.delay < 15 ? `Playback  ${back}` : `Playback  ${clockTime(playheadTime())}  (${back})`;
+    const lw = ctx.measureText(label).width;
     ctx.globalAlpha = 1; ctx.fillStyle = TH.bg; ctx.fillRect(W - lw - 18 * dpr, yPlay - 9 * dpr, lw + 12 * dpr, 18 * dpr);
     ctx.fillStyle = TH.mark; ctx.fillText(label, W - lw - 12 * dpr, yPlay + 4 * dpr);
     ctx.restore();
@@ -240,32 +249,49 @@ function caption(text, x, y, doubtful, playing, color) {
 function niceStep(x) { const p = Math.pow(10, Math.floor(Math.log10(x))); const m = x / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
 
 // ---------------- waterfall interaction ----------------
-let dragging = false, downAt = null;
+let dragging = false, dragTop = 0, downAt = null;
 function canvasPos(e) { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top, r]; }
-function playLineY() { const top = topTime(); return top === null ? -1e9 : (top - (nowS() - S.offset - S.delay)) * S.pps; }
+function playLineY() { const top = topTime(); return top === null ? -1e9 : (top - playheadTime()) * S.pps; }
 function boxAt(x, y) {
   for (const d of S.dets.values()) { const r = d.box._rect; if (r && x >= r[0] - 4 && x <= r[2] + 4 && y >= r[1] - 4 && y <= r[3] + 4) return d; }
   return null;
 }
+function setPlayhead(t, lineY) {
+  const maxBack = 60 * ((S.cfg && S.cfg.display.history_min) || 20);
+  S.delay = Math.max(S.lag, Math.min(maxBack, Math.round((nowS() - S.offset - t) * 4) / 4));
+  S.lineY = Math.max(0, Math.min(lineY, S.delay - S.lag));
+  S.follow = true; updateNav();
+}
+function returnToLive() {
+  S.delay = Math.max(S.lag, +lsGet("gb_delay", 4)); S.lineY = S.delay - S.lag; S.follow = true;
+  updateNav(); restartPlayback();
+}
+function updateNav() {
+  $("#followBtn").style.display = S.follow ? "none" : "inline-flex";
+  $("#liveBtn").style.display = S.delay > Math.max(8, +lsGet("gb_delay", 4) + 2) ? "inline-flex" : "none";
+}
 cv.addEventListener("mousedown", e => {
   const [x, y] = canvasPos(e);
-  if (Math.abs(y - playLineY()) < 7) { dragging = true; e.preventDefault(); return; }
+  if (Math.abs(y - playLineY()) < 7) { dragging = true; dragTop = topTime(); e.preventDefault(); return; }
   downAt = [x, y];
 });
 window.addEventListener("mouseup", e => {
-  if (dragging) { dragging = false; lsSet("gb_delay", S.delay); return; }
+  if (dragging) {
+    dragging = false;
+    if (S.delay < 15) lsSet("gb_delay", S.delay);          // remember small delays as the live preference
+    restartPlayback(); return;
+  }
   if (!downAt) return;
   const [x, y] = canvasPos(e); const moved = Math.hypot(x - downAt[0], y - downAt[1]); downAt = null;
   if (moved > 4) return;
-  const d = boxAt(x, y); if (d) togglePlay(detKey(d), d);
+  const d = boxAt(x, y);
+  if (d) { togglePlay(detKey(d), d); return; }
+  const top = topTime(); if (top === null) return;          // empty spot: play from here
+  setPlayhead(top - y / S.pps, y / S.pps); restartPlayback();
 });
 cv.addEventListener("mousemove", e => {
   const [x, y, r] = canvasPos(e); const top = topTime(); if (top === null) return;
-  if (dragging) {
-    const tPlay = top - y / S.pps;
-    S.delay = Math.max(S.lag, Math.min(30, Math.round((nowS() - S.offset - tPlay) * 4) / 4));
-    return;
-  }
+  if (dragging) { setPlayhead(dragTop - y / S.pps, y / S.pps); return; }
   cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : boxAt(x, y) ? "pointer" : "crosshair";
   const f = S.fmin + x / r.width * (S.fmax - S.fmin), tip = $("#tip");
   tip.style.display = "block"; tip.style.left = Math.min(x + 14, r.width - 170) + "px"; tip.style.top = (y + 14) + "px";
@@ -275,30 +301,30 @@ cv.addEventListener("mouseleave", () => { $("#tip").style.display = "none"; });
 cv.addEventListener("wheel", e => {
   e.preventDefault();
   const top = topTime(); if (top === null) return;
-  if (e.ctrlKey || e.metaKey) {                          // zoom the time axis around the cursor
+  if (e.ctrlKey || e.metaKey) {                            // zoom the time axis around the cursor
     const [, y] = canvasPos(e); const tAt = top - y / S.pps;
     S.pps = Math.max(3, Math.min(160, S.pps * Math.exp(-e.deltaY * 0.0025))); lsSet("gb_pps", S.pps);
     if (!S.follow) S.viewTop = tAt + y / S.pps;
+    else S.lineY = Math.max(0, Math.min(S.delay - S.lag, S.lineY));
     return;
   }
-  const live = liveTop();
-  if (S.follow) { S.follow = false; S.viewTop = live; }
-  S.viewTop = Math.min(live, S.viewTop - e.deltaY / S.pps);
-  if (S.viewTop >= live - 0.05) S.follow = true;
-  $("#liveBtn").style.display = S.follow ? "none" : "inline-flex";
+  if (S.follow) { S.follow = false; S.viewTop = top; }       // browse without moving the playhead
+  S.viewTop = Math.min(liveTop(), S.viewTop - e.deltaY / S.pps);
+  updateNav();
 }, { passive: false });
-$("#liveBtn").addEventListener("click", () => { S.follow = true; $("#liveBtn").style.display = "none"; });
+$("#followBtn").addEventListener("click", () => { S.follow = true; updateNav(); });
+$("#liveBtn").addEventListener("click", returnToLive);
 function jumpTo(t) {
   const H = cv.clientHeight; S.follow = false; S.viewTop = Math.min(liveTop(), t + H / S.pps * 0.4);
-  $("#liveBtn").style.display = "inline-flex";
+  updateNav();
 }
 
 // ---------------- audio ----------------
 let AC = null, master = null;
 function ensureAudio() {
   if (!AC) { AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.connect(AC.destination); master.gain.value = +$("#vol").value; }
-  AC.resume();
   const b = $("#audioBtn"); b.textContent = "Audio on"; b.classList.remove("primary"); b.classList.add("on");
+  AC.resume().then(restartPlayback);                       // schedule once audio is actually running
 }
 $("#audioBtn").addEventListener("click", () => {
   if (AC && AC.state === "running" && $("#audioBtn").classList.contains("on")) {
@@ -308,18 +334,77 @@ $("#audioBtn").addEventListener("click", () => {
 });
 $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) master.gain.value = +e.target.value; });
 
-function onAudio(m) {                                    // live, delayed playback of every detection
+// Playback scheduler: every detection plays when the playhead reaches it. Audio comes from the
+// chunks received live (with their stream times) or, for older detections, from their WAV files.
+// Only what the playhead reaches within the next 30 s is scheduled; moving the playhead restarts it.
+const PB = { gen: 0, sources: [], gain: null };
+function streamOut() { if (!PB.gain) { PB.gain = AC.createGain(); PB.gain.connect(master); } return PB.gain; }
+function pcmBuffer(pcm, rate) {
+  const buf = AC.createBuffer(1, pcm.length, rate), ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  return buf;
+}
+async function decodeWavs(wavs) {
+  const parts = [];
+  for (const w of wavs) { try { parts.push(await AC.decodeAudioData(await (await fetch("/rec/" + w)).arrayBuffer())); } catch (e) {} }
+  if (!parts.length) return null;
+  const n = parts.reduce((a, p) => a + p.length, 0), buf = AC.createBuffer(1, n, parts[0].sampleRate);
+  let o = 0; for (const p of parts) { buf.getChannelData(0).set(p.getChannelData(0), o); o += p.length; }
+  return buf;
+}
+function playAt(d, buf, tStart, rate) {                     // buf: AudioBuffer or Int16 PCM starting at stream time tStart
+  const dur = buf.duration ?? buf.length / rate, now = nowS(), when = tStart + S.offset + S.delay;
+  const skip = Math.max(0, now - when); if (skip >= dur) return;
+  d.playing.push([Math.max(when, now), when + dur]); if (d.playing.length > 300) d.playing.shift();
+  if (!AC || AC.state !== "running") return;
+  const src = AC.createBufferSource(); src.buffer = buf.duration !== undefined ? buf : pcmBuffer(buf, rate);
+  src.connect(streamOut()); src.start(AC.currentTime + Math.max(0, when - now), skip);
+  PB.sources.push(src); src.onended = () => { const i = PB.sources.indexOf(src); if (i >= 0) PB.sources.splice(i, 1); };
+}
+function restartPlayback() {
+  PB.gen++;
+  for (const s of PB.sources) { try { s.stop(); } catch (e) {} }
+  PB.sources = [];
+  for (const d of S.dets.values()) { d.playing = []; d.sched = new Set(); d.wavSched = false; }
+  schedulePlayback();
+}
+function schedulePlayback() {
+  if (S.offset === null) return;
+  const ph = playheadTime(), horizon = ph + 30;
+  for (const d of S.dets.values()) {
+    if (!d.sched) d.sched = new Set();
+    const b = d.box;
+    if (b.t1 < ph - 0.5 || b.t0 > horizon) continue;
+    const chunks = d.chunks || [], whole = chunks.length && chunks[0].t <= b.t0 + 0.5;
+    const wavs = b.wavs && b.wavs.length;
+    if (whole || (chunks.length && !wavs)) {
+      for (const c of chunks) {
+        const key = c.t.toFixed(3);
+        if (d.sched.has(key) || c.t + c.pcm.length / c.rate < ph || c.t > horizon) continue;
+        d.sched.add(key); playAt(d, c.pcm, c.t, c.rate);
+      }
+    } else if (wavs && !d.wavSched) {
+      d.wavSched = true; const gen = PB.gen;
+      if (!AC) {                                           // no audio yet: still light the box as the playhead passes
+        const when = b.t0 + S.offset + S.delay; d.playing.push([when, when + (b.t1 - b.t0)]); continue;
+      }
+      (d.wavBuf ? Promise.resolve(d.wavBuf) : (AC ? decodeWavs(b.wavs) : Promise.resolve(null))).then(buf => {
+        if (buf) d.wavBuf = buf;
+        if (gen === PB.gen && buf) playAt(d, buf, b.t0);
+      });
+    }
+  }
+}
+setInterval(schedulePlayback, 2000);
+
+function onAudio(m) {                                      // live chunk: keep it, and schedule if the playhead will reach it
   const d = S.dets.get(m.id); if (!d || S.offset === null) return;
   const pcm = new Int16Array(b64bytes(m.pcm).buffer);
   d.pcm.push(pcm); if (d.pcm.length > 120) d.pcm.shift();
-  const dur = pcm.length / m.rate, when = m.t + S.offset + S.delay, now = nowS();
-  const skip = Math.max(0, now - when); if (skip >= dur) return;
-  d.playing.push([Math.max(when, now), when + dur]); if (d.playing.length > 200) d.playing.shift();
-  if (!AC || AC.state !== "running" || S.playing) return; // a clicked clip has the floor
-  const buf = AC.createBuffer(1, pcm.length, m.rate), ch = buf.getChannelData(0);
-  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
-  const src = AC.createBufferSource(); src.buffer = buf; src.connect(master);
-  src.start(AC.currentTime + Math.max(0, when - now), skip);
+  d.chunks = d.chunks || []; d.chunks.push({ t: m.t, pcm, rate: m.rate }); if (d.chunks.length > 150) d.chunks.shift();
+  if (!d.sched) d.sched = new Set();
+  const key = m.t.toFixed(3);
+  if (!d.sched.has(key) && m.t + pcm.length / m.rate >= playheadTime()) { d.sched.add(key); playAt(d, pcm, m.t, m.rate); }
 }
 
 // click-to-play: a detection (live PCM or its recording) or a saved recording
@@ -327,7 +412,7 @@ const detKey = d => d.box.wavs && d.box.wavs.length ? "wav:" + d.box.wavs[0] : "
 const recKey = r => "wav:" + r.files.wav;
 async function togglePlay(key, det, rec) {
   ensureAudio();
-  if (S.playing) { const old = S.playing.key; try { S.playing.src.stop(); } catch (e) {} S.playing = null; setPlayingUI(old, false); if (old === key) return; }
+  if (S.playing) { const old = S.playing.key; try { S.playing.src.stop(); } catch (e) {} S.playing = null; setPlayingUI(old, false); if (PB.gain) PB.gain.gain.value = 1; if (old === key) return; }
   let buf = null;
   const wavs = rec ? [rec.files.wav] : (det && det.box.wavs) || [];
   if (wavs.length) {
@@ -347,7 +432,8 @@ async function togglePlay(key, det, rec) {
   if (!det && rec) det = [...S.dets.values()].find(d => (d.box.wavs || []).includes(rec.files.wav));
   S.playing = { key, src, start: AC.currentTime, dur: buf.duration, det };
   if (det) det.playing.push([nowS(), nowS() + buf.duration]);
-  src.onended = () => { if (S.playing && S.playing.src === src) { S.playing = null; setPlayingUI(key, false); } };
+  src.onended = () => { if (S.playing && S.playing.src === src) { S.playing = null; setPlayingUI(key, false); if (PB.gain) PB.gain.gain.value = 1; } };
+  if (PB.gain) PB.gain.gain.value = 0;                     // a clicked clip has the floor
   setPlayingUI(key, true);
 }
 function updateRowProgress() {
@@ -712,7 +798,7 @@ function connect() {
       case "hello": {
         S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch;
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
-        S.delay = Math.max(S.lag, S.delay);
+        S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
         if (m.reset && m.reset.fmax) { S.fmin = m.reset.fmin; S.fmax = m.reset.fmax; }
         $("#view").replaceChildren(...m.views.map(v => el("option", { value: v.id }, v.label)));
         if (!m.views.some(v => v.id === S.view)) S.view = "power";

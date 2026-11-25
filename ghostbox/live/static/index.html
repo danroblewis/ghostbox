@@ -80,7 +80,6 @@ main{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 400px;min-height:0}
 #wfwrap{position:relative;flex:1;min-height:280px;overflow:hidden;background:var(--wf-bg)}
 canvas#wf{position:absolute;inset:0;width:100%;height:100%;display:block}
 #tip{position:absolute;pointer-events:none;background:var(--panel);color:var(--text);border:1px solid var(--line-strong);padding:3px 6px;border-radius:var(--radius);font:11px var(--mono);display:none;white-space:nowrap}
-#liveBtn{position:absolute;right:12px;bottom:12px;display:none}
 
 #side{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
 .tabs{display:flex;padding:0 12px;border-bottom:1px solid var(--line)}
@@ -175,7 +174,10 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
     </div>
     <div id="wfwrap">
       <canvas id="wf"></canvas><div id="tip"></div>
-      <button id="liveBtn" class="btn primary">Return to live</button>
+      <div id="nav" style="position:absolute;right:12px;bottom:12px;display:flex;gap:6px">
+        <button id="followBtn" class="btn" style="display:none">Follow playhead</button>
+        <button id="liveBtn" class="btn primary" style="display:none">Return to live</button>
+      </div>
     </div>
   </section>
   <aside id="side">
