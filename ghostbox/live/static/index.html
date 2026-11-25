@@ -27,6 +27,10 @@ button,select,input{font:inherit;color:inherit;font-variant-numeric:tabular-nums
 .btn:disabled{opacity:.4;cursor:default}
 .btn.icon{width:28px;padding:0;justify-content:center}
 .btn.icon svg{width:10px;height:10px;fill:currentColor}
+.seg button.icon{width:28px;padding:0;display:inline-flex;align-items:center;justify-content:center;color:var(--text-2)}
+.seg button.icon:hover{color:var(--text)}
+.seg button.icon svg{height:10px;width:auto;fill:currentColor}
+.seg button:disabled{opacity:.4;cursor:default}
 .btn.on{border-color:var(--accent);color:var(--accent)}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
 .seg{display:inline-flex}
@@ -73,7 +77,6 @@ main{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 400px;min-height:0}
 #wfbar{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
 #wfbar .lbl{color:var(--text-2);font-size:12px}
 #wfbar input[type=range]{width:72px}
-#wfbar .hint{margin-left:auto;font-size:11.5px;color:var(--text-3)}
 #wfwrap{position:relative;flex:1;min-height:280px;overflow:hidden;background:var(--wf-bg)}
 canvas#wf{position:absolute;inset:0;width:100%;height:100%;display:block}
 #tip{position:absolute;pointer-events:none;background:var(--panel);color:var(--text);border:1px solid var(--line-strong);padding:3px 6px;border-radius:var(--radius);font:11px var(--mono);display:none;white-space:nowrap}
@@ -93,8 +96,10 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .dethead{height:28px;font-size:11px;color:var(--text-3);border-bottom:1px solid var(--line)}
 .dethead span:last-child{text-align:right}
 .det{position:relative;height:34px;border-bottom:1px solid var(--line);cursor:pointer;
-  background:linear-gradient(90deg,color-mix(in srgb,var(--mark) 16%,transparent) var(--p,0%),transparent var(--p,0%))}
-.det::before{content:"";position:absolute;left:0;top:5px;bottom:5px;width:3px;background:var(--mark);opacity:var(--a,.2)}
+  background:
+    linear-gradient(90deg,color-mix(in srgb,var(--mark) 30%,transparent) var(--p,0%),transparent var(--p,0%)),
+    linear-gradient(90deg,color-mix(in srgb,var(--mark) var(--ca,5%),transparent),color-mix(in srgb,var(--mark) var(--cb,2%),transparent))}
+.det::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--mark);opacity:var(--a,.2)}
 .det:hover{background-color:var(--hover)}
 .det .play{width:22px;height:22px;border:1px solid var(--line-strong);border-radius:var(--radius);background:var(--field);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;color:var(--text-2)}
 .det .play svg{width:8px;height:8px;fill:currentColor}
@@ -106,8 +111,12 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .det .x.none{color:var(--text-3)}
 .det .x.doubt{color:var(--text-2)}
 .det .c{font-family:var(--mono);font-size:11.5px;color:var(--text-2);text-align:right}
+.det.hi .c{color:var(--mark)}
 .det .live{position:absolute;left:3px;top:50%;transform:translateY(-50%);width:4px;height:4px;border-radius:50%;background:var(--alarm)}
-#detHead{display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px}
+#detHead{display:flex;align-items:center;gap:12px;padding:8px 12px}
+.search{flex:1;min-width:0;height:26px;border:0;border-bottom:1px solid var(--line-strong);background:transparent;padding:0 2px;outline:none;color:var(--text)}
+.search:focus{border-bottom-color:var(--accent)}
+.search::placeholder{color:var(--text-3)}
 
 /* settings */
 .row{display:grid;grid-template-columns:minmax(0,1fr) 120px 70px;align-items:center;gap:10px;min-height:28px}
@@ -131,12 +140,15 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 <header id="top">
   <i id="dot" title="Receiver status"></i>
   <div class="grp">
-    <select id="src" class="sel" title="Receiver"><option value="hackrf">HackRF</option><option value="rtlsdr">RTL-SDR</option><option value="file">Replay file</option></select>
-  </div>
-  <div class="grp">
-    <button id="left" class="btn icon" title="Shift window down in frequency"><svg viewBox="0 0 10 10"><path d="M7 1 2 5l5 4z"/></svg></button>
+    <div class="seg">
+      <button id="fleft" class="icon" title="Down two window widths"><svg viewBox="0 0 12 10"><path d="M6 1 1 5l5 4zM11 1 6 5l5 4z"/></svg></button>
+      <button id="left" class="icon" title="Down half a window width"><svg viewBox="0 0 10 10"><path d="M7 1 2 5l5 4z"/></svg></button>
+    </div>
     <input id="freq" class="field freq" title="Centre frequency (MHz)"><span class="unit">MHz</span>
-    <button id="right" class="btn icon" title="Shift window up in frequency"><svg viewBox="0 0 10 10"><path d="M3 1l5 4-5 4z"/></svg></button>
+    <div class="seg">
+      <button id="right" class="icon" title="Up half a window width"><svg viewBox="0 0 10 10"><path d="M3 1l5 4-5 4z"/></svg></button>
+      <button id="fright" class="icon" title="Up two window widths"><svg viewBox="0 0 12 10"><path d="M1 1l5 4-5 4zM6 1l5 4-5 4z"/></svg></button>
+    </div>
   </div>
   <div class="grp"><select id="rate" class="sel" title="Sample rate (= bandwidth)"></select></div>
   <div class="grp">
@@ -160,7 +172,6 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
       <span class="lbl">Max</span><input id="smax" type="range" min="1" max="255" step="1" value="255">
       <button id="sreset" class="btn">Auto</button>
       <label class="lbl" style="display:flex;align-items:center;gap:6px"><span class="switch"><input id="caps" type="checkbox" checked><span></span></span>Captions</label>
-      <span class="hint">Drag the playback line to set delay · Scroll for history · ⌘/Ctrl + scroll to zoom · Click a detection to play it</span>
     </div>
     <div id="wfwrap">
       <canvas id="wf"></canvas><div id="tip"></div>
@@ -174,9 +185,9 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
       <button data-tab="sdr">Settings</button>
     </div>
     <div id="dets" class="tab active">
-      <div id="detHead"><span class="t2" id="detCount"></span></div>
+      <div id="detHead"><span class="t2" id="detCount"></span><input id="search" class="search" type="search" placeholder="Search" title="Search transcripts and frequencies" autocomplete="off"></div>
       <div class="dethead"><span></span><span>Frequency</span><span>Time</span><span>Transcript</span><span>Conf.</span></div>
-      <div id="detList"></div>
+      <div id="liveList"></div><div id="savedList"></div><div id="listMore" class="note" style="text-align:center"></div>
     </div>
     <div id="detector" class="tab pad"></div>
     <div id="sdr" class="tab pad"></div>

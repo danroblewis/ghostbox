@@ -174,20 +174,53 @@ def make_app(args):
     def rec_dir():
         return ROOT / config.get()["record"]["dir"]
 
-    async def recordings(request):
+    meta_cache = {}   # path -> (mtime, slim meta); recordings are re-read only when they change
+
+    def slim_meta(p):
+        mt = p.stat().st_mtime
+        hit = meta_cache.get(p)
+        if hit and hit[0] == mt:
+            return hit[1]
+        m = json.loads(p.read_text())
+        m["confidence"].pop("history", None)
+        for k in ("checks", "detect", "path", "sdr"):
+            m.pop(k, None)
+        meta_cache[p] = (mt, m)
+        return m
+
+    def list_recordings(offset, limit, q):
         d = rec_dir()
-        metas = []
-        if d.exists():
-            for p in sorted(d.glob("*.json"), reverse=True)[:300]:
-                try:
-                    m = json.loads(p.read_text())
-                    m["confidence"].pop("history", None)
-                    m.pop("checks", None)
-                    m.pop("detect", None)
-                    metas.append(m)
-                except Exception:
-                    pass
-        return web.json_response(metas)
+        if not d.exists():
+            return {"total": 0, "items": []}
+        paths = sorted(d.glob("*.json"), reverse=True)
+        live = set(paths)
+        for k in [k for k in meta_cache if k not in live]:
+            meta_cache.pop(k, None)
+        q = q.strip().lower()
+        out, matched = [], 0
+        for p in paths:
+            try:
+                m = slim_meta(p)
+            except Exception:
+                continue
+            if q:
+                hay = " ".join([(m.get("transcript") or {}).get("text", ""),
+                                (m.get("chain_transcript") or {}).get("text", ""),
+                                f"{m['freq_hz']['mean'] / 1e6:.4f}", f"{m['freq_hz']['mean'] / 1e3:.1f}"]).lower()
+                if q not in hay:
+                    continue
+            if offset <= matched < offset + limit:
+                out.append(m)
+            matched += 1
+        return {"total": matched, "items": out}
+
+    async def recordings(request):
+        """Saved detections, newest first, paginated, optional search over transcripts/frequency."""
+        offset = max(0, int(request.query.get("offset", 0)))
+        limit = max(1, min(500, int(request.query.get("limit", 100))))
+        q = request.query.get("q", "")
+        res = await asyncio.get_running_loop().run_in_executor(None, list_recordings, offset, limit, q)
+        return web.json_response(res)
 
     async def rec_file(request):
         name = request.match_info["name"]
