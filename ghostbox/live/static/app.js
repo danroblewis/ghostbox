@@ -363,15 +363,13 @@ function ensureAudio() {
     master.gain.value = +$("#vol").value;
     SCOPE.an = AC.createAnalyser(); SCOPE.an.fftSize = 2048; SCOPE.an.smoothingTimeConstant = 0; master.connect(SCOPE.an);
   }
-  const b = $("#audioBtn"); b.textContent = "Audio on"; b.classList.remove("primary"); b.classList.add("on");
-  AC.resume().then(restartPlayback);                       // schedule once audio is actually running
+  if (AC.state !== "running") AC.resume().then(restartPlayback);   // schedule once audio is actually running
 }
-$("#audioBtn").addEventListener("click", () => {
-  if (AC && AC.state === "running" && $("#audioBtn").classList.contains("on")) {
-    AC.suspend(); const b = $("#audioBtn"); b.textContent = "Muted"; b.classList.remove("on"); return;
-  }
-  ensureAudio();
-});
+// Audio is always on. Browsers only allow it to start from a user action, so the first click or
+// key press anywhere starts it. To stop listening, pause playback (then only clicked clips play).
+function startAudioOnce() { ensureAudio(); if (AC && AC.state === "running") { window.removeEventListener("pointerdown", startAudioOnce, true); window.removeEventListener("keydown", startAudioOnce, true); } }
+window.addEventListener("pointerdown", startAudioOnce, true);
+window.addEventListener("keydown", startAudioOnce, true);
 $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) master.gain.value = +e.target.value; });
 
 // ---------------- audio scope: a lane per voice + log-frequency spectrogram of the mix ----------------
@@ -454,7 +452,7 @@ function drawScope() {
   }
   // caption: only when it says something
   const d = voices[0], cap = $("#scopeCap");
-  const text = !AC || AC.state !== "running" ? "Audio is off. Enable audio to hear and see playback."
+  const text = !AC || AC.state !== "running" ? "Click anywhere to start audio."
     : d && S.tx.get(d.box.id) && S.tx.get(d.box.id).text ? `“${S.tx.get(d.box.id).text}”` : S.paused ? "Paused" : "";
   if (cap.textContent !== text) cap.textContent = text;
 }
@@ -941,12 +939,27 @@ async function buildSDR() {
   });
   const themeSel = el("select", { class: "sel" }, ...THEMES.map(([k, l]) => el("option", { value: k }, l)));
   { const t = lsGet("gb_theme", "instrument"); themeSel.value = THEMES.some(([k]) => k === t) ? t : "instrument"; } themeSel.addEventListener("change", () => setTheme(themeSel.value));
-  const presetSel = el("select", { class: "sel" }, el("option", { value: "" }, "Choose…"), ...Object.entries(S.presets).map(([k, v]) => el("option", { value: k }, v)));
+  const pres = await (await fetch("/api/presets")).json();
+  const presetSel = el("select", { class: "sel" }, el("option", { value: "" }, "Choose…"),
+    el("optgroup", { label: "Built in" }, ...Object.entries(pres.builtin).map(([k, v]) => el("option", { value: "b:" + k }, v))),
+    pres.saved.length ? el("optgroup", { label: "Saved" }, ...pres.saved.map(p => el("option", { value: "f:" + p.file }, p.label))) : null);
   presetSel.addEventListener("change", async () => {
-    const name = presetSel.value; if (!name) return;
-    await fetch("/api/preset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    const v = presetSel.value; if (!v) return;
+    const body = v.startsWith("f:") ? { file: v.slice(2) } : { name: v.slice(2) };
+    await fetch("/api/preset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     presetSel.value = "";
   });
+  const presetName = el("input", { class: "field", placeholder: "Name, e.g. basement session", maxlength: 60 });
+  const saveBtn = el("button", { class: "btn", onclick: async () => {
+    const r = await (await fetch("/api/presets", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: presetName.value }) })).json();
+    presetName.value = ""; buildSDR();
+  } }, "Save");
+  const savedList = el("div", {}, ...pres.saved.map(p => el("div", { class: "row wide", style: "min-height:26px" },
+    el("label", { title: p.file }, p.label),
+    el("button", { class: "btn", style: "justify-self:end;height:24px", title: "Delete " + p.file, onclick: async () => {
+      if (!confirm(`Delete the preset "${p.label}"?`)) return;
+      await fetch("/api/presets/" + encodeURIComponent(p.file), { method: "DELETE" }); buildSDR();
+    } }, "Delete"))));
   const mkScale = (label, key, init) => {
     const out = el("output", {}, String(Math.round(init)));
     const inp = el("input", { type: "range", min: 0, max: 255, step: 1, value: Math.round(init), disabled: S.autoScale }); fillRange(inp);
@@ -957,7 +970,11 @@ async function buildSDR() {
   };
   root.append(
     el("h2", {}, "Presets"),
-    rowW("Band preset", presetSel),
+    rowW("Load a preset", presetSel),
+    el("div", { class: "row wide" }, el("label", {}, "Save current settings as"),
+      el("div", { style: "display:flex;gap:6px" }, presetName, saveBtn)),
+    el("div", { class: "note", style: "margin:2px 0 6px" }, "Saves the receiver, detector and playback settings. Files go in live_data/presets, named with the date, device and frequency range."),
+    savedList,
     el("h2", {}, "Appearance"),
     rowW("Theme (this browser)", themeSel),
     el("div", { class: "row wide" }, el("label", {}, "Automatic waterfall brightness"), toggle(S.autoScale, v => {

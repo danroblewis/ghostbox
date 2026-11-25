@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import secrets
+import time
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -156,8 +157,55 @@ def make_app(args):
     async def post_config(request):
         return web.json_response(apply(await request.json()))
 
+    PRESET_DIR = ROOT / "live_data" / "presets"
+    PRESET_KEYS = ("sdr", "analysis", "detect", "checks", "audio")   # a preset = receiver + detector + playback
+
+    def saved_presets():
+        out = []
+        for p in sorted(PRESET_DIR.glob("*.json"), reverse=True) if PRESET_DIR.exists() else []:
+            try:
+                m = json.loads(p.read_text())
+                out.append({"file": p.name, "label": m.get("label", p.stem), "saved": m.get("saved")})
+            except Exception:
+                pass
+        return out
+
+    async def get_presets(request):
+        return web.json_response({"builtin": {k: v["label"] for k, v in PRESETS.items()}, "saved": saved_presets()})
+
+    async def save_preset(request):
+        """Save the current receiver + detector + playback settings. File name: date, device, range, name."""
+        name = re.sub(r"[^A-Za-z0-9 _.-]+", "", str((await request.json()).get("name", "")).strip())[:60] or "preset"
+        c = config.get()
+        sdr = c["sdr"]
+        lo = sdr["fmin_hz"] if sdr.get("fmin_hz") is not None else sdr["center_hz"] - sdr["sample_rate"] / 2
+        hi = sdr["fmax_hz"] if sdr.get("fmax_hz") is not None else sdr["center_hz"] + sdr["sample_rate"] / 2
+        stamp = time.strftime("%Y-%m-%d")
+        slug = re.sub(r"[^A-Za-z0-9-]+", "-", name).strip("-").lower() or "preset"
+        fname = f"{stamp}_{sdr['source']}_{max(0, lo) / 1e6:.3f}-{hi / 1e6:.3f}MHz_{slug}.json"
+        PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        body = {"label": f"{name} ({sdr['source']}, {max(0, lo) / 1e6:.3f}-{hi / 1e6:.3f} MHz, {stamp})",
+                "saved": time.strftime("%Y-%m-%dT%H:%M:%S"), **{k: c[k] for k in PRESET_KEYS}}
+        (PRESET_DIR / fname).write_text(json.dumps(body, indent=1))
+        return web.json_response({"file": fname, "presets": saved_presets()})
+
+    async def delete_preset(request):
+        f = request.match_info["file"]
+        if not SAFE.match(f) or not f.endswith(".json"):
+            raise web.HTTPNotFound()
+        (PRESET_DIR / f).unlink(missing_ok=True)
+        return web.json_response({"presets": saved_presets()})
+
     async def post_preset(request):
-        name = (await request.json()).get("name")
+        """Apply a built-in preset ({name}) or a saved one ({file})."""
+        b = await request.json()
+        if b.get("file"):
+            f = b["file"]
+            if not SAFE.match(f) or not (PRESET_DIR / f).is_file():
+                return web.json_response({"error": "unknown preset"}, status=400)
+            m = json.loads((PRESET_DIR / f).read_text())
+            return web.json_response(apply({k: m[k] for k in PRESET_KEYS if k in m}))
+        name = b.get("name")
         if name not in PRESETS:
             return web.json_response({"error": "unknown preset"}, status=400)
         patch = {k: v for k, v in PRESETS[name].items() if k != "label"}
@@ -316,6 +364,9 @@ def make_app(args):
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", post_config)
     app.router.add_post("/api/preset", post_preset)
+    app.router.add_get("/api/presets", get_presets)
+    app.router.add_post("/api/presets", save_preset)
+    app.router.add_delete("/api/presets/{file}", delete_preset)
     app.router.add_post("/api/reset", post_reset)
     app.router.add_post("/api/restart", post_restart)
     app.router.add_get("/api/recordings", recordings)
