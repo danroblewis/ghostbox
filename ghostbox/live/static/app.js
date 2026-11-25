@@ -794,8 +794,7 @@ function buildDetector() {
     }
   }, v.label)));
   root.append(tuneCard()); tickReady();
-  root.append(el("h2", {}, "Sensitivity"), seg,
-    el("div", { class: "note" }, "Sets thresholds, tracking limits and the voice-check weights in one click. Ghost hunter and Everything let far more human-ish fragments through (expect more false alarms). Checks you switched off stay off."));
+  root.append(el("h2", {}, "Sensitivity"), seg);
   root.append(el("h2", {}, "Thresholds & tracking"),
     slider("Candidate threshold", ["detect", "candidate_threshold"], 0, 1, 0.01, v => v.toFixed(2)),
     slider("Capture floor (kept in memory)", ["detect", "threshold"], 0, 1, 0.01, v => v.toFixed(2)),
@@ -864,8 +863,8 @@ function tuneCard() {
   else if (st.state === "done" && st.result) {
     const r = st.result, pct = v => Math.round(v * 100) + "%";
     out.style.color = "var(--text-2)";
-    const summary = r.voice_like === 0
-      ? `Analysed ${r.minutes} min: ${r.candidates} candidates, none even ${pct(at.floor)} speech-like, so nothing from this band will be shown (the filter is set above the strongest one).`
+    const summary = r.kept_checks
+      ? `Analysed ${r.minutes} min: ${r.candidates} candidates, ${r.voice_like ? "only " + r.voice_like : "none"} at least ${pct(at.floor)} speech-like. Tracking and candidate finding fixed; check weights left as they were (nothing to learn them from). Showing the best ${r.per_min} per minute anyway (≥ ${pct(r.show_threshold)}).`
       : `Analysed ${r.minutes} min: ${r.candidates} candidates, ${r.voice_like} at least ${pct(at.floor)} speech-like. Aiming for ${r.target_count} in that time, the top detections now score ${pct(r.score_after)} on the voice detector (was ${pct(r.score_before)}). Showing ≥ ${pct(r.show_threshold)}, keeping ≥ ${pct(r.capture_threshold)} in memory.`;
     const rows = (r.decisions || []).map(d => el("div", { class: "row", style: "min-height:22px;grid-template-columns:minmax(0,1fr) 70px 70px" },
       el("label", { title: d.label }, d.label),
@@ -883,7 +882,6 @@ function tuneCard() {
     el("div", { class: "row wide" }, el("label", {}, "Analyse the last"), mins),
     slider("Max detections per min", ["autotune", "per_min"], 1, 30, 1, v => v + " / min"),
     slider("Voice-likeness floor", ["autotune", "floor"], 0, 0.9, 0.05, v => Math.round(v * 100) + "%"),
-    el("div", { class: "note", style: "margin:2px 0 4px" }, "The rate is a listening budget, not a guess at how many ghosts there are: it shows up to that many of the best detections per minute, but only ones the voice detector rates above the floor, so a dead band shows nothing."),
     readyBlock(),
     el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go,
       st.state === "done" ? el("button", { class: "btn", onclick: () => fetch("/api/autotune/revert", { method: "POST" }) }, "Revert") : null),

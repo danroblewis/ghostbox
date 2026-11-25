@@ -33,6 +33,14 @@ TUNE_DETECT = {"candidate_threshold": 0.15, "threshold": 0.0, "min_duration_s": 
                "max_candidates": 12, "max_tracks": 30, "novelty": 0.5, "prominence": 0.3,
                "track_gap_s": 0.3, "max_slide_hz_s": 100e3, "min_sep_hz": 6e3, "link_hops_s": 0.4}
 LEVELS = (0.0, 0.5, 1.0, 2.0)
+# If a band gives too few candidates to learn from, loosen candidate finding step by step.
+LADDER = (
+    {},
+    {"candidate_threshold": 0.10, "prominence": 0.15, "novelty": 0.3},
+    {"candidate_threshold": 0.06, "prominence": 0.0, "novelty": 0.15},
+    {"candidate_threshold": 0.03, "prominence": 0.0, "novelty": 0.0, "min_duration_s": 0.2},
+)
+ENOUGH = 10                          # candidates needed to tune on
 # Switched off only if that strictly improves things (a tie keeps them): the modulation checks decide
 # which kinds of signal can be found at all, and co-modulation / hop continuity only matter in the
 # moments they apply, which a few minutes of recording may not contain.
@@ -80,7 +88,7 @@ def pick_segments(root, cfg, minutes, since=None):
     return [p for _, p, _ in chosen], total
 
 
-def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None):
+def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, keep=False):
     """Choose check weights by coordinate descent, judged by the ML voice detector.
 
     K = how many detections to aim for: per_min x minutes, but never more than the candidates the
@@ -144,10 +152,13 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None):
         return w, best
 
     current = np.array([live_checks[i]["weight"] if live_checks[i]["enabled"] else 0.0 for i in ids])
-    runs = [descend(np.ones(len(ids)))]
-    if current.sum() > 0:
-        runs.append(descend(np.maximum(current, 0)))
-    w_best, best_score = max(runs, key=lambda r: r[1])
+    if keep and current.sum() > 0:                      # rank with the current checks, no search
+        w_best, best_score = current, evaluate(current)
+    else:
+        runs = [descend(np.ones(len(ids)))]
+        if current.sum() > 0:
+            runs.append(descend(np.maximum(current, 0)))
+        w_best, best_score = max(runs, key=lambda r: r[1])
 
     # what each check contributed: the objective with it switched off vs as chosen
     decisions = []
@@ -164,10 +175,9 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None):
     vad_s = np.nan_to_num(np.array([b["scores"].get("vad", 0.5) for b in boxes], float), nan=0.5)
     conf_full = conf_of(w_best, vad_s, w_vad)
     order = np.sort(conf_full)[::-1]
-    if voicey == 0:                                     # nothing speech-like: show nothing from this band
-        show = float(order[0]) + 0.01
-    else:
-        show = float(order[K - 1])
+    # nothing (much) speech-like: still show the best per_min of what there is, rather than nothing
+    K_show = K if voicey >= 3 else int(min(n, max(1, round(per_min * minutes))))
+    show = float(order[K_show - 1])
     capture = float(order[min(n, 3 * K) - 1])
     return {
         "weights": {i: float(w) for i, w in zip(ids, w_best)},
@@ -239,34 +249,57 @@ class AutoTune:
             tcfg["whisper"]["enabled"] = False
             tcfg["record"]["enabled"] = False
             tcfg["iq_ring"]["enabled"] = False
-            boxes = []
+            def analyse(step):
+                boxes = []
+                t = copy.deepcopy(tcfg)
+                t["detect"].update(LADDER[step])
+                pre = f"Analysing {dur / 60:.1f} min of recorded IQ" + (f" (looser, step {step + 1}/{len(LADDER)})" if step else "")
 
-            def collect(m):
-                if m.get("type") == "det_end":
-                    boxes.append(m["box"])
-                elif m.get("type") == "status" and m.get("progress") is not None:
-                    self._set(progress=round(0.9 * m["progress"], 3),
-                              message=f"Analysing {dur / 60:.1f} min of recorded IQ… {len(boxes)} candidates")
+                def collect(m):
+                    if m.get("type") == "det_end":
+                        boxes.append(m["box"])
+                    elif m.get("type") == "status" and m.get("progress") is not None:
+                        self._set(progress=round(0.9 * (step + m["progress"]) / len(LADDER), 3),
+                                  message=f"{pre}… {len(boxes)} candidates")
 
-            self._set(message=f"Analysing {dur / 60:.1f} min of recorded IQ…")
-            src = FileSource(paths, fs, fc, paced=False, loop=False)
-            eng = Engine(StaticConfig(tcfg), collect, self.root, source=src, oneshot=True, transcribe=False,
-                         score_all=score_all)
-            t_start = time.time()
-            while not eng.done.wait(1.0):
-                if time.time() - t_start > dur * 4 + 120:
-                    eng.stop()
-                    raise RuntimeError("Analysis took too long; try fewer minutes.")
-            if len(boxes) < 5:                          # too little to learn from: change nothing
+                self._set(message=pre + "…")
+                src = FileSource(paths, fs, fc, paced=False, loop=False)
+                eng = Engine(StaticConfig(t), collect, self.root, source=src, oneshot=True, transcribe=False,
+                             score_all=score_all)
+                t_start = time.time()
+                while not eng.done.wait(1.0):
+                    if time.time() - t_start > dur * 4 + 120:
+                        eng.stop()
+                        raise RuntimeError("Analysis took too long; try fewer minutes.")
+                return boxes
+
+            for step in range(len(LADDER)):
+                boxes = analyse(step)
+                if len(boxes) >= ENOUGH:
+                    break
+            found = {**TUNE_DETECT, **LADDER[step]}
+            if len(boxes) < 5:
+                # still too little to learn weights from: keep the checks, but apply working tracking
+                # and the loosest candidate finding so the live detector has its best chance
+                self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
+                self.apply({"detect": {**found, "max_tracks": 16, "max_candidates": 8, "threshold": 0.0}})
                 self._set(state="quiet", progress=1.0,
-                          message=f"Only {len(boxes)} candidate signal{'s' if len(boxes) != 1 else ''} in {dur / 60:.1f} min: "
-                                  "too quiet to tune on, so nothing was changed.")
+                          message=f"Only {len(boxes)} candidate signal{'s' if len(boxes) != 1 else ''} in {dur / 60:.1f} min "
+                                  "even at the loosest settings. Check weights unchanged; tracking and candidate "
+                                  "finding set as loose as they go.")
                 return
             self._set(progress=0.95, message=f"Searching settings over {len(boxes)} candidates…")
             avail = score_all - SKIP
             res = optimise(boxes, dur / 60, per_min, cfg["checks"], floor=cfg["autotune"].get("floor", 0.3), available=avail)
             self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
-            live_detect = {**TUNE_DETECT, "max_tracks": 16, "max_candidates": 8,   # the analysis pass is wide open;
+            if res["voice_like"] < 3:
+                # nothing (or almost nothing) speech-like to learn from: weights chosen against noise would
+                # be arbitrary, so keep the current checks and only fix tracking and candidate finding;
+                # the thresholds then come from the current checks' ranking
+                res = optimise(boxes, dur / 60, per_min, {**cfg["checks"]}, floor=cfg["autotune"].get("floor", 0.3),
+                               available=avail, keep=True)
+                res["decisions"], res["kept_checks"] = [], True
+            live_detect = {**found, "max_tracks": 16, "max_candidates": 8,   # the analysis pass is wide open;
                            "threshold": res["capture_threshold"]}                      # live keeps CPU in check
             labels = {c["id"]: c["label"] for c in CHECKS}
             for d in res["decisions"]:

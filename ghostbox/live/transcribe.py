@@ -19,11 +19,31 @@ import threading
 import time
 import traceback
 
+import re
+
 import numpy as np
 
 FS = 16000
 GAP = np.zeros(FS // 2, np.float32)
 
+
+
+# Whisper was trained on subtitled video; on noise it falls back to the commonest subtitle lines.
+STOCK = {"you", "thank you", "thanks", "thank you very much", "thanks for watching", "thank you for watching",
+         "thank you so much for watching", "please subscribe", "subscribe", "the end", "bye", "bye bye", "so",
+         "okay", "oh", "uh", "um", "hmm", "music", "applause", "silence", "i'm sorry", "i love you",
+         "subtitles by the amara.org community", "thanks for watching and see you next time", "see you next time"}
+
+
+def is_stock_phrase(text):
+    t = re.sub(r"[^a-z' .]+", " ", text.lower()).replace(".", " ")
+    t = " ".join(t.split())
+    if not t:
+        return True
+    words = t.split()
+    if len(set(words)) == 1 and len(words) > 1:            # "you you you", "the the the"
+        return True
+    return t in STOCK or "amara.org" in text.lower()
 
 class Transcriber:
     def __init__(self, config, emit, on_result=None):
@@ -150,8 +170,11 @@ class Transcriber:
         out = []
         for i in range(len(items)):
             probs = [p for p in nsp[i] if p is not None]
-            out.append({"text": " ".join(texts[i]).strip(),
-                        "no_speech_prob": float(np.mean(probs)) if probs else (0.5 if texts[i] else 1.0),
+            text = " ".join(texts[i]).strip()
+            nsp_i = float(np.mean(probs)) if probs else (0.5 if texts[i] else 1.0)
+            if is_stock_phrase(text):                      # Whisper's training-data filler: shown dimmed
+                nsp_i = max(nsp_i, 0.95)
+            out.append({"text": text, "no_speech_prob": nsp_i,
                         "language": info.language, "model": cfg["model"]})
         return out
 
