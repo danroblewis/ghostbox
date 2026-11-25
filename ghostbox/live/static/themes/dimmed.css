@@ -1,0 +1,9 @@
+/* Dimmed — soft blue-grey with low contrast (GitHub "dark dimmed"-style), gentle in dark rooms. */
+:root{
+  --bg:#22272e; --panel:#2d333b; --field:#373e47; --hover:rgba(205,217,229,.04);
+  --line:#373e47; --line-strong:#444c56;
+  --text:#adbac7; --text-2:#8b98a5; --text-3:#636e7b;
+  --accent:#539bf5; --accent-text:#ffffff;
+  --mark:#daaa3f; --alarm:#e5534b; --ok:#57ab5a;
+  --wf-bg:#161a1f; --wf-grid:rgba(173,186,199,.07); --wf-label:rgba(173,186,199,.6);
+}

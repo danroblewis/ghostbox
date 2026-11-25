@@ -1,0 +1,9 @@
+/* Bench — light grey with dark-blue accents, like a modern lab spectrum analyser's front panel. */
+:root{
+  --bg:#e3e5e8; --panel:#f2f3f5; --field:#ffffff; --hover:rgba(0,0,0,.03);
+  --line:#d4d7dc; --line-strong:#b9bdc4;
+  --text:#1b1f24; --text-2:#4d5560; --text-3:#858d98;
+  --accent:#00539b; --accent-text:#ffffff;
+  --mark:#c46a00; --alarm:#c8102e; --ok:#2e7d32;
+  --wf-bg:#0d1014; --wf-grid:rgba(255,255,255,.07); --wf-label:rgba(235,238,242,.65);
+}

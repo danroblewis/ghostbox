@@ -1,0 +1,10 @@
+/* Studio — mid-grey pro-audio look (in the spirit of DAWs like Ableton Live / Logic).
+   Lighter than Instrument, easier on the eyes for long sessions; orange marker. */
+:root{
+  --bg:#262626; --panel:#2e2e2e; --field:#383838; --hover:rgba(255,255,255,.035);
+  --line:#3a3a3a; --line-strong:#4a4a4a;
+  --text:#e8e8e8; --text-2:#ababab; --text-3:#7a7a7a;
+  --accent:#ff8a3d; --accent-text:#1a1a1a;
+  --mark:#ff8a3d; --alarm:#ff5b4f; --ok:#7ccf5a;
+  --wf-bg:#141414; --wf-grid:rgba(255,255,255,.06); --wf-label:rgba(232,232,232,.55);
+}

@@ -1,0 +1,9 @@
+/* Editor — the near-black, blue-accented look of mainstream code editors (Dark+-style). */
+:root{
+  --bg:#1e1e1e; --panel:#252526; --field:#2d2d2d; --hover:rgba(255,255,255,.04);
+  --line:#2f2f2f; --line-strong:#454545;
+  --text:#d4d4d4; --text-2:#9d9d9d; --text-3:#6a6a6a;
+  --accent:#3794ff; --accent-text:#ffffff;
+  --mark:#d7ba7d; --alarm:#f14c4c; --ok:#89d185;
+  --wf-bg:#111111; --wf-grid:rgba(255,255,255,.06); --wf-label:rgba(212,212,212,.55);
+}

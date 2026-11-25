@@ -133,7 +133,13 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 @media (max-width:980px){main{grid-template-columns:1fr;grid-template-rows:58vh auto}#side{border-left:0;border-top:1px solid var(--line);min-height:70vh}#top{flex-wrap:wrap}#status{margin-left:0}}
 </style>
 <link id="themeCss" rel="stylesheet" href="/static/themes/instrument.css">
-<script>try{var t=localStorage.getItem("gb_theme");if(["instrument","daylight","nightvision"].indexOf(t)>=0)document.getElementById("themeCss").href="/static/themes/"+t+".css"}catch(e){}</script>
+<script>
+/* The one list of themes (file name, label). Loaded before first paint so there's no flash. */
+window.GB_THEMES=[["instrument","Instrument"],["studio","Studio"],["editor","Editor"],["dimmed","Dimmed"],
+  ["gruvbox","Gruvbox"],["solarized-dark","Solarized Dark"],["solarized-light","Solarized Light"],
+  ["daylight","Daylight"],["bench","Bench"],["nightvision","Night vision (red)"]];
+try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return x[0]===t}))document.getElementById("themeCss").href="/static/themes/"+t+".css"}catch(e){}
+</script>
 </head>
 <body>
 <header id="top">

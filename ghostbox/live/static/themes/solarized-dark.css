@@ -1,0 +1,9 @@
+/* Solarized Dark — Ethan Schoonover's palette, designed for precise lightness relationships. */
+:root{
+  --bg:#002b36; --panel:#073642; --field:#0a3f4c; --hover:rgba(147,161,161,.05);
+  --line:#0e4552; --line-strong:#1d5866;
+  --text:#93a1a1; --text-2:#839496; --text-3:#586e75;
+  --accent:#268bd2; --accent-text:#fdf6e3;
+  --mark:#b58900; --alarm:#dc322f; --ok:#859900;
+  --wf-bg:#001f27; --wf-grid:rgba(147,161,161,.08); --wf-label:rgba(147,161,161,.65);
+}

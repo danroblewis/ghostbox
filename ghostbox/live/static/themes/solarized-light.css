@@ -1,0 +1,9 @@
+/* Solarized Light — the same palette on its warm paper base. The waterfall stays dark. */
+:root{
+  --bg:#eee8d5; --panel:#fdf6e3; --field:#fdf6e3; --hover:rgba(0,43,54,.03);
+  --line:#e4ddc8; --line-strong:#cfc7af;
+  --text:#073642; --text-2:#586e75; --text-3:#93a1a1;
+  --accent:#268bd2; --accent-text:#fdf6e3;
+  --mark:#b58900; --alarm:#dc322f; --ok:#859900;
+  --wf-bg:#002b36; --wf-grid:rgba(147,161,161,.08); --wf-label:rgba(147,161,161,.7);
+}

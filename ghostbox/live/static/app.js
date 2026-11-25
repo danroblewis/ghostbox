@@ -48,7 +48,7 @@ function readTheme() {
     mono: v("--mono") || "ui-monospace,monospace", sans: v("--font") || "system-ui,sans-serif" });
 }
 readTheme();
-const THEMES = [["instrument", "Instrument (dark)"], ["daylight", "Daylight"], ["nightvision", "Night vision (red)"]];
+const THEMES = window.GB_THEMES;                        // defined in index.html
 function setTheme(name) {
   if (!THEMES.some(([k]) => k === name)) name = "instrument";
   lsSet("gb_theme", name);
