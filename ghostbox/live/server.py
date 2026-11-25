@@ -81,9 +81,40 @@ def make_app(args):
         hub = Hub(asyncio.get_running_loop())
         state["hub"] = hub
         state["engine"] = Engine(config, hub.emit, ROOT)
-        state["tune"] = AutoTune(ROOT, config, hub.emit, apply)
+        state["tune"] = AutoTune(ROOT, config, hub.emit, apply, session=lambda: state["engine"].session())
+        state["auto_task"] = asyncio.create_task(auto_tune_loop())
+
+    def rx_signature(c):
+        """Receiver settings: any change (frequency, span, gain, amp, range, device) re-arms auto-tune."""
+        return json.dumps({k: v for k, v in c["sdr"].items() if k != "file"}, sort_keys=True)
+
+    async def auto_tune_loop():
+        """With auto-tune on: run after every receiver change once enough IQ has been recorded since
+        the change, and again every `every_min` minutes."""
+        while True:
+            await asyncio.sleep(10)
+            try:
+                c = config.get()
+                at, tune, eng = c["autotune"], state["tune"], state["engine"]
+                if not at["auto"] or c["sdr"]["source"] == "file" or tune.state.get("state") == "running":
+                    continue
+                if not c["iq_ring"]["enabled"]:                # auto-tune needs the IQ recording
+                    apply({"iq_ring": {"enabled": True}})
+                    continue
+                changed = tune.auto_band != rx_signature(c)
+                due = at.get("every_min", 0) > 0 and time.time() - tune.last_run >= at["every_min"] * 60
+                if not (changed or due):
+                    continue
+                _, have = await asyncio.get_running_loop().run_in_executor(
+                    None, pick_segments, ROOT, c, at["minutes"], eng.session())
+                if have >= at["minutes"] * 60 * 0.95:
+                    tune.start(at["minutes"], at["per_min"], auto=True)
+            except Exception:
+                pass
 
     async def on_cleanup(app):
+        if state.get("auto_task"):
+            state["auto_task"].cancel()
         state["engine"].stop()
 
     async def no_cache(request, response):
@@ -300,7 +331,8 @@ def make_app(args):
 
     async def tune_start(request):
         b = await request.json()
-        ok = state["tune"].start(b.get("minutes", 2), b.get("per_min", 6))
+        at = config.get()["autotune"]
+        ok = state["tune"].start(b.get("minutes", at["minutes"]), b.get("per_min", at["per_min"]))
         return web.json_response({"ok": ok, **state["tune"].state})
 
     async def tune_get(request):
@@ -313,10 +345,14 @@ def make_app(args):
         need = minutes * 60
         if c["sdr"]["source"] == "file":
             return web.json_response({"ready": False, "reason": "file", "have_s": 0, "need_s": need})
-        _, have = await asyncio.get_running_loop().run_in_executor(None, pick_segments, ROOT, c, minutes)
+        _, have = await asyncio.get_running_loop().run_in_executor(
+            None, pick_segments, ROOT, c, minutes, state["engine"].session())
         reason = None if have >= need * 0.95 else ("off" if not c["iq_ring"]["enabled"] else "recording")
         return web.json_response({"ready": reason is None, "reason": reason, "have_s": round(have, 1), "need_s": need,
-                                  "segment_s": c["iq_ring"]["segment_s"]})
+                                  "segment_s": c["iq_ring"]["segment_s"], "auto": c["autotune"]["auto"],
+                                  "tuned": state["tune"].auto_band == rx_signature(c),
+                                  "next_in_s": max(0, round(c["autotune"].get("every_min", 0) * 60 - (time.time() - state["tune"].last_run)))
+                                  if c["autotune"].get("every_min", 0) > 0 and state["tune"].last_run else None})
 
     async def tune_revert(request):
         return web.json_response({"ok": state["tune"].revert()})

@@ -174,8 +174,11 @@ class Track:
 
 
 class Engine:
-    def __init__(self, config, emit, root, source=None, oneshot=False, transcribe=True):
-        """source/oneshot: run once over a given source (auto-tune) without housekeeping or disk writes."""
+    def __init__(self, config, emit, root, source=None, oneshot=False, transcribe=True, score_all=()):
+        """source/oneshot: run once over a given source (auto-tune) without housekeeping or disk writes.
+        score_all: check ids to compute for every track even when disabled (auto-tune needs every
+        column); they don't affect which candidates are found or their confidence."""
+        self.score_all = set(score_all)
         self.config = config
         self.emit = emit
         self.root = Path(root)
@@ -206,6 +209,10 @@ class Engine:
 
     def stop(self):
         self._stop.set()
+
+    def session(self):
+        """(epoch, stream time) of the last receiver (re)start: IQ before it was recorded differently."""
+        return (self.t_origin, getattr(self, "session_t0", 0.0))
 
     def snapshot(self):
         """Live detections (history comes from history())."""
@@ -242,6 +249,7 @@ class Engine:
         self.f_lo, self.f_hi = float(self.fc + f[keep][0]), float(self.fc + f[keep][-1])
         # continuous timeline across receiver restarts: start this session at "now"
         self.n_samples = int(round((time.time() - self.t_origin) * self.fs))
+        self.session_t0 = self.n_samples / self.fs              # when the current receiver settings began
         self.raw_keep = int(self.fs * (an["window_s"] + 4))
         self.raw = np.zeros(self.raw_keep, np.complex64)
         self.spec, self.spec_t = [], []
@@ -392,7 +400,7 @@ class Engine:
         self.spec.append(P)
         self.spec_t.append(ts)
         ch = cfg["checks"]
-        if any(ch[k]["enabled"] for k in stage1.PITCH) and self.fine_n * self.fr == int(self.fs):
+        if any(ch[k]["enabled"] or k in self.score_all for k in stage1.PITCH) and self.fine_n * self.fr == int(self.fs):
             t_p = time.time()
             self.pitch_spec.append(self._pitch_maps(x, cfg))
             self.timing["pitch"] = time.time() - t_p
@@ -474,7 +482,8 @@ class Engine:
         pitch = None
         if all(p is not None for p in self.pitch_spec) and self.pitch_spec:
             pitch = (np.concatenate([p[0] for p in self.pitch_spec]), np.concatenate([p[1] for p in self.pitch_spec]))
-        scores, comb, extra = stage1.run_blocks(P, self.df, self.fr, cfg, sl, pool=self.pool, pitch=pitch)
+        scores, comb, extra = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=tuple(self.score_all & set(stage1.STAGE1)),
+                                                pool=self.pool, pitch=pitch)
         self.timing["stage1"] = time.time() - t_s1
         ts = T[sl]
 
@@ -492,7 +501,7 @@ class Engine:
         # cross-channel co-modulation among the strongest candidates
         comod_map = None
         self.comod = None
-        if ch["comod"]["enabled"]:
+        if ch["comod"]["enabled"] or "comod" in self.score_all:
             t_c = time.time()
             comod_map = self._comodulation(extra["env"], comb, sl, cfg)
             self.timing["comod"] = time.time() - t_c
@@ -635,7 +644,7 @@ class Engine:
     # ---------------- per track: audio, stage 2, confidence, events ----------------
     def _tracks_audio_and_stage2(self, cfg, ta, tb):
         det, checks = cfg["detect"], cfg["checks"]
-        enabled = {c["id"]: checks[c["id"]]["enabled"] and checks[c["id"]]["weight"] > 0
+        enabled = {c["id"]: (checks[c["id"]]["enabled"] and checks[c["id"]]["weight"] > 0) or c["id"] in self.score_all
                    for c in CHECKS if c["stage"] == 2}
         alive = []
         # demodulate every track's new audio in parallel (the heavy, full-rate part)
