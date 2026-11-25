@@ -9,6 +9,7 @@ SmoothGain         slow automatic level control: the gain glides across each chu
 fade()             raised-cosine fade in / out.
 """
 import numpy as np
+from scipy.signal import lfilter
 
 FS = 16000
 
@@ -24,6 +25,8 @@ class StreamingDenoiser:
     def __init__(self, strength=1.0, floor_db=-18.0, n=512, hop=128):
         self.n, self.hop = n, hop
         self.strength, self.floor = float(strength), 10 ** (floor_db / 20)
+        if n % hop:
+            raise ValueError("n must be a multiple of hop")
         self.win = np.sqrt(np.hanning(n + 1)[:n]).astype(np.float32)
         self.inbuf = np.zeros(n, np.float32)            # last n input samples
         self.ola = np.zeros(n, np.float32)              # overlap-add accumulator
@@ -38,41 +41,63 @@ class StreamingDenoiser:
         x = np.asarray(x, np.float32)
         if self.strength <= 0:
             return x
+        n, hop = self.n, self.hop
         data = np.concatenate([self.pending, x])
-        nh = len(data) // self.hop
-        out = np.empty(nh * self.hop, np.float32)
-        for i in range(nh):
-            hopd = data[i * self.hop:(i + 1) * self.hop]
-            self.inbuf = np.concatenate([self.inbuf[self.hop:], hopd])
-            X = np.fft.rfft(self.inbuf * self.win)
-            P = (X.real ** 2 + X.imag ** 2).astype(np.float32)
-            if self.ps is None:
-                self.ps, self.nmin, self.gs = P.copy(), P.copy(), np.ones_like(P)
-            # noise tracker: average each bin only over frames where it looks like noise (< 2.5x the
-            # estimate); otherwise let the estimate creep up slowly so a rising background is followed
-            if self.frames < 20:                                   # seed: plain average over the first ~0.16 s
-                k = self.frames + 1
-                self.nmin = P.copy() if self.frames <= 4 else self.nmin + (P - self.nmin) / (k - 4)
-            else:
-                quiet = P < 2.5 * self.nmin
-                self.nmin = np.where(quiet, 0.97 * self.nmin + 0.03 * P, self.nmin * 1.002)
-            noise = (1.0 if self.frames < 20 else 1.65) * self.nmin  # the truncated average sits ~0.6x the mean
-            # decide the gain from power smoothed over neighbouring frames and bins: a single frame's
-            # noise power fluctuates too much (that is what leaves "musical noise" behind)
-            Pf = np.convolve(P, (0.25, 0.5, 0.25), mode="same")
-            self.ps = 0.65 * self.ps + 0.35 * Pf
-            self.gs = np.maximum(1 - self.strength * noise / (self.ps + 1e-12), self.floor)
-            if self.frames < 20:                                   # no estimate yet (~0.16 s): pass through
-                self.gs[:] = 1.0
-            self.frames += 1
-            y = np.fft.irfft(X * self.gs, self.n).astype(np.float32) * self.win * 0.5
-            self.ola += y
-            out[i * self.hop:(i + 1) * self.hop] = self.ola[:self.hop]
-            self.ola = np.concatenate([self.ola[self.hop:], np.zeros(self.hop, np.float32)])
-        self.pending = data[nh * self.hop:]
+        nh = len(data) // hop
+        self.pending = data[nh * hop:]
+        if nh == 0:
+            out = np.zeros(0, np.float32)
+        else:
+            out = self._frames(data[:nh * hop], nh)
         self.fifo = np.concatenate([self.fifo, out])
         res, self.fifo = self.fifo[:len(x)], self.fifo[len(x):]
         return res
+
+    def _frames(self, data, nh):
+        """All complete hops of one call at once: one batched rfft/irfft, the sequential
+        per-frame recursions as short loops / filters over 257-bin vectors, vectorised OLA."""
+        n, hop = self.n, self.hop
+        buf = np.concatenate([self.inbuf[hop:], data])            # frame i = buf[i*hop : i*hop+n]
+        frames = np.lib.stride_tricks.sliding_window_view(buf, n)[::hop]
+        self.inbuf = buf[-n:].copy()
+        X = np.fft.rfft(frames * self.win, axis=1)
+        P = (X.real ** 2 + X.imag ** 2).astype(np.float32)
+        if self.ps is None:
+            self.ps, self.nmin, self.gs = P[0].copy(), P[0].copy(), np.ones_like(P[0])
+        f0 = self.frames
+        # noise tracker (conditional recursion, inherently sequential): see the class docstring
+        N = np.empty_like(P)
+        nmin = self.nmin
+        for i in range(nh):
+            f = f0 + i
+            Pi = P[i]
+            if f < 20:                                             # seed: plain average over the first ~0.16 s
+                nmin = Pi.copy() if f <= 4 else nmin + (Pi - nmin) / (f + 1 - 4)
+            else:                                                  # average over noise-like frames, else creep up
+                nmin = np.where(Pi < 2.5 * nmin, 0.97 * nmin + 0.03 * Pi, nmin * 1.002)
+            N[i] = nmin
+        self.nmin = nmin
+        # gain from power smoothed over neighbouring bins (3-tap) and frames (one-pole IIR)
+        Pf = 0.5 * P.astype(np.float64)
+        Pf[:, 1:] += 0.25 * P[:, :-1]
+        Pf[:, :-1] += 0.25 * P[:, 1:]
+        ps, _ = lfilter([0.35], [1.0, -0.65], Pf, axis=0, zi=(0.65 * np.asarray(self.ps, np.float64))[None, :])
+        self.ps = ps[-1]
+        G = np.maximum(1 - self.strength * 1.65 * N / (ps + 1e-12), self.floor)
+        if f0 < 20:                                                # no estimate yet (~0.16 s): pass through
+            G[:max(0, min(nh, 20 - f0))] = 1.0
+        self.gs = G[-1]
+        self.frames += nh
+        Y = np.fft.irfft(X * G, n, axis=1).astype(np.float32) * self.win * 0.5
+        # overlap-add: frame i lands on hop blocks i .. i+r-1; block i is complete after frame i
+        r = n // hop
+        acc = np.zeros((nh + r, hop), np.float32)
+        acc[:r] = self.ola.reshape(r, hop)
+        Y = Y.reshape(nh, r, hop)
+        for k in range(r - 1, -1, -1):                             # oldest contribution first, as streamed
+            acc[k:k + nh] += Y[:, k]
+        self.ola = acc[nh:].reshape(-1).copy()
+        return acc[:nh].reshape(-1)
 
 
 class SmoothGain:
