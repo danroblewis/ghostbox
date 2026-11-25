@@ -795,7 +795,7 @@ function buildDetector() {
       S.cfg = await r.json(); buildDetector();
     }
   }, v.label)));
-  root.append(tuneCard());
+  root.append(tuneCard()); tickReady();
   root.append(el("h2", {}, "Sensitivity"), seg,
     el("div", { class: "note" }, "Sets thresholds, tracking limits and the voice-check weights in one click. Ghost hunter and Everything let far more human-ish fragments through (expect more false alarms). Checks you switched off stay off."));
   root.append(el("h2", {}, "Thresholds & tracking"),
@@ -849,11 +849,11 @@ const TUNE = { state: { state: "idle" }, minutes: +lsGet("gb_tune_min", 2), perM
 function tuneCard() {
   const st = TUNE.state, running = st.state === "running";
   const mins = el("select", { class: "sel" }, ...[1, 2, 5, 10].map(m => el("option", { value: m }, m + " min")));
-  mins.value = TUNE.minutes; mins.addEventListener("change", () => { TUNE.minutes = +mins.value; lsSet("gb_tune_min", TUNE.minutes); });
+  mins.value = TUNE.minutes; mins.addEventListener("change", () => { TUNE.minutes = +mins.value; lsSet("gb_tune_min", TUNE.minutes); pollReady(); });
   const rate = el("input", { type: "range", min: 1, max: 30, step: 1, value: TUNE.perMin }); fillRange(rate);
   const rateOut = el("output", {}, TUNE.perMin + " / min");
   rate.addEventListener("input", () => { fillRange(rate); TUNE.perMin = +rate.value; rateOut.textContent = rate.value + " / min"; lsSet("gb_tune_rate", rate.value); });
-  const go = el("button", { class: "btn primary", disabled: running, onclick: async () => {
+  const go = el("button", { id: "tuneGo", class: "btn primary", disabled: running || !(TUNE.ready && TUNE.ready.ready), onclick: async () => {
     await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: TUNE.minutes, per_min: TUNE.perMin }) });
   } }, running ? "Analysing…" : "Auto-tune for this band");
   const out = el("div", { class: "note", style: "margin:8px 0 0" });
@@ -871,10 +871,43 @@ function tuneCard() {
     el("div", { class: "desc" }, "Calibrates the checks to this band from recently recorded IQ: finds the weights whose top detections sound most like speech, then sets the thresholds to give about the rate you choose. Needs Record raw IQ on."),
     el("div", { class: "row wide" }, el("label", {}, "Analyse the last"), mins),
     el("div", { class: "row" }, el("label", {}, "Target detections"), rate, rateOut),
+    readyBlock(),
     el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go,
       st.state === "done" ? el("button", { class: "btn", onclick: () => fetch("/api/autotune/revert", { method: "POST" }) }, "Revert") : null),
     out);
 }
+// Readiness: the server says how much continuous IQ exists for this band; between polls the
+// count ticks up locally once a second (the ring grows in real time), so the timer moves smoothly.
+function readyBlock() {
+  const bar = el("div", { class: "tbar" }, el("i", { id: "tuneBarFill" }));
+  const txt = el("span", { id: "tuneReadyTxt" });
+  const act = el("span", { id: "tuneReadyAct" });
+  return el("div", { id: "tuneReady", style: "margin-top:8px" }, bar, el("div", { class: "note", style: "margin:4px 0 0;display:flex;gap:10px;align-items:center" }, txt, act));
+}
+const fmtMS = s => `${Math.floor(s / 60)}:${pad2(Math.floor(s % 60))}`;
+function tickReady() {
+  const r = TUNE.ready, box = $("#tuneReady"); if (!r || !box) return;
+  const running = TUNE.state.state === "running";
+  const have = Math.min(r.need_s, r.have_s + (r.reason === "recording" ? (Date.now() - r.at) / 1000 : 0));
+  const ready = r.ready || (r.reason === "recording" && have >= r.need_s * 0.95);
+  box.style.display = r.ready && !running ? "none" : "";
+  $("#tuneBarFill").style.width = (100 * have / r.need_s).toFixed(1) + "%";
+  const txt = $("#tuneReadyTxt"), act = $("#tuneReadyAct");
+  if (r.reason === "file") { txt.textContent = "Auto-tune needs a live receiver: it learns from IQ recorded at the current frequency."; act.replaceChildren(); }
+  else if (r.reason === "off") {
+    txt.textContent = `Raw IQ recording is off (${fmtMS(have)} of ${fmtMS(r.need_s)} recorded here).`;
+    if (!act.firstChild) act.replaceChildren(el("button", { class: "btn", onclick: () => { patch({ iq_ring: { enabled: true } }, 50); r.reason = "recording"; r.at = Date.now(); } }, "Start recording IQ"));
+  } else { txt.textContent = ready ? "Ready." : `Recording this band: ${fmtMS(have)} of ${fmtMS(r.need_s)} · ready in ${fmtMS(r.need_s * 0.95 - have)}`; act.replaceChildren(); }
+  const go = $("#tuneGo"); if (go) go.disabled = running || !ready;
+}
+async function pollReady() {
+  if (!$("#detector").classList.contains("active")) return;
+  try {
+    const r = await (await fetch(`/api/autotune/ready?minutes=${TUNE.minutes}`)).json();
+    TUNE.ready = { ...r, at: Date.now() }; tickReady();
+  } catch (e) {}
+}
+setInterval(pollReady, 5000); setInterval(tickReady, 1000);
 function onTune(m) {
   const was = TUNE.state.state; TUNE.state = m;
   if (m.state === "done" && was === "running" && m.result) setMinConf(m.result.show_threshold);
@@ -991,6 +1024,7 @@ function switchTab(name) {
   document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === name));
   if (name === "sdr") buildSDR();
+  if (name === "detector") pollReady();
 }
 document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 

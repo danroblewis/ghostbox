@@ -15,7 +15,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
-from .autotune import AutoTune
+from .autotune import AutoTune, pick_segments
 from .engine import Engine
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -258,6 +258,18 @@ def make_app(args):
     async def tune_get(request):
         return web.json_response(state["tune"].state, dumps=lambda o: json.dumps(o, default=float))
 
+    async def tune_ready(request):
+        """How much continuous raw IQ exists for the current band (the same rule auto-tune uses)."""
+        minutes = float(request.query.get("minutes", 2))
+        c = config.get()
+        need = minutes * 60
+        if c["sdr"]["source"] == "file":
+            return web.json_response({"ready": False, "reason": "file", "have_s": 0, "need_s": need})
+        _, have = await asyncio.get_running_loop().run_in_executor(None, pick_segments, ROOT, c, minutes)
+        reason = None if have >= need * 0.95 else ("off" if not c["iq_ring"]["enabled"] else "recording")
+        return web.json_response({"ready": reason is None, "reason": reason, "have_s": round(have, 1), "need_s": need,
+                                  "segment_s": c["iq_ring"]["segment_s"]})
+
     async def tune_revert(request):
         return web.json_response({"ok": state["tune"].revert()})
 
@@ -300,6 +312,7 @@ def make_app(args):
     app.router.add_post("/api/autotune", tune_start)
     app.router.add_get("/api/autotune", tune_get)
     app.router.add_post("/api/autotune/revert", tune_revert)
+    app.router.add_get("/api/autotune/ready", tune_ready)
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", post_config)
     app.router.add_post("/api/preset", post_preset)
