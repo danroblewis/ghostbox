@@ -204,12 +204,15 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 body.field .fieldonly{display:flex}
 body.field #top{height:48px;min-height:48px;flex-wrap:nowrap;padding:0 8px;gap:6px}
 body.field #top #grpRate,body.field #top #grpGain,body.field #top #fleft,body.field #top #fright,
-body.field #top #status,body.field #top #pp,body.field #top #vol,body.field #top #helpBtn{display:none}
+body.field #top #status,body.field #top #vol,body.field #top #helpBtn{display:none}
+body.field #top #pp{width:40px;height:36px}
 body.field #top .freq{width:96px;font-size:15px}
 body.field #top #menuBtn{margin-left:auto;width:40px;height:36px}
 body.field #top #menuBtn svg{width:16px;height:16px}
 body.field main{display:block;overflow-y:auto;-webkit-overflow-scrolling:touch}
-body.field #left #wfbar,body.field #scopeWrap{display:none}
+body.field #left #wfbar{display:none}
+body.field canvas#scope{height:72px}
+body.field #cv,body.field #wf{touch-action:none}
 body.field #wfwrap{height:34vh;min-height:190px;flex:none}
 body.field #side{border:0;min-height:0}
 body.field #side .tabs{display:none}
@@ -226,7 +229,8 @@ body.field #side .tab{overflow:visible}
 #fieldCtl{display:flex;gap:10px;align-items:center}
 .btn.big{height:44px;padding:0 18px;font-size:15px}
 #fieldCtl input{flex:1;min-width:60px}
-#fMark.flash{border-color:var(--mark);color:var(--mark)}
+#fMinOut{min-width:36px;text-align:right}
+#fRecal{height:36px}
 body.field .det{height:44px}
 /* sheets: the Detector / Settings tab full-screen */
 .sheethead{display:none}
@@ -253,6 +257,9 @@ body.field .svhead{flex-wrap:wrap;height:auto;row-gap:6px}
 #fieldMenu #mapBtn{display:none}
 body.field .kbdhint{display:none}
 body.field .abseg{flex-wrap:wrap}
+#fieldMenu #vol{flex:1;width:auto !important}
+#fieldMenu .dlghead{flex-wrap:nowrap}
+#fieldMenu .dlghead .num{min-width:0;flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;background:var(--panel);border:1px solid var(--line-strong);padding:8px 14px;border-radius:var(--radius);font-size:14px}
 /* dialogs fill a phone screen */
 @media (max-width:760px){
@@ -320,9 +327,8 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
       <div id="nowLine"><span id="nowFreq" class="num">Listening…</span><span id="nowConf" class="num"></span></div>
       <div id="nowText"></div>
       <div id="fieldCtl">
-        <button id="fPause" class="btn big">Pause</button>
-        <button id="fMark" class="btn big" title="Bookmark this moment">Mark</button>
-        <input id="fVol" type="range" min="0" max="1.5" step="0.05" title="Volume">
+        <span class="lbl">Min confidence</span><input id="fMin" type="range" min="0" max="100" step="1"><span id="fMinOut" class="num t2"></span>
+        <button id="fRecal" class="btn" title="Re-learn this band from the last few minutes of IQ">Recalibrate</button>
       </div>
     </div>
     <div id="scopeWrap">

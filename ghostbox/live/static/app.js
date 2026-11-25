@@ -482,7 +482,7 @@ function drawScope() {
   }
   // caption: only when it says something
   const d = voices[0], cap = $("#scopeCap");
-  const text = !AC || AC.state !== "running" ? "Click anywhere to start audio."
+  const text = !AC || AC.state !== "running" ? (FIELD.on ? "Tap anywhere to start audio." : "Click anywhere to start audio.")
     : d && S.tx.get(d.box.id) && S.tx.get(d.box.id).text ? `“${S.tx.get(d.box.id).text}”` : S.paused ? "Paused" : "";
   if (cap.textContent !== text) cap.textContent = text;
 }
@@ -1222,6 +1222,10 @@ async function pollReady() {
 setInterval(pollReady, 5000); setInterval(tickReady, 1000);
 function onTune(m) {
   const was = TUNE.state.state; TUNE.state = m;
+  const rb = $("#fRecal");
+  if (rb) { const run = m.state === "running"; rb.disabled = run; rb.textContent = run ? "Calibrating…" : "Recalibrate"; }
+  if (FIELD.on && was === "running" && m.state !== "running")
+    toast(m.state === "done" && m.result ? `Calibrated on ${m.result.candidates} candidates, ${m.result.voice_like} speech-like` : (m.message || "Calibration finished"));
   if (m.state === "done" && was === "running" && m.result) setMinConf(m.result.show_threshold);
   if (!$("#detector").contains(document.activeElement) || m.state !== "running") buildDetector();
 }
@@ -1346,6 +1350,7 @@ function setMinConf(v) {
   $("#minConf").value = Math.round(v * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(v * 100) + "%";
   renderLive(); clearTimeout(confTimer); confTimer = setTimeout(() => loadPage(true), 250);
   if (SV.open) { renderSurvey(); renderSamples(); }
+  if ($("#fMin")) syncFieldMin();
 }
 $("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
 $("#caps").checked = lsGet("gb_caps", "1") === "1";
@@ -1796,7 +1801,7 @@ $("#helpBtn").addEventListener("click", openHelp);
 // Same app, rearranged: waterfall, a "now" panel (K2-style confidence LEDs, frequency, live
 // transcript), big Pause / Mark / volume, and the detections list. Everything else lives in a menu
 // that borrows the real controls (so they behave exactly as on the desktop) and in full-screen sheets.
-const FIELD = { on: false };
+var FIELD = { on: false };
 function wantField() { const p = lsGet("gb_layout", "auto"); return p === "phone" || (p === "auto" && innerWidth <= 760); }
 function applyLayout() {
   const on = wantField(); if (on === FIELD.on) return;
@@ -1824,23 +1829,54 @@ setInterval(() => {
     box.replaceChildren(...log.slice(0, -1).map(x => el("span", { class: "prev" }, `“${x.text}”`)),
       ...log.slice(-1).map(x => el("span", { class: x.doubt ? "doubt" : "" }, `“${x.text}”`)));
   }
-  $("#fPause").textContent = S.paused ? "Resume" : "Pause";
 }, 150);
-$("#fPause").addEventListener("click", () => { ensureAudio(); setPaused(!S.paused); });
-$("#fVol").value = $("#vol").value;
-$("#fVol").addEventListener("input", e => { $("#vol").value = e.target.value; $("#vol").dispatchEvent(new Event("input")); });
-function toast(text) { const t = $("#toast") || document.body.appendChild(el("div", { id: "toast" })); t.textContent = text; t.style.display = ""; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2200); }
-$("#fMark").addEventListener("click", async () => {
+function toast(text) { const t = $("#toast") || document.body.appendChild(el("div", { id: "toast" })); t.textContent = text; t.style.display = ""; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2600); }
+async function markNow() {
   const t = S.offset === null ? undefined : playheadTime();
   try { const m = await (await fetch("/api/mark", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ t }) })).json(); toast(`Marked ${clockTime(m.t)}`); } catch (e) { toast("Couldn't save the mark"); }
-  const b = $("#fMark"); b.classList.add("flash"); setTimeout(() => b.classList.remove("flash"), 600);
+}
+// min confidence, right in the panel
+function syncFieldMin() { const v = Math.round(S.minConf * 100); $("#fMin").value = v; fillRange($("#fMin")); $("#fMinOut").textContent = v + "%"; }
+$("#fMin").addEventListener("input", e => { setMinConf(+e.target.value / 100); syncFieldMin(); });
+syncFieldMin();
+// recalibrate on demand (the same as Detector > Recalibrate now)
+$("#fRecal").addEventListener("click", async () => {
+  const at = S.cfg.autotune, b = $("#fRecal"); b.disabled = true; b.textContent = "Calibrating…";
+  const r = await (await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: at.minutes, per_min: at.per_min }) })).json().catch(() => ({}));
+  if (r.error) { toast(r.error); b.disabled = false; b.textContent = "Recalibrate"; }
+  FIELD.recal = true;
 });
+// touch on the waterfall: one finger scrolls through time, two fingers zoom it; taps behave as clicks
+(() => {
+  let t0 = null, pinch = null;
+  cv.addEventListener("touchstart", e => {
+    if (e.touches.length === 2) {
+      const d = Math.abs(e.touches[0].clientY - e.touches[1].clientY) || 1; pinch = { d, pps: S.pps }; t0 = null; return;
+    }
+    const top = topTime(); if (top === null) return;
+    t0 = { y: e.touches[0].clientY, top: S.follow ? top : S.viewTop, moved: false };
+  }, { passive: true });
+  cv.addEventListener("touchmove", e => {
+    if (pinch && e.touches.length === 2) {
+      e.preventDefault();
+      const d = Math.abs(e.touches[0].clientY - e.touches[1].clientY) || 1;
+      S.pps = Math.max(3, Math.min(160, pinch.pps * d / pinch.d)); lsSet("gb_pps", S.pps); return;
+    }
+    if (!t0) return;
+    const dy = e.touches[0].clientY - t0.y;
+    if (!t0.moved && Math.abs(dy) < 8) return;
+    e.preventDefault(); t0.moved = true; downAt = null;     // a swipe, not a tap
+    const live = liveTop(); if (live === null) return;
+    S.follow = false; S.viewTop = Math.min(live, t0.top + dy / S.pps); updateNav();
+  }, { passive: false });
+  cv.addEventListener("touchend", e => { if (e.touches.length < 2) pinch = null; if (!e.touches.length) t0 = null; });
+})();
 // full-screen sheets for the Detector and Settings tabs
 function openSheet(tab, title) { closeFieldMenu(); document.body.classList.add("sheet"); $("#sheetTitle").textContent = title; switchTab(tab); }
 function closeSheet() { if (!document.body.classList.contains("sheet")) return; document.body.classList.remove("sheet"); switchTab("dets"); }
 $("#sheetClose").addEventListener("click", closeSheet);
 // the menu: borrows the header's span / gain / map controls and the waterfall toolbar
-const BORROW = ["#grpRate", "#grpGain", "#wfbar"];
+const BORROW = ["#grpRate", "#grpGain", "#wfbar", "#vol"];
 function closeFieldMenu() {
   const m = $("#fieldMenu"); if (!m) return;
   for (const b of FIELD.borrowed || []) b.parent.insertBefore(b.node, b.next);
@@ -1849,13 +1885,15 @@ function closeFieldMenu() {
 function openFieldMenu() {
   if ($("#fieldMenu")) return closeFieldMenu();
   FIELD.borrowed = BORROW.map(q => { const n = $(q); return { node: n, parent: n.parentNode, next: n.nextSibling }; });
-  const [rate, gain, bar] = FIELD.borrowed.map(b => b.node);
+  const [rate, gain, bar, vol] = FIELD.borrowed.map(b => b.node);
   const go = (label, fn) => el("button", { class: "btn", onclick: fn }, label);
   const box = el("div", { class: "dlg" },
-    el("div", { class: "dlghead" }, el("strong", {}, "Ghostbox"), el("span", { class: "t2 num", style: "font-size:12px" }, $("#status").textContent), el("span", { style: "flex:1" }), go("Close", closeFieldMenu)),
+    el("div", { class: "dlghead" }, el("strong", {}, "Ghostbox"), el("span", { class: "t2 num", style: "font-size:12px" }, $("#status").textContent), go("Close", closeFieldMenu)),
     el("h3", {}, "Receiver"), el("div", { class: "mrow" }, rate), el("div", { class: "mrow" }, gain),
     el("h3", {}, "Display"), el("div", { class: "mrow" }, bar),
+    el("h3", {}, "Volume"), el("div", { class: "mrow" }, vol),
     el("div", { class: "mbtns" },
+      go("Mark this moment", () => { closeFieldMenu(); markNow(); }),
       go("Map", () => { closeFieldMenu(); openMap(); }),
       go("Detector", () => openSheet("detector", "Detector")),
       go("Settings", () => openSheet("sdr", "Settings")),

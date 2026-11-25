@@ -117,10 +117,11 @@ The original way to start it still works from a source checkout:
 
 ## On a phone (field use)
 
-Open the same page on a phone and it switches to a field layout: the waterfall, a confidence meter,
-the live transcript in large text, big Pause / **Mark** / volume controls, and the detections list
-(tap one for its details). Tuning, the display options, the map, the detector and settings are in the
-menu. **Mark** bookmarks the moment you're hearing (saved to `live_data/marks.jsonl` and drawn on the
+Open the same page on a phone and it switches to a field layout: the waterfall (swipe up to go back in
+time, pinch to zoom), a confidence meter, the live transcript in large text, the min-confidence slider
+and a Recalibrate button, the audio waveform and spectrogram, and the detections list (tap one for its
+details). Pause is in the top bar; tuning, display options, volume, Mark, the map, the detector and
+settings are in the menu. **Mark** bookmarks the moment you're hearing (saved to `live_data/marks.jsonl` and drawn on the
 waterfall), so recordings can be lined up with what happened in the room afterwards. Settings ›
 Appearance can force the phone or desktop layout.
 
