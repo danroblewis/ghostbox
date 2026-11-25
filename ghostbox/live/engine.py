@@ -16,6 +16,8 @@ waterfall.
 """
 import base64
 import collections
+import os
+from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
 import time
@@ -43,14 +45,27 @@ def _b64(a):
     return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
 
 
+def _oscillator(f_offset, n, fs, L=4096):
+    """exp(-j 2 pi integral f dt) for a piecewise-constant frequency, without n trig calls:
+    each constant run is built as (block steps) x (one block), i.e. ~n/L + L exps per run."""
+    f = np.full(n, float(f_offset)) if np.ndim(f_offset) == 0 else np.asarray(f_offset, np.float64)
+    starts = np.concatenate([[0], np.flatnonzero(np.diff(f)) + 1, [n]])
+    out = np.empty(n, np.complex64)
+    phase = 0.0
+    for a, b in zip(starts[:-1], starts[1:]):
+        m = b - a
+        w = -2 * np.pi * f[a] / fs
+        base = np.exp(1j * w * np.arange(L))
+        steps = np.exp(1j * (phase + w * L * np.arange(-(-m // L))))
+        out[a:b] = (steps[:, None] * base[None, :]).ravel()[:m]
+        phase += w * m
+    return out
+
+
 def demod(x, fs, f_offset, bw_hz):
     """Mix x (complex, at fs) down by f_offset (scalar or per-sample Hz), decimate to 16 kHz.
     Returns (narrowband complex IQ at 16 kHz, AM envelope at 16 kHz)."""
-    if np.ndim(f_offset) == 0:
-        ph = -2 * np.pi * float(f_offset) * np.arange(len(x)) / fs
-    else:
-        ph = -2 * np.pi * np.cumsum(f_offset, dtype=np.float64) / fs
-    y = x * np.exp(1j * ph).astype(np.complex64)
+    y = x * _oscillator(f_offset, len(x), fs)
     d1 = max(1, int(fs // 160000))
     n = len(y) // d1 * d1
     y = y[:n].reshape(-1, d1).mean(axis=1)                      # CIC-like first stage
@@ -129,6 +144,7 @@ class Engine:
         self._last_prune = 0.0
         self.chains = {}                            # hop chain id -> finished member clips
         self.transcriber = Transcriber(config, emit)
+        self.pool = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
         self.lock = threading.Lock()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -211,7 +227,9 @@ class Engine:
                     misses = 0
                 cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = self.fc, self.fs
                 n = int(self.fs * cfg["analysis"]["hop_s"]) // self.frame_len * self.frame_len
+                t_wait = time.time()
                 x = src.read(n, timeout=3.0)
+                t_got = time.time()
                 if x is None:
                     misses += 1
                     self.status = {"state": "no data", "source": cfg["sdr"]["source"],
@@ -223,10 +241,13 @@ class Engine:
                         time.sleep(2)
                     continue
                 misses = 0
-                t_proc = time.time()
+                self._src = src
                 self._ingest(x, cfg)
                 self._analyze(cfg)
-                load = (time.time() - t_proc) / (len(x) / self.fs)
+                # load = all work for this second of signal (conversion + processing) / its duration.
+                # Time spent blocked waiting for samples isn't work; conversion happens inside read().
+                busy = time.time() - t_got + getattr(src, "convert_s", 0.0)
+                load = busy / (len(x) / self.fs)
                 self.status = {"state": "running", "source": cfg["sdr"]["source"], "fs": self.fs,
                                "epoch": self.t_origin, "fmin": self.f_lo, "fmax": self.f_hi,
                                "fc": self.fc, "t": self.n_samples / self.fs, "load": round(load, 2),
@@ -327,7 +348,7 @@ class Engine:
             return
         sl = slice(idx[0], idx[-1] + 1)
         self.analyzed_until = float(T[idx[-1]])
-        scores, comb = stage1.run(P, self.df, self.fr, cfg, sl, force=set(stage1.STAGE1))
+        scores, comb = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=set(stage1.STAGE1), pool=self.pool)
         ts = T[sl]
 
         # novelty: subtract a slow per-bin baseline (always-on emitters cancel)
@@ -404,12 +425,16 @@ class Engine:
                    for c in CHECKS if c["stage"] == 2}
         weights = {k: v["weight"] for k, v in checks.items() if v["enabled"]}
         alive = []
+        # demodulate every track's new audio in parallel (the heavy, full-rate part)
+        jobs = []
         for tr in self.tracks:
-            ended = tb - tr.t_last > det["track_gap_s"]
             t_from = tr.audio_until if tr.audio_until is not None else tr.t0 - 0.5 / self.fr
             t_to = min(tb, tr.t_last + 0.5 / self.fr)
             if t_to - t_from > 0.02:
-                self._demod_track(tr, t_from, t_to, cfg)
+                jobs.append((tr, t_from, t_to))
+        list(self.pool.map(lambda j: self._demod_track(j[0], j[1], j[2], cfg), jobs))
+        for tr in self.tracks:
+            ended = tb - tr.t_last > det["track_gap_s"]
             # stage 2 on the last 3 s, stage 1 averaged over the last 1 s of the track
             recent = [fr for fr in tr.frames if fr[0] >= tr.t_last - 1.0]
             s1 = {}
@@ -584,9 +609,15 @@ class Engine:
             (d / (name[:-4] + ".json")).write_text(json.dumps(
                 {"t0": t_start, "epoch": self.t_origin, "utc": utc.isoformat(), "fc": self.fc, "fs": self.fs,
                  "source": cfg["sdr"]["source"], "format": "cs8"}))
-        q = np.empty(2 * len(x), np.int8)
-        q[0::2] = np.clip(np.round(x.real * 128), -127, 127)
-        q[1::2] = np.clip(np.round(x.imag * 128), -127, 127)
+        src = getattr(self, "_src", None)
+        raw = getattr(src, "last_raw", None)
+        if raw is not None and len(raw) == 2 * len(x):
+            from .sources import _to_cs8
+            q = _to_cs8(raw, getattr(src, "signed", True))
+        else:
+            q = np.empty(2 * len(x), np.int8)
+            q[0::2] = np.clip(np.round(x.real * 128), -127, 127)
+            q[1::2] = np.clip(np.round(x.imag * 128), -127, 127)
         self.iq_file.write(q.tobytes())
 
     def _prune(self, cfg):

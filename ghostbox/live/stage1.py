@@ -98,3 +98,42 @@ def _fine_mirror(P, inner, outer, avg):
     var = (sxx - sx * sx / m) * (syy - sy * sy / m)
     c = cov / np.sqrt(np.maximum(var, 1e-12))
     return np.clip(avg(c), 0, 1)
+
+
+def max_offset(df, cfg, force=()):
+    """Largest frequency offset (bins) any enabled/forced check reaches; blocks need this much overlap."""
+    an, ch = cfg["analysis"], cfg["checks"]
+    inner = max(1, round(an["sideband_lo_hz"] / df))
+    m = max(inner + 2, round(an["sideband_hi_hz"] / df))
+    for k in ("ring", "broadband"):
+        if ch[k]["enabled"] or k in force:
+            m = max(m, round(ch[k]["hi_hz"] / df))
+    return m + 2
+
+
+def run_blocks(P, df, frame_rate, cfg, sl, force=(), pool=None, nblocks=16, min_block=2000):
+    """run() split into frequency blocks processed in parallel (numpy releases the GIL).
+
+    Each block is padded by the checks' maximum frequency reach, so results are identical to
+    run() except the syllable check's noise reference, which becomes per-block (local)."""
+    K = P.shape[1]
+    nb = max(1, min(nblocks, K // min_block))
+    if pool is None or nb == 1:
+        return run(P, df, frame_rate, cfg, sl, force)
+    pad = max_offset(df, cfg, force)
+    edges = np.linspace(0, K, nb + 1).astype(int)
+
+    def job(a, b):
+        lo, hi = max(0, a - pad), min(K, b + pad)
+        out, comb = run(P[:, lo:hi], df, frame_rate, cfg, sl, force)
+        return a, b, lo, out, comb
+
+    parts = list(pool.map(lambda ab: job(*ab), zip(edges[:-1], edges[1:])))
+    n = sl.stop - sl.start
+    comb = np.empty((n, K), np.float32)
+    out = {k: np.empty((n, K), np.float32) for k in parts[0][3]}
+    for a, b, lo, o, c in parts:
+        comb[:, a:b] = c[:, a - lo:b - lo]
+        for k, v in o.items():
+            out[k][:, a:b] = v[:, a - lo:b - lo]
+    return out, comb

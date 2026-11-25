@@ -15,9 +15,18 @@ CU8_OFFSET = 127.4
 
 
 def _to_complex(raw, signed):
+    """Interleaved 8-bit I/Q -> complex64 (scaled /128) via a float32 view: ~5x faster than slicing."""
     u = raw.astype(np.float32)
-    off = 0.0 if signed else CU8_OFFSET
-    return ((u[0::2] - off) + 1j * (u[1::2] - off)).astype(np.complex64) / 128.0
+    if not signed:
+        u -= CU8_OFFSET
+    x = u.view(np.complex64)
+    x *= 1 / 128.0
+    return x
+
+
+def _to_cs8(raw, signed):
+    """The same samples as signed 8-bit (what the IQ ring stores), without re-quantizing."""
+    return raw if signed else (raw.astype(np.int16) - 127).clip(-127, 127).astype(np.int8)
 
 
 class Source:
@@ -80,9 +89,13 @@ class ProcSource(Source):
                 return None
             parts.append(c)
             have += len(c)
+        t0 = time.time()
         allb = np.concatenate(parts)
         self.buf = allb[need:]
-        return _to_complex(allb[:need], self.signed)
+        self.last_raw = allb[:need]
+        x = _to_complex(allb[:need], self.signed)
+        self.convert_s = time.time() - t0
+        return x
 
     def stop(self):
         self._stop.set()
@@ -125,7 +138,8 @@ class FileSource(Source):
             if self.pos >= len(self.raw):
                 self.pos = 0  # loop
         self.sent += n
-        return _to_complex(np.concatenate(out), self.signed)
+        self.last_raw = np.concatenate(out)
+        return _to_complex(self.last_raw, self.signed)
 
 
 def make_source(sdr):

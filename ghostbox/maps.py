@@ -28,6 +28,7 @@ a few hundred ms dwell can still be caught.
 from dataclasses import dataclass
 
 import numpy as np
+from scipy import fft as sp_fft
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import butter, sosfiltfilt
 
@@ -56,7 +57,7 @@ def power_frames(x, fs, nfft=19200, frame_rate=25, chunk_s=1.0):
     for i in range(0, nframes, per_chunk):
         j = min(nframes, i + per_chunk)
         seg = x[i * hop: j * hop].reshape(j - i, hop)[:, : nseg * nfft].reshape(j - i, nseg, nfft)
-        S = np.fft.fft(seg * win, axis=-1)
+        S = sp_fft.fft(seg * win, axis=-1, workers=-1)
         P[i:j] = np.fft.fftshift(np.mean(np.abs(S) ** 2, axis=1), axes=-1)
     f = np.fft.fftshift(np.fft.fftfreq(nfft, 1 / fs)).astype(np.float32)
     t = ((np.arange(nframes) + 0.5) / frame_rate).astype(np.float32)
