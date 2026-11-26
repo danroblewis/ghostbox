@@ -19,6 +19,7 @@ import numpy as np
 from .config import CHECKS, GROUPS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
 from .engine import Engine, iq_cut_wav, render_mix, render_segments
+from .afilters import FILTERS as AFILTERS
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
 from .survey import Survey
@@ -148,6 +149,7 @@ def make_app(args):
         await sock.send_str(json.dumps({
             "type": "hello", "config": config.get(), "checks": CHECKS, "check_groups": GROUPS, "views": VIEWS,
             "asr_models": [[k, v[2]] for k, v in ASR_MODELS.items()],
+            "audio_filters": [dict(zip(("id", "label", "value", "min", "max", "step", "unit"), f)) for f in AFILTERS],
             "root": str(ROOT.resolve()),
             "presets": {k: v["label"] for k, v in PRESETS.items()},
             "sensitivity": SENSITIVITY, "epoch": eng.t_origin,
@@ -414,10 +416,43 @@ def make_app(args):
         res["apply"] = as_audio_settings(res["best"])
         return web.json_response(res, dumps=lambda o: json.dumps(o, default=float))
 
+    def wav_response(pcm):
+        import io
+        from scipy.io import wavfile
+        buf = io.BytesIO()
+        wavfile.write(buf, 16000, pcm)
+        return web.Response(body=buf.getvalue(), content_type="audio/wav")
+
     async def render(request):
         """A detection / survey sample re-rendered from the IQ ring with other audio settings, for A/B:
         ?demod=envelope|sync|sync_sb|auto &denoise=0|1 &band=0|1 (anything left out: as configured)."""
-        q, eng, loop = request.query, state["engine"], asyncio.get_running_loop()
+        return wav_response(await render_pcm(request.query))
+
+    async def afilter(request):
+        """A clip through the listening filters (afilters): ?key= with src=played (the audio as
+        recorded) or anything render takes (re-rendered from the IQ first), plus one parameter per
+        filter that is on, e.g. &notch=6&gate=8&reverse=1."""
+        from . import afilters
+        q, loop = request.query, asyncio.get_running_loop()
+        params = {f[0]: q[f[0]] for f in afilters.FILTERS if q.get(f[0]) not in (None, "")}
+        try:
+            params = {k: float(v) for k, v in params.items()}
+        except ValueError:
+            raise web.HTTPBadRequest(text="bad filter value")
+        if q.get("src") == "played" and q.get("key"):
+            data = await loop.run_in_executor(None, state["engine"].clip, q["key"])
+            if data is None:
+                raise web.HTTPNotFound(text="audio no longer available")
+            import io
+            from scipy.io import wavfile
+            _, pcm = wavfile.read(io.BytesIO(data))
+        else:
+            pcm = await render_pcm(q)
+        y = await loop.run_in_executor(None, afilters.apply, pcm.astype(np.float32) / 32768, params)
+        return wav_response((np.clip(y, -1, 1) * 32767).astype(np.int16))
+
+    async def render_pcm(q):
+        eng, loop = state["engine"], asyncio.get_running_loop()
         au = dict(config.get()["audio"])
         if q.get("demod") in ("auto", "envelope", "sync", "sync_sb", "suppressed"):
             au["demod"] = q["demod"]
@@ -444,11 +479,7 @@ def make_app(args):
                 pcm = await loop.run_in_executor(None, render_mix, meta, eng.ring_segments, au)
                 if pcm is None:
                     raise web.HTTPNotFound(text="this mix's IQ is no longer in the IQ ring (or IQ recording is off)")
-                import io
-                from scipy.io import wavfile
-                buf = io.BytesIO()
-                wavfile.write(buf, 16000, pcm)
-                return web.Response(body=buf.getvalue(), content_type="audio/wav")
+                return pcm
             t0, t1 = meta["stream_t0"] - pre, meta["stream_t1"] + post
             segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
             if not segs:
@@ -460,11 +491,7 @@ def make_app(args):
         pcm = await loop.run_in_executor(None, render_segments, segs, t0, t1, pts, au, mode, offset)
         if pcm is None:
             raise web.HTTPNotFound(text="no IQ in that time range")
-        import io
-        from scipy.io import wavfile
-        buf = io.BytesIO()
-        wavfile.write(buf, 16000, pcm)
-        return web.Response(body=buf.getvalue(), content_type="audio/wav")
+        return pcm
 
     async def get_iq(request):
         """IQ around a detection (?key=) or a survey sample (?survey=&track=), as a stereo I/Q WAV."""
@@ -731,6 +758,7 @@ def make_app(args):
     app.router.add_post("/api/sdr/test", sdr_test)
     app.router.add_get("/api/iq", get_iq)
     app.router.add_get("/api/render", render)
+    app.router.add_get("/api/afilter", afilter)
     app.router.add_post("/api/tune_audio", tune_audio)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)

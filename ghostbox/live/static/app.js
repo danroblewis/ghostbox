@@ -1665,7 +1665,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello": {
-        S.cfg = m.config; S.checks = m.checks; S.groups = m.check_groups || []; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
+        S.cfg = m.config; S.checks = m.checks; S.groups = m.check_groups || []; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root; S.afilters = m.audio_filters || [];
         fetch("/api/marks").then(r => r.json()).then(x => { S.marks = x; }).catch(() => {});
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
@@ -1928,6 +1928,16 @@ function dtTick() {
 function abControls(base, clip, composed) {
   const au = S.cfg.audio;
   DT.ab = { demod: "rec", denoise: au.denoise !== false, band: au.voice_band !== false }; DT.tunedUrl = null;
+  DT.af = DT.af && DT.af.vals ? { on: {}, vals: DT.af.vals } : { on: {}, vals: {} };   // filter values persist between dialogs
+  if (composed) {                                          // a mix: the audio as played, or its signals again without processing
+    const src = el("div", { class: "abseg" }, ...[["rec", "As played"], ["raw", "Unprocessed"]].map(([v, l]) => el("button", { class: "btn" + (v === "rec" ? " on" : ""), "data-v": v,
+      onclick: e => { DT.ab.demod = v; DT.ab.denoise = DT.ab.band = v === "rec" ? (au.denoise !== false) : false;
+        e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
+    return el("div", {}, el("div", { class: "abrow" }, el("span", { class: "t2" }, "Source"), src,
+      el("span", { id: "abNote", class: "t3", style: "font-size:12px" })),
+      el("div", { class: "note", style: "margin:4px 0 0" }, "Unprocessed: every signal in the mix demodulated again from the IQ without noise reduction or voice band, so the filters below start from the raw sound."),
+      afPanel(base, clip));
+  }
   const seg = (items, key) => el("div", { class: "abseg" }, ...items.map(([v, l]) => el("button", { class: "btn" + (DT.ab[key] === v ? " on" : ""), "data-v": String(v),
     onclick: e => { DT.ab[key] = v; e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
   const note = el("span", { id: "abNote", class: "t3", style: "font-size:12px" });
@@ -1938,10 +1948,9 @@ function abControls(base, clip, composed) {
     seg([["rec", "Recorded"], ["auto", "Auto"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["suppressed", "No carrier"], ["sync_sb", "Sync sideband"]], "demod"),
     el("span", { class: "t2" }, "Noise reduction"), seg([[true, "On"], [false, "Off"]], "denoise"),
     el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note),
-    composed ? el("div", { class: "note" }, "Each signal in the mix is demodulated again from the IQ with these settings and mixed back where it played.")
-      : el("div", { style: "display:flex;gap:10px;align-items:center;margin-top:10px" }, tuneBtn,
+    el("div", { style: "display:flex;gap:10px;align-items:center;margin-top:10px" }, tuneBtn,
       el("span", { class: "t3", style: "font-size:12px" }, "Finds the demodulation and filtering that make this one signal most voice-like.")),
-    tuneOut);
+    tuneOut, afPanel(base, clip));
 }
 async function tuneThis(base, clip, btn) {
   const out = $("#tuneOut"); btn.disabled = true; btn.textContent = "Tuning…";
@@ -1974,9 +1983,37 @@ async function tuneThis(base, clip, btn) {
   } catch (e) { out.replaceChildren(el("div", { class: "err" }, String(e.message || e).slice(0, 160))); }
   btn.disabled = false; btn.textContent = "Tune again";
 }
+// Audio filters (listening only): a rack of optional filters applied on the server to the selected source.
+function afPanel(base, clip) {
+  const rows = (S.afilters || []).map(f => {
+    const v = DT.af.vals[f.id] ?? f.value;
+    const out = el("output", {}, fmtAf(f, v));
+    const cb = el("input", { type: "checkbox" }); cb.checked = !!DT.af.on[f.id];
+    const fixed = f.min === f.max;
+    const inp = fixed ? el("span") : el("input", { type: "range", min: f.min, max: f.max, step: f.step, value: v });
+    if (!fixed) { fillRange(inp); inp.addEventListener("input", () => { fillRange(inp); DT.af.vals[f.id] = +inp.value; out.textContent = fmtAf(f, +inp.value); if (!cb.checked) { cb.checked = true; DT.af.on[f.id] = true; } afSoon(base, clip); }); }
+    cb.addEventListener("change", () => { DT.af.on[f.id] = cb.checked; afSoon(base, clip); });
+    return el("label", { class: "afrow" }, cb, el("span", { class: "t2" }, f.label), inp, fixed ? el("span") : out);
+  });
+  const reset = el("button", { class: "btn", onclick: () => { DT.af.on = {}; document.querySelectorAll(".afrow input[type=checkbox]").forEach(c => { c.checked = false; }); abLoad(base, clip); } }, "All off");
+  return el("details", { class: "afpanel", open: true },
+    el("summary", { class: "t2" }, "Audio filters ", el("span", { class: "t3", style: "font-size:12px" }, "for listening only; detection never hears them")),
+    el("div", { class: "afgrid" }, ...rows), el("div", { style: "margin-top:6px" }, reset));
+}
+const fmtAf = (f, v) => f.unit === "Hz" ? `${Math.round(v)} Hz` : f.unit === "dB" ? `${v} dB` : f.unit === "x" ? `${(+v).toFixed(2).replace(/0$/, "")}×` : (+v).toFixed(2);
+let afTimer = null;
+function afSoon(base, clip) { clearTimeout(afTimer); afTimer = setTimeout(() => abLoad(base, clip), 350); }
+function afQuery() {
+  return (S.afilters || []).filter(f => DT.af && DT.af.on[f.id]).map(f => `&${f.id}=${DT.af.vals[f.id] ?? f.value}`).join("");
+}
 async function abLoad(base, clip) {
   const a = DT.ab, note = $("#abNote");
-  const url = a.demod === "tuned" && DT.tunedUrl ? DT.tunedUrl
+  const fq = afQuery();
+  const asPlayed = a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false);
+  const radio = a.demod === "tuned" && DT.tunedUrl ? DT.tunedUrl.split("?")[1]
+    : `${base}&demod=${a.demod === "rec" || a.demod === "raw" ? "" : a.demod}&denoise=${a.denoise ? 1 : 0}&band=${a.band ? 1 : 0}`;
+  const url = fq ? (asPlayed && /(^|&)key=/.test(base) ? `/api/afilter?${base}&src=played${fq}` : `/api/afilter?${radio}${fq}`)
+    : a.demod === "tuned" && DT.tunedUrl ? DT.tunedUrl
     : a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false) && clip ? clip
     : `/api/render?${base}&demod=${a.demod === "rec" ? "" : a.demod}&denoise=${a.denoise ? 1 : 0}&band=${a.band ? 1 : 0}`;
   if (note) note.textContent = "Rendering…";
