@@ -5,9 +5,10 @@ Each check returns a score in [0, 1]. `info` carries extras for the UI/metadata
 (pitch, voicing fraction, ...).
 """
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import welch
 
-STAGE2 = ("comb", "pitch_motion", "shape", "voicing", "rhythm", "am_phase", "tone", "vad")
+STAGE2 = ("comb", "pitch_motion", "shape", "voicing", "rhythm", "am_phase", "tone", "formants", "vad")
 FS = 16000
 
 import threading
@@ -84,6 +85,49 @@ def tonality(audio, lo=250.0, hi=3400.0):
     return fixed * share, float(f[lines[0]])
 
 
+def formant_pair(audio, prom_db=3.0):
+    """Two moving tones at once, like a vowel's first two formants: one resonance at 250-1000 Hz and
+    another at 850-3000 Hz, both present in the louder frames, each gliding smoothly (10 ms steps
+    under 100 / 150 Hz), the upper one moving a lot and the two moving independently (their ratio
+    changes; harmonics of one tone keep a fixed ratio). Two varying tones over a little noise is what
+    the ear takes for a voice. The spectrum is smoothed over ~125 Hz first, so a voice's individual
+    harmonics merge into its formants. Returns (score 0..1, info) or (None, {}) if too short."""
+    n, hop = 512, 160                                   # 32 ms frames every 10 ms
+    if len(audio) < n + 20 * hop:
+        return None, {}
+    idx = np.arange(0, len(audio) - n + 1, hop)
+    P = np.abs(np.fft.rfft(np.stack([audio[i:i + n] for i in idx]) * np.hanning(n), axis=1)) ** 2
+    return formant_score(P, np.fft.rfftfreq(n, 1 / FS), hop / FS, prom_db)
+
+
+def formant_score(P, f, hop_s, prom_db=3.0):
+    """formant_pair on a power spectrogram P [frames, bins] at frequencies f, frames hop_s apart
+    (P can be a sum of several signals' spectrograms: the composed-voice mode scores mixes this way)."""
+    b = (f >= 200) & (f <= 3400)
+    e = P[:, b].sum(axis=1)
+    if len(P) < 20 or e.max() <= 0:
+        return 0.0, {}
+    loud = e > np.percentile(e, 40)
+    Ls = gaussian_filter1d(10 * np.log10(P + 1e-12), 125.0 / (f[1] - f[0]), axis=1)
+    i1, i2 = np.where((f >= 250) & (f <= 1000))[0], np.where((f >= 850) & (f <= 3000))[0]
+    p1, p2 = i1[np.argmax(Ls[:, i1], axis=1)], i2[np.argmax(Ls[:, i2], axis=1)]
+    rows, med = np.arange(len(Ls)), np.median(Ls[:, b], axis=1)
+    f1, f2 = f[p1], f[p2]
+    two = loud & (Ls[rows, p1] - med > prom_db) & (Ls[rows, p2] - med > prom_db) & (f2 - f1 >= 350)
+    frac = float(two.sum() / max(1, loud.sum()))
+    if two.sum() < max(4, int(0.08 / hop_s)):
+        return 0.0, {"formant_frac": frac}
+    k = np.where(two[1:] & two[:-1])[0]
+    step = hop_s / 0.01                                  # glide limits are per 10 ms
+    cont = float(np.mean((np.abs(np.diff(f1))[k] < 100 * step) & (np.abs(np.diff(f2))[k] < 150 * step))) if len(k) else 0.0
+    f2_sd, ratio_sd = float(np.std(f2[two])), float(np.std(np.log(f2[two] / f1[two])))
+    present = np.clip((frac * cont - 0.05) / 0.25, 0, 1)
+    move = np.clip((f2_sd - 150) / 300, 0, 1) * np.clip((ratio_sd - 0.15) / 0.2, 0, 1)
+    info = {"formant_frac": frac, "formant_cont": cont, "f1_hz": float(np.median(f1[two])),
+            "f2_hz": float(np.median(f2[two])), "f2_sd_hz": f2_sd}
+    return float(present * move), info
+
+
 def keying(iq, min_share=0.15):
     """Sudden carrier steps per second: the channel's strongest line jumping by more than 12 dB within
     20 ms while near full strength. Morse and FSK data key their carrier in a few ms (10+ per second);
@@ -155,6 +199,11 @@ def run(audio, iq, cfg_checks, enabled, vad=None):
         if steps is not None:
             info["carrier_steps_hz"] = steps                 # faded AM voices: 0-1.5 per second; Morse: 4+
             out["tone"] = min(out.get("tone", 1.0), float(np.clip((4.0 - steps) / 2.5, 0, 1)))
+    if enabled.get("formants"):
+        fs_, finfo = formant_pair(audio)
+        if fs_ is not None:
+            out["formants"] = fs_
+            info.update(finfo)
     if not any(enabled.get(k) for k in ("comb", "pitch_motion", "voicing")):
         # the pitch checks now run on the IQ in stage 1; only AM phase and the ML detector remain here
         if enabled.get("am_phase"):

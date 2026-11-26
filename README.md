@@ -249,6 +249,22 @@ processes finished steps: replay through the detector, calibrate on that step, r
 confidences, transcribe what remains with Whisper tiny, and add the step to a map of power, voice
 score and every check. The receiver returns to where it was afterwards.
 
+**Composed voice (playback mode).** The waterfall bar switches between *Individual voices* (the
+above: each track that sounds like a voice on its own plays) and *Composed voice*, which plays
+several frequencies at once, chosen so that together they sound like a voice. It uses no tracks.
+*Layers*, any of the stage-1 maps plus a whole-band "two moving resonances" map, each weighted,
+give every frequency a confidence of 1 − Π(1 − weight × layer). The waterfall then shows the
+layers instead of the detector maps: *Why it plays* colours each frequency by its strongest layer,
+with brightness for confidence, and Min confidence is the cutoff for both the picture and what can
+play. Each second, the peaks of that confidence (one channel apart) are candidates, and each
+candidate's sound is read straight off the fine IQ spectrum (its sidebands, added). Starting from
+what is already playing, the candidates whose sidebands together score highest are chosen, on a
+moving pitch comb, a second comb on another note, two gliding formants and syllable rhythm. Those
+are demodulated and mixed. One station that has it all plays alone. Candidates are only picked
+and levelled, never shifted or reshaped. The mix is recorded and transcribed in pieces like a
+detection. *Blocked frequencies* (Block button, or shift-drag on the waterfall) are ranges neither
+mode uses.
+
 **Demodulation and playback.** Playback uses synchronous AM when a carrier is present, a
 suppressed-carrier loop when not, and a product detector for SSB, followed by a steep voice
 band-pass, spectral-gating noise reduction and slow level control. The detector itself always

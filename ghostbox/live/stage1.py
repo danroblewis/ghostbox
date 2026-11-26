@@ -233,6 +233,8 @@ def run(P, df, frame_rate, cfg, sl, force=(), pitch=None):
             out["voicing"] = np.clip((r - 0.02) / 0.1, 0, 1).astype(np.float32)[sl]
         extra["f0"] = F0[sl]
         extra["c"] = C[sl]
+    if on.get("resonances"):
+        out["resonances"] = _resonances(S, df, inner, outer, avg, frame_rate)[sl]
     for k in ("ring", "broadband"):
         if on[k]:
             r0, r1 = round(ch[k]["lo_hz"] / df), round(ch[k]["hi_hz"] / df)
@@ -308,6 +310,43 @@ def _fine_mirror(P, inner, outer, avg):
     var = (sxx - sx * sx / m) * (syy - sy * sy / m)
     c = cov / np.sqrt(np.maximum(var, 1e-12))
     return np.clip(avg(c), 0, 1)
+
+
+def _resonances(S, df, inner, outer, avg, frame_rate):
+    """Two moving resonances in the sidebands of every bin (both sides added): the strongest offset in
+    250-1000 Hz and in 850-3000 Hz, each 3 dB over the sideband mean and 350 Hz+ apart, present for a
+    good part of the last second, the upper one moving and the two moving independently (their gap
+    changes). The coarse bins (~125 Hz) are about a formant's width."""
+    lo1, hi1 = max(inner, round(250 / df)), round(1000 / df)
+    lo2, hi2 = round(850 / df), min(outer, round(3000 / df))
+    tot, n = 0.0, 0
+    v1 = k1 = v2 = k2 = None
+    for k in range(lo1, hi2 + 1):
+        a = 10 * np.log10(S(k, k) + S(-k, -k) + 1e-12).astype(np.float32)
+        tot, n = tot + a, n + 1
+        if k <= hi1:
+            if v1 is None:
+                v1, k1 = a.copy(), np.full(a.shape, k, np.float32)
+            else:
+                m = a > v1
+                v1[m], k1[m] = a[m], k
+        if k >= lo2:
+            if v2 is None:
+                v2, k2 = a.copy(), np.full(a.shape, k, np.float32)
+            else:
+                m = a > v2
+                v2[m], k2[m] = a[m], k
+    mean = tot / n
+    w = (((v1 - mean) > 3) & ((v2 - mean) > 3) & ((k2 - k1) * df >= 350)).astype(np.float32)
+    m = max(3, int(frame_rate))
+    sw = avg(w, m) + 1e-6
+
+    def wsd(x):
+        mu = avg(w * x, m) / sw
+        return np.sqrt(np.maximum(avg(w * x * x, m) / sw - mu * mu, 0))
+    sd2, sdd = wsd(k2 * df), wsd((k2 - k1) * df)
+    return (np.clip((sw - 0.1) / 0.4, 0, 1) * np.clip((sd2 - 100) / 250, 0, 1)
+            * np.clip((sdd - 80) / 250, 0, 1)).astype(np.float32)
 
 
 def max_offset(df, cfg, force=()):

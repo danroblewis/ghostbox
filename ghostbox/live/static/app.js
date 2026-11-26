@@ -96,8 +96,29 @@ if (!CMAPS[S.cmap]) S.cmap = "magma";                   // e.g. a map from an ol
 let LUT = makeLUT();
 
 // ---------------- waterfall chunks ----------------
+const isConfView = v => v === "layered" || v === "why" || (v || "").startsWith("layer:");
+// colours of the layers in the "why" view (by position in the layer list)
+const LAYER_COLORS = [[255, 196, 64], [64, 200, 255], [255, 96, 160], [120, 230, 120], [190, 140, 255], [255, 140, 80], [80, 230, 210], [230, 230, 230]];
+function hexRGB(h) { const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(h || ""); return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [12, 13, 14]; }
+function paintConf(c, img) {                      // below Min confidence: background; above: colour by confidence
+  const cut = Math.round(S.minConf * 255), why = c.view === "why", bg = hexRGB(TH.bg);
+  for (let r = 0; r < c.n; r++) {
+    const src = (c.n - 1 - r) * c.w, dst = r * c.w * 4;
+    for (let x = 0; x < c.w; x++) {
+      const v = c.vals[src + x], o = dst + x * 4;
+      const conf = why ? (v >> 3) / 31 * 255 : v;
+      if (conf < cut || conf === 0) { img.data[o] = bg[0]; img.data[o + 1] = bg[1]; img.data[o + 2] = bg[2]; }
+      else if (why) {
+        const col = LAYER_COLORS[v & 7], k = 0.35 + 0.65 * conf / 255;
+        img.data[o] = col[0] * k; img.data[o + 1] = col[1] * k; img.data[o + 2] = col[2] * k;
+      } else { const i = conf * 4; img.data[o] = LUT[i]; img.data[o + 1] = LUT[i + 1]; img.data[o + 2] = LUT[i + 2]; }
+      img.data[o + 3] = 255;
+    }
+  }
+}
 function paintChunk(c) {
   const img = c.ctx.createImageData(c.w, c.n);
+  if (isConfView(c.view)) { paintConf(c, img); c.ctx.putImageData(img, 0, 0); return; }
   for (let r = 0; r < c.n; r++) {                 // newest row at the top of the chunk canvas
     const src = (c.n - 1 - r) * c.w, dst = r * c.w * 4;
     for (let x = 0; x < c.w; x++) { const v = c.vals[src + x] * 4, o = dst + x * 4; img.data[o] = LUT[v]; img.data[o + 1] = LUT[v + 1]; img.data[o + 2] = LUT[v + 2]; img.data[o + 3] = 255; }
@@ -111,14 +132,14 @@ function addChunk(m) {
   if ((m.mode || "power") !== S.view) return;
   const key = m.t0.toFixed(3);
   if (S.chunks.has(key)) return;
-  const c = { t0: m.t0, dt: m.dt, n: m.n, w: m.w, fmin: m.fmin, fmax: m.fmax, vals: b64bytes(m.rows) };
+  const c = { t0: m.t0, dt: m.dt, n: m.n, w: m.w, fmin: m.fmin, fmax: m.fmax, vals: b64bytes(m.rows), view: m.mode || "power" };
   c.cv = document.createElement("canvas"); c.cv.width = c.w; c.cv.height = c.n; c.ctx = c.cv.getContext("2d");
   paintChunk(c); c.ver = S.lutVer;
   S.chunks.set(key, c);
 }
 function repaintAll() { LUT = makeLUT(); S.lutVer++; }
 function autoScale() {                                     // follow what's on screen: noise floor (20th pct) .. peaks (99.8th)
-  if (!S.autoScale || !S.visible.length) return;
+  if (!S.autoScale || !S.visible.length || isConfView(S.view)) return;
   const v = [];
   for (const c of S.visible) for (let i = 0; i < c.vals.length; i += 23) v.push(c.vals[i]);
   if (v.length < 200) return;
@@ -193,6 +214,7 @@ function draw() {
     const x0 = xOf(c.fmin), x1 = xOf(c.fmax);
     ctx.drawImage(c.cv, x0, (top - tEnd) * pps, x1 - x0, c.n * c.dt * pps + 0.6);
   }
+  drawBlocked(H, dpr);
   // grid: clock times on the left, frequency across the top
   ctx.font = `${11 * dpr}px ${TH.mono}`;
   ctx.strokeStyle = TH.grid; ctx.fillStyle = TH.text; ctx.lineWidth = 1;
@@ -220,6 +242,7 @@ function draw() {
     if (!audible(d)) { d.box._rect = null; continue; }      // below the filter: not drawn, not heard
     const b = d.box; const y0 = (top - b.t1) * pps, y1 = (top - b.t0) * pps;
     if (y1 < -20 || y0 > H + 20) { d.box._rect = null; continue; }
+    if (b.composed) { drawComposed(d, top, pps, dpr, now); continue; }
     const pad = Math.max(5 * dpr, xOf(b.fmin + 3400) - xOf(b.fmin));
     const x0 = xOf(b.fmin) - pad, x1 = xOf(b.fmax) + pad;
     const playing = d.playing.some(([a, z]) => now >= a && now <= z);
@@ -281,6 +304,54 @@ function draw() {
   updateRowProgress();
   updateVoiceGains();
 }
+// Composed voice: each component a line at its frequency for as long as it was in the mix, labelled with
+// the voice part it gave; the piece's score and transcript beside the rightmost one.
+const ROLE = { pitch: ["pitch", "Pitch comb"], voice2: ["2nd voice", "Second pitch comb"], formants: ["formants", "Formant (F1/F2)"],
+  syllables: ["syllables", "Syllable rhythm"], texture: ["texture", "Adds little on its own"] };
+function drawComposed(d, top, pps, dpr, now) {
+  const b = d.box, comps = b.components || [];
+  const playing = d.playing.some(([a, z]) => now >= a && now <= z);
+  let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+  const labels = [];
+  ctx.save(); ctx.strokeStyle = TH.accent; ctx.fillStyle = TH.accent; ctx.lineCap = "round";
+  for (const c of comps) {
+    const x = xOf(c.f), ya = (top - c.t1) * pps, yb = (top - c.t0) * pps;
+    if (yb < -20 || ya > cv.height + 20) continue;
+    xmin = Math.min(xmin, x); xmax = Math.max(xmax, x); ymin = Math.min(ymin, ya); ymax = Math.max(ymax, yb);
+    ctx.globalAlpha = playing ? 0.95 : 0.6; ctx.lineWidth = (playing ? 3 : 2) * dpr;
+    ctx.beginPath(); ctx.moveTo(x, ya); ctx.lineTo(x, yb); ctx.stroke();
+    const lab = (ROLE[c.role] || [c.role])[0], ly = Math.max(14 * dpr, ya + 11 * dpr), lw = ctx.measureText(lab).width;
+    if (yb - ya > 36 * dpr && !labels.some(([lx, lyy, w]) => Math.abs(lyy - ly) < 14 * dpr && x + 4 * dpr < lx + w + 6 * dpr && lx < x + 4 * dpr + lw + 6 * dpr)) {
+      labels.push([x + 4 * dpr, ly, lw]);
+      ctx.globalAlpha = c.role === "texture" ? 0.45 : playing ? 1 : 0.75; ctx.fillText(lab, x + 4 * dpr, ly);
+    }
+  }
+  ctx.restore();
+  if (!isFinite(xmin)) { b._rect = null; return; }
+  b._rect = [(xmin - 6 * dpr) / dpr, ymin / dpr, (xmax + 6 * dpr) / dpr, ymax / dpr];
+  const ly = Math.max(28 * dpr, ymin + 11 * dpr), lx = xmax + 80 * dpr;
+  ctx.fillStyle = TH.accent; ctx.globalAlpha = playing ? 1 : 0.7;
+  ctx.fillText(`Composed  ${(b.conf_max * 100).toFixed(0)}%`, Math.min(lx, cv.width - 140 * dpr), ly); ctx.globalAlpha = 1;
+  const tx = S.tx.get(b.id);
+  if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, Math.min(lx, cv.width - 200 * dpr), ly + 16 * dpr, tx.no_speech_prob > 0.6, playing, TH.accent);
+}
+function drawBlocked(H, dpr) {
+  const ranges = [...((S.cfg && S.cfg.blocked) || [])];
+  if (BLK.drag) ranges.push({ lo: Math.min(BLK.drag.f0, BLK.drag.f1), hi: Math.max(BLK.drag.f0, BLK.drag.f1), label: "Block…", live: true });
+  for (const r of ranges) {
+    const x0 = Math.max(0, xOf(r.lo)), x1 = Math.min(cv.width, xOf(r.hi));
+    if (x1 < 0 || x0 > cv.width) continue;
+    const w = Math.max(2 * dpr, x1 - x0);
+    ctx.save();
+    ctx.globalAlpha = r.live ? 0.35 : 0.6; ctx.fillStyle = TH.bg; ctx.fillRect(x0, 0, w, H);
+    ctx.beginPath(); ctx.rect(x0, 0, w, H); ctx.clip();
+    ctx.globalAlpha = 0.25; ctx.strokeStyle = TH.text; ctx.lineWidth = dpr;
+    for (let x = x0 - H; x < x0 + w; x += 10 * dpr) { ctx.beginPath(); ctx.moveTo(x, H); ctx.lineTo(x + H, 0); ctx.stroke(); }
+    ctx.restore();
+    ctx.save(); ctx.fillStyle = TH.text; ctx.globalAlpha = 0.9; ctx.font = `${11 * dpr}px ${TH.sans}`;
+    ctx.fillText(r.label || "blocked", x0 + 3 * dpr, 30 * dpr); ctx.restore();
+  }
+}
 function caption(text, x, y, doubtful, playing, color) {
   const dpr = devicePixelRatio;
   if (text.length > 90) text = text.slice(0, 88) + "…”";
@@ -319,12 +390,21 @@ function updateNav() {
   $("#followBtn").style.display = S.follow ? "none" : "inline-flex";
   $("#liveBtn").style.display = S.paused || S.delay > Math.max(8, +lsGet("gb_delay", 4) + 2) ? "inline-flex" : "none";
 }
+const BLK = { mode: false, drag: null };
+const fAtX = (x, r) => S.fmin + x / r.width * (S.fmax - S.fmin);
 cv.addEventListener("mousedown", e => {
-  const [x, y] = canvasPos(e);
+  const [x, y, r] = canvasPos(e);
+  if (e.shiftKey || BLK.mode) { BLK.drag = { f0: fAtX(x, r), f1: fAtX(x, r) }; e.preventDefault(); return; }
   if (Math.abs(y - playLineY()) < 7) { dragging = true; dragTop = topTime(); e.preventDefault(); return; }
   downAt = [x, y];
 });
 window.addEventListener("mouseup", e => {
+  if (BLK.drag) {
+    const d = BLK.drag; BLK.drag = null;
+    addBlock(Math.min(d.f0, d.f1), Math.max(d.f0, d.f1));
+    if (BLK.mode) setBlockMode(false);
+    return;
+  }
   if (dragging) {
     dragging = false;
     if (S.delay < 15) lsSet("gb_delay", S.delay);          // remember small delays as the live preference
@@ -341,6 +421,8 @@ window.addEventListener("mouseup", e => {
 cv.addEventListener("mousemove", e => {
   const [x, y, r] = canvasPos(e); const top = topTime(); if (top === null) return;
   if (dragging) { setPlayhead(dragTop - y / S.pps, y / S.pps); return; }
+  if (BLK.drag) { BLK.drag.f1 = fAtX(x, r); }
+  if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else
   cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : boxAt(x, y) ? "pointer" : "crosshair";
   const f = S.fmin + x / r.width * (S.fmax - S.fmin), tip = $("#tip");
   tip.style.display = "block"; tip.style.left = Math.min(x + 14, r.width - 170) + "px"; tip.style.top = (y + 14) + "px";
@@ -394,7 +476,7 @@ $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) mast
 const SCOPE = { an: null, img: null, lo: -100, hi: -40, cols: [], repaint: false };
 const scv = $("#scope"), sctx = scv.getContext("2d");
 const confOf = d => Math.max(d.box.conf_max ?? 0, d.box.conf ?? 0);
-const audible = d => confOf(d) >= S.minConf;
+const audible = d => d.box.composed || confOf(d) >= S.minConf;
 // Each voice has its own gain node; it follows the Min confidence filter while it plays, so a
 // detection below the filter stays silent and one that rises above it partway fades in.
 function updateVoiceGains() {
@@ -618,7 +700,7 @@ function confStyle(row, conf) {
 }
 const ICON_SAVE = '<svg viewBox="0 0 10 10"><path d="M1 1h6.5L9 2.5V9H1zM2.5 1v3h4.5V1M2.5 9V6h5v3" fill="none" stroke="currentColor" stroke-width="1"/></svg>';
 const ICON_SAVED = '<svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.5 2.4" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
-function rowFor({ key, f, t, conf, tx, pending, live, onOpen, onPlay, saved, onSave }) {
+function rowFor({ key, f, t, conf, tx, pending, live, onOpen, onPlay, saved, onSave, label }) {
   const playing = S.playing && S.playing.key === key;
   let text = "", cls = "x none";
   if (tx) { if (tx.text && tx.no_speech_prob <= 0.6) { text = `“${tx.text}”`; cls = "x"; } else if (tx.text) { text = `“${tx.text}”`; cls = "x doubt"; } else text = "No words"; }
@@ -626,7 +708,7 @@ function rowFor({ key, f, t, conf, tx, pending, live, onOpen, onPlay, saved, onS
   const btn = el("button", { class: "play" + (playing ? " on" : ""), title: playing ? "Pause" : "Play", onclick: e => { e.stopPropagation(); onPlay(); } });
   btn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
   const row = el("div", { class: "det", "data-key": key, title: (live ? "Live — " : "") + "click for details", onclick: onOpen },
-    btn, el("span", { class: "f" }, fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
+    btn, el("span", { class: "f", title: label ? "Composed voice: several signals mixed" : "" }, label || fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
     el("span", { class: "c" }, (conf * 100).toFixed(0)), saveCell(saved, onSave),
     live ? el("i", { class: "live", title: "Live" }) : null);
   confStyle(row, conf);
@@ -653,11 +735,12 @@ function recRow(r) {
   const sameSession = r.epoch && Math.abs(r.epoch - S.epoch) < 1e-3;
   const minConf = S.cfg ? S.cfg.whisper.min_confidence : 1;
   const recent = Date.now() - new Date(r.utc_start).getTime() < 180e3;
-  return rowFor({ key: recKey(r), f: r.freq_hz.mean, t: hms(new Date(r.utc_start)), conf: r.confidence.max, tx: r.transcript,
+  return rowFor({ key: recKey(r), f: r.freq_hz.mean, t: hms(new Date(r.utc_start)), conf: r.confidence.max, tx: r.transcript, label: r.composed ? mixLabel(r.components) : null,
     pending: recent && !r.transcript && r.confidence.max >= minConf && S.cfg && S.cfg.whisper.enabled,
     onOpen: () => openDetail({ key: r.key }), onPlay: () => togglePlay(recKey(r), null, r),
     saved: r.saved !== false, onSave: () => saveDetection(r) });
 }
+const mixLabel = comps => `Mix ×${new Set((comps || []).map(c => c.id)).size}`;
 let liveTimer = null;
 function renderLive() {
   if (liveTimer) return;
@@ -666,7 +749,7 @@ function renderLive() {
     const ds = [...S.dets.values()].filter(d => !d.ended && d.box.detected !== false && audible(d)).sort((a, b) => b.box.t0 - a.box.t0);
     $("#liveList").replaceChildren(...ds.map(d => {
       const b = d.box;
-      return rowFor({ key: detKey(d), f: (b.fmin + b.fmax) / 2, t: clockTime(b.t0), conf: b.conf, tx: S.tx.get(b.id), live: true,
+      return rowFor({ key: detKey(d), f: (b.fmin + b.fmax) / 2, t: clockTime(b.t0), conf: b.composed ? b.conf_max : b.conf, tx: S.tx.get(b.id), live: true, label: b.composed ? mixLabel(b.components) : null,
         onOpen: () => openDetail({ live: d }), onPlay: () => togglePlay(detKey(d), d) });
     }));
     updateCount(ds.length);
@@ -755,6 +838,124 @@ function selectRow(label, options, value, onchange) {
   return el("div", { class: "row wide" }, el("label", {}, label), s);
 }
 
+// ---------------- playback mode: individual voices / composed voice ----------------
+const composing = () => !!(S.cfg && S.cfg.compose && S.cfg.compose.enabled);
+function buildMode() {
+  for (const b of document.querySelectorAll("#modeSeg button")) b.classList.toggle("on", (b.dataset.m === "1") === composing());
+  $("#composeLine").style.display = composing() ? "" : "none";
+  if (!composing()) $("#composeLine").textContent = "";
+  buildLegend();
+}
+function buildLegend() {                                   // what the colours of the "why" view mean
+  const lg = $("#layerLegend"); if (!lg) return;
+  const show = composing() && (S.view === "why" || S.view === "layered");
+  lg.style.display = show ? "" : "none"; if (!show) return;
+  lg.replaceChildren(el("div", { class: "t2", style: "margin-bottom:3px" }, S.view === "why" ? "Colour: strongest layer · brightness: confidence" : "Brightness: confidence (any layer, more if several)"),
+    ...(S.view === "why" ? layersOf().map((l, i) => el("div", { class: "lgrow" }, el("i", { style: `background:rgb(${LAYER_COLORS[i].join(",")})` }), `${labelOf(l.id)} ×${l.weight}`)) : []),
+    el("div", { class: "t3", style: "margin-top:3px" }, `Hidden below ${Math.round(S.minConf * 100)}% (Min confidence)`));
+}
+for (const b of document.querySelectorAll("#modeSeg button")) b.addEventListener("click", e => {
+  e.currentTarget.blur(); const on = b.dataset.m === "1"; if (on === composing()) return;
+  setComposing(on);
+  toast(on ? "Composed voice: several signals at once, picked so that together they sound like a voice." : "Individual voices: each signal that sounds like a voice on its own.");
+});
+function setComposing(on) {
+  patch(on ? { compose: { enabled: true, min_conf: S.minConf } } : { compose: { enabled: false } }, 50);
+  buildMode(); buildViewList(); buildDetector();
+  if (on && !isConfView(S.view)) setView("why");
+  if (!on && isConfView(S.view)) setView("power");
+}
+const layersOf = () => ((S.cfg && S.cfg.compose && S.cfg.compose.layers) || []).filter(l => l.weight > 0).slice(0, 8);
+function onCompose(m) {
+  if (!composing()) return;
+  const p = m.parts || {}, pc = v => Math.round((v || 0) * 100);
+  const roles = (m.members || []).map(x => (ROLE[x.role] || [x.role])[0]);
+  $("#composeLine").textContent = `${(m.members || []).length} of ${m.candidates} candidates · pitch ${pc(p.pitch)} · 2nd voice ${pc(p.voice2)} · formants ${pc(p.formants)} · syllables ${pc(p.syllables)}`
+    + (m.vad != null ? ` · ML voice ${pc(m.vad)}` : "");
+  $("#composeLine").title = `Score ${pc(m.score)}%. Candidates: peaks of the layered confidence above Min confidence. Playing: ${(m.members || []).map(x => fmtFshort(x.f) + " (" + (ROLE[x.role] || [x.role])[0] + ")").join(", ")}`;
+}
+
+function composeCard() {
+  const cc = S.cfg.compose || {}, on = !!cc.enabled;
+  const pct = v => Math.round(v * 100) + "%";
+  return el("div", {},
+    el("h2", {}, "Playback mode"),
+    el("div", { class: "card" + (on ? "" : " off") },
+      el("div", { class: "hd" }, toggle(on, v => setComposing(v)), "Composed voice",
+        el("span", { class: "tag" }, on ? "on" : "individual voices")),
+      el("div", { class: "note", style: "margin-top:-2px" }, "No tracking: every frequency gets a confidence from the layers below, straight from the IQ. Peaks above Min confidence are candidates, and each second the ones whose sidebands together make the most voice (a moving pitch comb, a second voice, formants, syllable rhythm) are demodulated and played. One that has it all plays alone. Signals are only picked and levelled, never shifted or reshaped."),
+      ...(on ? [layersEditor(),
+        el("h3", { class: "sub" }, "Choosing"),
+        slider("Most at once", ["compose", "max_components"], 1, 12, 1),
+        slider("Fewest at once", ["compose", "min_components"], 1, 6, 1),
+        slider("Keep a signal at least", ["compose", "hold_s"], 0, 10, 0.5, v => v + " s"),
+        slider("Judge over the last", ["compose", "window_s"], 1.5, 6, 0.5, v => v + " s"),
+        slider("Candidates", ["compose", "candidates"], 4, 60, 1),
+        slider("Candidates at least apart", ["compose", "min_sep_hz"], 2000, 30000, 500, v => (v / 1e3) + " kHz"),
+        slider("Cost per extra signal", ["compose", "cost"], 0, 0.1, 0.005, v => v.toFixed(3)),
+        el("h3", { class: "sub" }, "What a voice needs (scored on the mix)"),
+        slider("Pitch comb", ["compose", "w_pitch"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("Second voice", ["compose", "w_voice2"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("Formants", ["compose", "w_formants"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("Syllable rhythm", ["compose", "w_syllables"], 0, 2, 0.1, v => v.toFixed(1)),
+        el("h3", { class: "sub" }, "Recording"),
+        slider("Record pieces of", ["compose", "segment_s"], 5, 60, 5, v => v + " s"),
+        slider("Save to disk above", ["compose", "save_score"], 0, 1, 0.05, pct),
+      ] : [])),
+    blockedCard());
+}
+// Layers: whole-band filter maps, each weighted; the waterfall's "why" view colours each frequency by
+// the layer that gives it the most, and "Layered confidence" is their union.
+function layersEditor() {
+  const layers = (S.cfg.compose.layers || []).map(l => ({ ...l }));
+  const save = () => { patch({ compose: { layers } }, 50); buildViewList(); buildLegend(); buildDetector(); };
+  const stage1 = (S.checks || []).filter(c => c.stage === 1 && c.id !== "profile");
+  const rows = layers.map((l, i) => {
+    const out = el("output", {}, (+l.weight).toFixed(1));
+    const inp = el("input", { type: "range", min: 0, max: 2, step: 0.1, value: l.weight }); fillRange(inp);
+    inp.addEventListener("input", () => { fillRange(inp); out.textContent = (+inp.value).toFixed(1); l.weight = +inp.value; patch({ compose: { layers } }, 300); });
+    inp.addEventListener("change", () => { buildViewList(); buildLegend(); });
+    const sw = el("i", { class: "lsw", style: `background:rgb(${LAYER_COLORS[i % 8].join(",")})`, title: "Colour in the “why” view" });
+    const show = el("button", { class: "ib", title: "Show this layer on the waterfall", onclick: () => setView("layer:" + l.id) }, "◐");
+    const del = el("button", { class: "ib", title: "Remove this layer", onclick: () => { layers.splice(i, 1); save(); } }, "×");
+    return el("div", { class: "row lrow" }, el("label", { title: (stage1.find(c => c.id === l.id) || {}).desc || "" }, sw, labelOf(l.id)), inp, out, show, del);
+  });
+  const free = stage1.filter(c => !layers.some(l => l.id === c.id));
+  const add = el("select", { class: "sel", disabled: layers.length >= 8 || !free.length },
+    el("option", { value: "" }, layers.length >= 8 ? "8 layers at most" : "Add a layer…"), ...free.map(c => el("option", { value: c.id }, c.label)));
+  add.addEventListener("change", () => { if (!add.value) return; layers.push({ id: add.value, weight: 1.0 }); save(); });
+  return el("div", {},
+    el("h3", { class: "sub" }, "Layers"),
+    el("div", { class: "note", style: "margin-top:0" }, "Each layer is a filter run on every frequency at once. A frequency's confidence is 1 − Π(1 − weight × layer): bright when any layer sees a part of a voice, brighter when several do. ◐ shows one layer on the waterfall."),
+    ...rows, el("div", { class: "row wide" }, el("label", {}, ""), add));
+}
+// Blocked frequencies: known stations and carriers neither mode will use.
+function blockedCard() {
+  const list = (S.cfg.blocked || []).map(r => ({ ...r }));
+  const save = () => { patch({ blocked: list }, 50); buildDetector(); };
+  return el("div", {},
+    el("h2", {}, "Blocked frequencies"),
+    el("div", { class: "note", style: "margin-top:-4px" }, "Ranges neither mode will use: known stations, carriers. Shift-drag across the waterfall (or use Block on the waterfall bar) to add one."),
+    ...list.map((r, i) => {
+      const name = el("input", { class: "field", value: r.label || "", placeholder: "label", style: "flex:1;min-width:0" });
+      name.addEventListener("change", () => { list[i].label = name.value; patch({ blocked: list }, 50); });
+      return el("div", { class: "row blrow" }, el("span", { class: "num t2" }, `${fmtFshort(r.lo)} – ${fmtFshort(r.hi)}`), name,
+        el("button", { class: "ib", title: "Unblock", onclick: () => { list.splice(i, 1); save(); } }, "×"));
+    }),
+    list.length ? "" : el("div", { class: "note" }, "None."));
+}
+function setBlockMode(on) {
+  BLK.mode = on; $("#blockBtn").classList.toggle("on", on);
+  if (on) toast("Drag across the waterfall to block a frequency range.");
+}
+$("#blockBtn").addEventListener("click", e => { e.currentTarget.blur(); setBlockMode(!BLK.mode); });
+function addBlock(lo, hi) {
+  if (hi - lo < 500) return;
+  const list = [...(S.cfg.blocked || []), { lo: Math.round(lo), hi: Math.round(hi), label: "" }];
+  patch({ blocked: list }, 50); buildDetector();
+  toast(`Blocked ${fmtFshort(lo)} – ${fmtFshort(hi)}. Unblock or label it in Detector › Blocked frequencies.`);
+}
+
 // ---------------- top bar (receiver) ----------------
 const RATES = { hackrf: [2e6, 4e6, 8e6, 10e6, 16e6, 20e6], rtlsdr: [1.024e6, 1.4e6, 1.8e6, 2.048e6, 2.4e6], file: [] };
 function hackrfSplit(g) { const lna = Math.min(40, 8 * Math.floor(g / 2 / 8)); return [lna, Math.min(62, Math.max(0, 2 * Math.round((g - lna) / 2)))]; }
@@ -825,6 +1026,7 @@ function buildDetector() {
     }
   }, v.label)));
   root.append(tuneCard()); tickReady();
+  root.append(composeCard());
   root.append(el("h2", {}, "Sensitivity"), seg);
   root.append(el("h2", {}, "Thresholds & tracking"),
     slider("Candidate threshold", ["detect", "candidate_threshold"], 0, 1, 0.01, v => v.toFixed(2)),
@@ -1373,7 +1575,7 @@ async function buildSDR() {
 
 // ---------------- waterfall toolbar ----------------
 function loadScale() {
-  const sc = JSON.parse(lsGet("gb_scale_" + S.view, "null") || "null") || { min: 0, max: 255 };
+  const sc = isConfView(S.view) ? { min: 0, max: 255 } : JSON.parse(lsGet("gb_scale_" + S.view, "null") || "null") || { min: 0, max: 255 };
   S.smin = sc.min; S.smax = sc.max;
 }
 const saveScale = () => lsSet("gb_scale_" + S.view, JSON.stringify({ min: S.smin, max: S.smax }));
@@ -1385,6 +1587,9 @@ function setMinConf(v) {
   S.minConf = v; lsSet("gb_minconf", v);
   $("#minConf").value = Math.round(v * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(v * 100) + "%";
   renderLive(); clearTimeout(confTimer); confTimer = setTimeout(() => loadPage(true), 250);
+  if (isConfView(S.view)) repaintAll();                    // the cutoff is part of the picture
+  buildLegend();
+  if (composing()) patch({ compose: { min_conf: v } }, 400);   // ... and of what can play
   if (SV.open) { renderSurvey(); renderSamples(); }
   if ($("#fMin")) syncFieldMin();
 }
@@ -1394,7 +1599,7 @@ $("#caps").checked = lsGet("gb_caps", "1") === "1";
 $("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
 let WS = null;
 function setView(mode) {
-  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode;
+  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode; buildLegend();
   S.chunks.clear(); loadScale(); LUT = makeLUT();
   if (SV.open) drawSurvey();
   if (WS && WS.readyState === 1) WS.send(JSON.stringify({ type: "view", mode }));
@@ -1404,12 +1609,20 @@ $("#view").addEventListener("change", e => setView(e.target.value));
 
 // Waterfall views: checks at weight 0 are not computed, so only those are listed.
 function availableViews() {
+  if (composing() && !SV.open) {
+    const base = (S.views || []).filter(v => v.id === "power" || v.id === "power_change");
+    return [...base, { id: "why", label: "Why it plays (strongest layer)" }, { id: "layered", label: "Layered confidence" },
+      ...layersOf().map(l => ({ id: "layer:" + l.id, label: "Layer: " + labelOf(l.id), layer: true }))];
+  }
   const sv = SV.open && SV.meta ? new Set(SV.meta.views) : null;
   return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].weight > 0) || (sv && sv.has(v.id)));
 }
 function buildViewList() {
   const vs = availableViews(), sel = $("#view");
   const opts = [...vs.filter(v => !v.check).map(v => el("option", { value: v.id }, v.label))];
+  const layers = vs.filter(v => v.layer);
+  if (layers.length) { opts.length = 0; opts.push(...vs.filter(v => !v.layer).map(v => el("option", { value: v.id }, v.label)),
+    el("optgroup", { label: "Layers (weighted)" }, ...layers.map(v => el("option", { value: v.id }, v.label)))); }
   const checks = vs.filter(v => v.check);
   if (checks.length) opts.push(el("optgroup", { label: "Detector maps (checks above 0)" }, ...checks.map(v => el("option", { value: v.id }, v.label))));
   sel.replaceChildren(...opts);
@@ -1463,14 +1676,15 @@ function connect() {
 
         setStatus(m.status || {});
         for (const b of m.detections) S.dets.set(b.id, { box: b, ended: false, playing: [], pcm: [] });
-        buildTop(); buildDetector(); loadPage(true);
+        buildTop(); buildMode(); buildDetector(); loadPage(true);
+        if (composing() && Math.abs((m.config.compose.min_conf ?? 0) - S.minConf) > 1e-3) patch({ compose: { min_conf: S.minConf } }, 50);
         Promise.all([fetch("/api/autotune").then(r => r.json()).then(t => { TUNE.state = t; }), loadSurveyList()]).then(buildDetector);
         const t = m.status && m.status.t; if (t) fetchHistory(t - 240, t + 5);
         break;
       }
       case "config": {
         S.cfg = m.config; buildViewList(); S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
-        buildTop(); if (!$("#detector").contains(document.activeElement)) buildDetector(); break;
+        buildTop(); buildMode(); if (!$("#detector").contains(document.activeElement)) buildDetector(); break;
       }
       case "reset": if (m.fmax) { S.fmin = m.fmin; S.fmax = m.fmax; } break;
       case "status": setStatus(m); break;
@@ -1485,6 +1699,7 @@ function connect() {
       case "survey": onSurvey(m); break;
       case "mark": (S.marks = S.marks || []).push(m); break;
       case "transcript": onTranscript(m); break;
+      case "compose": onCompose(m); break;
     }
   };
   ws.onclose = () => { setStatus({ state: "disconnected" }); setTimeout(connect, 1500); };
@@ -1525,7 +1740,7 @@ function specOf(x, rate) {                                // dB STFT, 0-4 kHz: [
   all.sort((a, b) => a - b);
   return { cols, bins, lo: all[Math.floor(all.length * 0.2)] || -100, hi: all[Math.floor(all.length * 0.998)] || 0, hop, rate };
 }
-const labelOf = id => ((S.checks || []).find(c => c.id === id) || {}).label || id;
+const labelOf = id => ((S.checks || []).find(c => c.id === id) || {}).label || (ROLE[id] || [])[1] || id;
 function closeDetail() {
   dtStop(); DT.open = false; const m = $("#detail"); if (m) m.remove();
   document.removeEventListener("keydown", dtKey, true);
@@ -1562,10 +1777,11 @@ async function openDetail(opts) {
         extra: [["Chain / segment", `${meta.chain} / ${meta.segment}`], ["Saved", meta.saved === false ? "In memory only" : "On disk"]], mode: meta.mode };
       tx = meta.transcript || S.tx.get(meta.id) || null;
       clip = meta.clip || (meta.files && meta.files.wav ? "/rec/" + meta.files.wav : null);
-      iqUrl = "/api/iq?key=" + encodeURIComponent(meta.key);
+      iqUrl = meta.composed ? null : "/api/iq?key=" + encodeURIComponent(meta.key);
+      if (meta.composed) { info.composed = meta.components || []; info.extra = info.extra.filter(([k]) => k !== "Chain / segment"); }
       if (meta.epoch && Math.abs(meta.epoch - S.epoch) < 1e-3) jump = meta.stream_t1;
     } else if (b) {
-      info = { f: (b.fmin + b.fmax) / 2, fmin: b.fmin, fmax: b.fmax, dur: b.t1 - b.t0, conf: b.conf, scores: b.scores || {}, info: b.info || {}, when: clockTime(b.t0) + " (still live)" };
+      info = { f: (b.fmin + b.fmax) / 2, fmin: b.fmin, fmax: b.fmax, dur: b.t1 - b.t0, conf: b.conf, scores: b.scores || {}, info: b.info || {}, when: clockTime(b.t0) + " (still live)", composed: b.composed ? b.components || [] : null };
       tx = S.tx.get(b.id) || null; jump = b.t1;
     }
   }
@@ -1575,7 +1791,7 @@ async function openDetail(opts) {
   // ---- header, transcript
   box.replaceChildren();
   box.append(el("div", { class: "dlghead" },
-    el("strong", { class: "num" }, fmtF(info.f || 0)), el("span", { class: "t2" }, info.when || ""),
+    el("strong", { class: "num" }, info.composed ? `Composed voice (${mixLabel(info.composed)})` : fmtF(info.f || 0)), el("span", { class: "t2" }, info.when || ""),
     el("span", { class: "t2 num" }, `${(info.dur || 0).toFixed(1)} s · ${Math.round((info.conf || 0) * 100)}%`),
     el("span", { style: "flex:1" }), el("button", { class: "btn", title: "Close (Esc)", onclick: closeDetail }, "Close")));
   const txText = tx && tx.text ? tx.text : null;
@@ -1589,7 +1805,7 @@ async function openDetail(opts) {
   pl.addEventListener("click", e => { if (!DT.buf) return; const r = pl.getBoundingClientRect(); dtSeek((e.clientX - r.left) / r.width * DT.buf.duration); });
   box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
     el("span", { style: "flex:1" }), el("span", { class: "t3 kbdhint", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
-    renderBase ? abControls(renderBase, clip) : el("div", { class: "note" }, "A/B listening needs this detection's IQ, which isn't available.")));
+    info.composed ? "" : renderBase ? abControls(renderBase, clip) : el("div", { class: "note" }, "A/B listening needs this detection's IQ, which isn't available.")));
   // ---- downloads and actions
   const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
   const dl = (label, href, name, title) => el("a", { class: "btn", href, download: name, title }, label);
@@ -1601,11 +1817,16 @@ async function openDetail(opts) {
     el("span", { style: "flex:1" }),
     jump != null ? el("button", { class: "btn", onclick: () => { closeDetail(); if (SV.open) closeSurvey(); jumpTo(jump); } }, "Show on waterfall") : null,
     opts.survey ? el("button", { class: "btn", onclick: () => { const t = opts.survey.track; closeDetail(); SV.hl = t.id; SV.sel = t.f; SV.v0 = Math.max(SV.meta.lo, t.f - 60e3); SV.v1 = Math.min(SV.meta.hi, t.f + 60e3); renderSurvey(); } }, "Show on map") : null,
-    el("button", { class: "btn", title: "Move the receiver here", onclick: () => { closeDetail(); if (SV.open) surveyTune(info.f); else { const step = S.cfg.sdr.sample_rate * 0.8; patch({ sdr: { center_hz: Math.round(info.f), fmin_hz: Math.round(info.f - step / 2), fmax_hz: Math.round(info.f + step / 2) } }, 50); } } }, "Tune here")));
+    info.composed ? null : el("button", { class: "btn", title: "Move the receiver here", onclick: () => { closeDetail(); if (SV.open) surveyTune(info.f); else { const step = S.cfg.sdr.sample_rate * 0.8; patch({ sdr: { center_hz: Math.round(info.f), fmin_hz: Math.round(info.f - step / 2), fmax_hz: Math.round(info.f + step / 2) } }, 50); } } }, "Tune here")));
   // ---- the numbers
   const kv = [];
   const fmtMode = m => m === 1 ? "USB" : m === -1 ? "LSB" : m === 0 ? "AM" : null;
-  kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
+  if (info.composed) {
+    const by = new Map(); for (const c of info.composed) { const o = by.get(c.id) || { f: c.f, roles: new Set(), s: 0 }; o.roles.add(c.role); o.s += c.t1 - c.t0; by.set(c.id, o); }
+    kv.push(["Components", `${by.size} signals mixed`]);
+    for (const o of [...by.values()].sort((a, b) => b.s - a.s).slice(0, 12))
+      kv.push([fmtF(o.f), `${o.s.toFixed(1)} s · ${[...o.roles].map(r => (ROLE[r] || [r, r])[1]).join(", ")}`]);
+  } else kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
   if (info.confFinal != null) kv.push(["Confidence", `max ${Math.round(info.conf * 100)}%, final ${Math.round(info.confFinal * 100)}%`]);
   const I = { ...(info.info || {}), ...(info.mode != null ? { mode: info.mode } : {}) };
   if (fmtMode(I.mode) || I.mode_name) kv.push(["Modulation", I.mode_name || fmtMode(I.mode)]);
@@ -1619,6 +1840,7 @@ async function openDetail(opts) {
     el("div", {}, el("h3", {}, "Details"), ...kv.map(([k, v]) => el("div", { class: "kv" }, el("span", { class: "t3" }, k), el("span", {}, v)))),
     el("div", {}, el("h3", {}, "Check scores"), ...(scores.length ? scores.map(([k, v]) => el("div", { class: "kv sc" }, el("span", { class: "t2" }, k === "vad" ? "ML voice detector" : labelOf(k)),
       el("span", { class: "bar" }, el("i", { style: `width:${Math.round(v * 100)}%` })), el("span", { class: "num" }, Math.round(v * 100)))) : [el("div", { class: "note" }, "None recorded.")]),
+      info.composed ? el("div", { class: "note" }, "Averaged over the piece. Pitch / second voice / formants / syllables are scored on the mix; the ML voice detector only listens.") : "",
       info.hist && info.hist.length > 2 ? el("h3", { style: "margin-top:12px" }, "Confidence over time") : "", info.hist && info.hist.length > 2 ? confSpark(info.hist) : "")));
   // ---- load and draw the audio
   if (clip) {

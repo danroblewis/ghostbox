@@ -65,6 +65,12 @@ CHECKS = [
     {"id": "shape", "group": "speech", "stage": 1, "label": "Speech spectral shape",
      "desc": "Sideband energy is strongest near the carrier and falls toward 3.4 kHz (formant-shaped), unlike flat noise.",
      "default": {"enabled": True, "weight": 0.7}, "params": []},
+    {"id": "formants", "group": "speech", "stage": 2, "label": "Two moving tones (formants)",
+     "desc": "Two tones at once that glide independently, like a vowel's first two formants (250-1000 Hz and 850-3000 Hz). Two varying tones over a little noise is what the ear hears as a voice, even without a pitch comb. Scored on each detection's demodulated audio.",
+     "default": {"enabled": True, "weight": 1.0}, "params": []},
+    {"id": "resonances", "group": "speech", "stage": 1, "label": "Two moving resonances (whole band)",
+     "desc": "At every frequency, the sidebands hold two peaks at once, one at 250-1000 Hz and one at 850-3000 Hz from it, and both move independently over the last second: two gliding tones, like a vowel's first two formants, seen straight from the IQ. Mainly a layer for the composed voice; off for detection by default.",
+     "default": {"enabled": False, "weight": 0.0}, "params": []},
     {"id": "envstat", "group": "speech", "stage": 1, "label": "Loudness range",
      "desc": "Syllables and pauses make the sideband loudness swing by tens of dB; noise swings a few. Strong for SSB and loud voices, but weak AM voices (carrier present) don't swing enough, so it's off by default.",
      "default": {"enabled": False, "weight": 0.0, "full_db": 12.0},
@@ -149,6 +155,23 @@ DEFAULT = {
         "link_hops_s": 0.4,                 # a new track starting this soon after one ends = same voice (hop)
         "min_duration_s": 0.4,
     },
+    # Playback mode. Off: every track that sounds like a voice on its own plays (individual voices).
+    # On (composed voice): no tracks. Layers (whole-band filter maps) give every frequency a confidence,
+    # 1 - prod(1 - weight x layer): bright where any layer finds a part of a voice, brighter where several
+    # do. Peaks of it above min_conf (the Min confidence slider) are the candidates; each hop the
+    # candidates whose sidebands, added together, best make a voice (a moving pitch comb, a second comb,
+    # two gliding formants, syllable rhythm) are demodulated and mixed.
+    "compose": {"enabled": False,
+                "layers": [{"id": "comb", "weight": 1.0}, {"id": "pitch_motion", "weight": 1.0},
+                           {"id": "resonances", "weight": 1.0}, {"id": "rhythm", "weight": 0.8}],
+                "min_conf": 0.3, "candidates": 24, "min_sep_hz": 7000,
+                "max_components": 4, "min_components": 1, "window_s": 3.0, "hold_s": 2.0,
+                "w_pitch": 1.0, "w_voice2": 0.5, "w_formants": 1.0, "w_syllables": 1.0,
+                "cost": 0.02,                    # score each extra component must earn
+                "segment_s": 20.0,               # the mix is recorded and transcribed in pieces this long
+                "save_score": 0.5},              # pieces whose score reached this are written to disk
+    # Frequency ranges neither mode uses (known stations, carriers): [{"lo": Hz, "hi": Hz, "label": ""}]
+    "blocked": [],
     "audio": {"delay_s": 4.0, "bandwidth_hz": 3400,      # (unused: the channel follows voice_hi_hz)
               "demod": "auto",                          # auto (sync AM with a carrier, suppressed-carrier loop without;
                                                         # product detector for SSB) | sync | suppressed | sync_sb | envelope
@@ -304,6 +327,9 @@ class Config:
             except Exception:
                 pass
         normalize_checks(self._cfg)
+        cc = self._cfg.get("compose", {})
+        if "candidate_threshold" in cc or "max_tracks" in cc:     # the earlier track-based composed voice
+            self._cfg["compose"] = dict(copy.deepcopy(DEFAULT["compose"]), enabled=bool(cc.get("enabled")))
         self.version = 0
 
     def get(self):

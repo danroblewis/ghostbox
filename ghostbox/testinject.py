@@ -88,7 +88,7 @@ def main():
         if best:
             s = best["scores"]
             line += (f"; best confidence {rescore(best, live):.2f} (without the tone check {rescore(best, no_tone):.2f}), "
-                     f"ML voice {g(s, 'vad'):.2f}, tone {g(s, 'tone'):.2f}, comb {g(s, 'comb'):.2f}, "
+                     f"ML voice {g(s, 'vad'):.2f}, formants {g(s, 'formants'):.2f}, tone {g(s, 'tone'):.2f}, comb {g(s, 'comb'):.2f}, "
                      f"twinning {g(s, 'twinning'):.2f}")
         print(line)
         if a.detail:

@@ -173,7 +173,10 @@ def make_app(args):
                         m = json.loads(msg.data)
                     except ValueError:
                         continue
-                    if m.get("type") == "view" and m.get("mode") in {v["id"] for v in VIEWS}:
+                    md = m.get("mode")
+                    if m.get("type") == "view" and isinstance(md, str) and (
+                            md in {v["id"] for v in VIEWS} or md in ("layered", "why")
+                            or (md.startswith("layer:") and md[6:] in {c["id"] for c in CHECKS})):
                         hub.clients[q] = m["mode"]
         finally:
             hub.clients.pop(q, None)

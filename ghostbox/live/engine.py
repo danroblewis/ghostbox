@@ -30,11 +30,11 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import wavfile
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import maximum_filter1d, uniform_filter1d
 from scipy.signal import butter, firwin, resample_poly, sosfilt, sosfilt_zi
 
 from ..maps import power_frames
-from . import stage1, stage2
+from . import compose, stage1, stage2
 from .config import CHECKS
 from .sources import _to_complex, make_source
 from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, VoiceBand, channel_hz, detector_for, fade, render_clip
@@ -125,6 +125,20 @@ def load_iq(segs, t0, t1):
     if not parts:
         return None
     return _to_complex(np.concatenate(parts), True), start, fs, fc
+
+
+def span(chunks, t0, n):
+    """n samples at AUDIO_FS from stream time t0 out of [(t_start, array)] chunks, zeros where there
+    are none. Returns (samples, share of them covered)."""
+    out = np.zeros(n, np.float32)
+    got = 0
+    for t, a in chunks:
+        i = int(round((t - t0) * AUDIO_FS))
+        lo, hi = max(0, i), min(n, i + len(a))
+        if hi > lo:
+            out[lo:hi] = a[lo - i: hi - i]
+            got += hi - lo
+    return out, min(1.0, got / max(1, n))
 
 
 def detect_clip(iq, au, mode=0):
@@ -305,6 +319,14 @@ class Engine:
         self.storage = {"paused": False, "free_gb": None}   # disk guard state
         self.chains = {}                            # hop chain id -> finished member clips
         self.comod = None                           # latest co-modulation candidates / pairs
+        self.composer = compose.Composer()          # composed-voice mode: which candidates play together
+        self.cmix = None                            # the composed mix's current piece (a virtual detection)
+        self.cgain, self.cmix_until = {}, None      # component gains last hop; mix audio emitted up to
+        self.clevel = SmoothGain()
+        self.c_conf = collections.deque()           # composing: (t, layered confidence row [bins]) per frame
+        self.c_fine = collections.deque()           # composing: (frame times, fine power [frames, fine bins]) per hop
+        self.channels = {}                          # composing: key -> demodulator state of a playing frequency
+        self.compose_offline = False                # compose in a one-shot replay too (tests / replays)
         self.transcriber = Transcriber(config, emit, on_result=self._on_transcript) if transcribe else None
         self.pool = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
         self.lock = threading.RLock()                # re-entrant: _finish runs inside locked analysis
@@ -325,7 +347,7 @@ class Engine:
         """Live detections (history comes from history())."""
         with self.lock:
             fc = getattr(self, "fc", 0)
-            return [t.box(fc) for t in self.tracks if t.detected]
+            return [t.box(fc) for t in self.tracks if t.detected] + ([self._cmix_box()] if self.cmix else [])
 
     def history(self, view, t0, t1, max_chunks=1500):
         """Waterfall chunks of one view and detection boxes overlapping [t0, t1]."""
@@ -334,6 +356,8 @@ class Engine:
             fc = getattr(self, "fc", 0)
             boxes = [b for b in self.box_hist if b["t1"] >= t0 and b["t0"] <= t1]
             boxes += [t.box(fc) for t in self.tracks if t.detected]
+            if self.cmix:
+                boxes.append(self._cmix_box())
         return chunks[-max_chunks:], boxes
 
     # ---------------- main loop ----------------
@@ -379,6 +403,8 @@ class Engine:
                 if t.detected:
                     self._finish(t, cfg, final=True)
             self.tracks, self.ended = [], []
+            self._cmix_close(cfg)
+            self._compose_reset()
         self.chains = {}
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
                    "frame_rate": self.fr, "t": self.n_samples / self.fs})
@@ -392,12 +418,14 @@ class Engine:
         lo, hi = float(self.f[0]) - self.df / 2, float(self.f[-1]) + self.df / 2
         self.fine_sel = np.flatnonzero((ff >= lo - margin) & (ff <= hi + margin))
         fsel = ff[self.fine_sel]
+        self.fine_f = fsel.astype(np.float32)               # fine bin frequencies (Hz from the centre)
         # for each kept coarse bin, the fine bins within it (contiguous): reduceat start indices
         starts = np.searchsorted(fsel, self.f - self.df / 2)
         self.fine_starts = np.clip(starts, 0, len(fsel) - 1)
 
-    def _pitch_maps(self, x, cfg):
-        """Comb strength and pitch per kept coarse bin, for each 40 ms frame of x."""
+    def _pitch_maps(self, x, cfg, keep_power=False):
+        """Comb strength and pitch per kept coarse bin, for each 40 ms frame of x (and the fine power
+        spectrum itself if keep_power)."""
         ch = cfg["checks"]
         n = len(x) // self.fine_n
         frames = x[: n * self.fine_n].reshape(n, self.fine_n)
@@ -405,15 +433,16 @@ class Engine:
 
         def job(rows):
             X = np.fft.fftshift(np.fft.fft(frames[rows] * win, axis=1), axes=1)[:, self.fine_sel]
-            C, F0 = stage1.pitch_frames((X.real ** 2 + X.imag ** 2).astype(np.float32),
-                                        ch["comb"]["f0_min"], ch["comb"]["f0_max"], df=self.fine_df)
+            Pf = (X.real ** 2 + X.imag ** 2).astype(np.float32)
+            C, F0 = stage1.pitch_frames(Pf, ch["comb"]["f0_min"], ch["comb"]["f0_max"], df=self.fine_df)
             Cc = np.maximum.reduceat(C, self.fine_starts, axis=1)
             w = np.maximum(C, 1e-6)                                # pitch: comb-weighted within each coarse bin
             Fc = np.add.reduceat(w * F0, self.fine_starts, axis=1) / np.add.reduceat(w, self.fine_starts, axis=1)
-            return Cc.astype(np.float32), Fc.astype(np.float32)
+            return Cc.astype(np.float32), Fc.astype(np.float32), (Pf if keep_power else None)
 
         parts = list(self.pool.map(job, [slice(i, min(n, i + 5)) for i in range(0, n, 5)]))
-        return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
+        return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
+                np.concatenate([p[2] for p in parts]) if keep_power else None)
 
     def _run(self):
         src = None
@@ -511,9 +540,16 @@ class Engine:
         self.spec.append(P)
         self.spec_t.append(ts)
         ch = cfg["checks"]
-        if any(ch[k]["enabled"] or k in self.score_all for k in stage1.PITCH) and self.fine_n * self.fr == int(self.fs):
+        composing = self.composing(cfg) and self.fine_n * self.fr == int(self.fs)
+        if (any(ch[k]["enabled"] or k in self.score_all or k in self._layer_ids(cfg) for k in stage1.PITCH) or composing) \
+                and self.fine_n * self.fr == int(self.fs):
             t_p = time.time()
-            self.pitch_spec.append(self._pitch_maps(x, cfg))
+            C, F0, Pf = self._pitch_maps(x, cfg, keep_power=composing)
+            self.pitch_spec.append((C, F0))
+            if composing:                                # the candidates' sidebands come from these
+                self.c_fine.append((ts[: len(Pf)], Pf))
+                while self.c_fine and self.c_fine[0][0][-1] < ts[-1] - cfg["compose"]["window_s"] - cfg["analysis"]["settle_s"] - 2:
+                    self.c_fine.popleft()
             self.timing["pitch"] = time.time() - t_p
         else:
             self.pitch_spec.append(None)
@@ -592,7 +628,11 @@ class Engine:
         return np.concatenate([self.raw[a:], self.raw[:b]]), s0
 
     # ---------------- analysis ----------------
+    def composing(self, cfg):
+        return bool(cfg.get("compose", {}).get("enabled")) and (not self.oneshot or self.compose_offline)
+
     def _analyze(self, cfg):
+        composing = self.composing(cfg)
         an, det = cfg["analysis"], cfg["detect"]
         P = np.concatenate(self.spec)
         T = np.concatenate(self.spec_t)
@@ -611,7 +651,8 @@ class Engine:
         pitch = None
         if all(p is not None for p in self.pitch_spec) and self.pitch_spec:
             pitch = (np.concatenate([p[0] for p in self.pitch_spec]), np.concatenate([p[1] for p in self.pitch_spec]))
-        scores, comb, extra = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=tuple(self.score_all & set(stage1.STAGE1)),
+        force = (self.score_all | (set(self._layer_ids(cfg)) if composing else set())) & set(stage1.STAGE1)
+        scores, comb, extra = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=tuple(force),
                                                 pool=self.pool, pitch=pitch)
         self.timing["stage1"] = time.time() - t_s1
         ts = T[sl]
@@ -649,12 +690,19 @@ class Engine:
             w = int(2 * det["prominence_hz"] / self.df) | 1
             ev -= beta * uniform_filter1d(ev, size=w, axis=1, mode="nearest")
         ev = np.clip(ev, 0, None)
+        blocked = self._blocked(cfg)
+        if blocked.any():
+            ev[:, blocked] = 0                              # never a candidate here, in either mode
+        if composing:
+            ev[:] = 0                                       # composing: no tracks; the layers pick
         t_v = time.time()
         views = []
         if comod_map is not None:
             views.append(("comod", comod_map))
         if prof_map is not None and "profile" not in scores:
             views.append(("profile", prof_map))
+        if composing:
+            views += self._layer_views(scores, ts, blocked, cfg)
         self._view_rows(scores, comb, ev, ts, cfg, views)
         self.timing["views"] = time.time() - t_v
 
@@ -667,6 +715,11 @@ class Engine:
             t_t = time.time()
             self._tracks_audio_and_stage2(cfg, float(ts[0]) - 0.5 / self.fr, float(ts[-1]) + 0.5 / self.fr)
             self.timing["tracks"] = time.time() - t_t
+            if composing:
+                self._compose_step(cfg, float(ts[-1]))
+            elif self.cmix is not None or self.channels:
+                self._cmix_close(cfg)
+                self._compose_reset()
 
     def _comodulation(self, env, comb, sl, cfg):
         """Pairs of candidate frequencies whose syllable-band loudness moves together (at once or
@@ -852,6 +905,15 @@ class Engine:
                     self.emit({"type": "det_end", "box": box})
             else:
                 alive.append(tr)
+                if not tr.detected:              # nothing will be recorded: keep only what the checks / mix read
+                    keep_from = tb - 8.0
+                    if tr.out and tr.out[0][0] < keep_from - 2.0:
+                        tr.audio = [(t, a) for t, a in tr.audio if t >= keep_from]
+                        tr.out = [(t, a) for t, a in tr.out if t >= keep_from]
+                        tr.iq = [(t, a) for t, a in tr.iq if t >= keep_from]
+                        tr.seg_start = max(tr.seg_start, keep_from)
+        if tb - ta > 30 and self.cmix is not None:   # end of the stream
+            self._cmix_close(cfg)
         if self.on_hop is not None:              # before ended tracks are dropped
             self.on_hop(self, cfg, tb)
         self.tracks = alive
@@ -966,6 +1028,287 @@ class Engine:
             self.emit({"type": "audio", "id": tr.id, "t": round(t, 4), "rate": AUDIO_FS,
                        "pcm": _b64((pcm * 32767).astype(np.int16))})
             tr.emitted_until = t + len(a) / AUDIO_FS
+
+    # ---------------- composed voice ----------------
+    @staticmethod
+    def _layer_ids(cfg):
+        return [l["id"] for l in cfg.get("compose", {}).get("layers", []) if float(l.get("weight", 0)) > 0]
+
+    def _blocked(self, cfg):
+        """Kept bins inside a blocked frequency range."""
+        m = np.zeros(len(self.f), bool)
+        for r in cfg.get("blocked") or []:
+            try:
+                m |= (self.fc + self.f >= float(r["lo"])) & (self.fc + self.f <= float(r["hi"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        return m
+
+    def _layer_views(self, scores, ts, blocked, cfg):
+        """Composing: each layer's weighted map, their union (the confidence every frequency gets), and
+        "why" (which layer gives the most, packed with the confidence). Keeps the confidence rows."""
+        layers = [l for l in cfg["compose"]["layers"] if float(l.get("weight", 0)) > 0 and l["id"] in scores][:8]
+        n, K = len(ts), len(self.f)
+        conf, miss = np.zeros((n, K), np.float32), np.ones((n, K), np.float32)
+        best, arg = np.zeros((n, K), np.float32), np.zeros((n, K), np.uint8)
+        views = []
+        for i, l in enumerate(layers):
+            v = np.clip(float(l["weight"]) * scores[l["id"]], 0, 1).astype(np.float32)
+            v[:, blocked] = 0
+            miss *= 1 - v
+            m = v > best
+            best[m], arg[m] = v[m], i
+            views.append(("layer:" + l["id"], v))
+        conf = 1 - miss
+        for t, row in zip(ts, conf):
+            self.c_conf.append((float(t), row))
+        W = float(cfg["compose"]["window_s"])
+        while self.c_conf and self.c_conf[0][0] < ts[-1] - W - 1:
+            self.c_conf.popleft()
+        # "why": confidence in the top 5 bits (so max-pooling keeps the most confident pixel), layer below
+        why = ((np.round(conf * 31).astype(np.uint8) << 3) | arg).astype(np.float32) / 255.0
+        return [("layered", conf), ("why", why)] + views
+
+    def _compose_reset(self):
+        self.composer, self.cgain, self.cmix_until, self.channels = compose.Composer(), {}, None, {}
+        self.c_conf.clear()
+        self.c_fine.clear()
+
+    def _sidebands(self, Pf, f_off, g):
+        """A candidate's sound, read off the fine power spectrum: power at 0..3.4 kHz above and below
+        f_off (Hz from the centre), added; nothing below 150 Hz (the carrier, hum)."""
+        c = int(np.searchsorted(self.fine_f, f_off))
+        k = np.arange(g.top)
+        up, dn = c + k, c - k
+        ok = (up < Pf.shape[1]) & (dn >= 0)
+        A = np.zeros((len(Pf), g.top), np.float32)
+        A[:, ok] = Pf[:, up[ok]] + Pf[:, dn[ok]]
+        A[:, : int(150 / g.df)] = 0
+        return compose.normalise(A, g)
+
+    def _compose_step(self, cfg, tb):
+        """Composing, each hop: candidates = peaks of the layered confidence over the last window_s; the
+        composer picks the set whose sidebands together make the most voice; those are demodulated
+        from the raw IQ and mixed into one stream for the newest hop."""
+        cc = cfg["compose"]
+        W, hop = float(cc["window_s"]), float(cfg["analysis"]["hop_s"])
+        rows = [r for t, r in self.c_conf if t > tb - W]
+        fine = [(t, P) for t, P in self.c_fine]
+        if not rows or not fine:
+            return
+        if not hasattr(self, "c_grid") or self.c_grid.df != self.fine_df:
+            self.c_grid = compose.iq_grid(self.fine_df, 1.0 / self.fr)
+        g = self.c_grid
+        T = np.concatenate([t for t, _ in fine])
+        sel = (T > tb - W) & (T <= tb)
+        if sel.sum() < 10:
+            return
+        Pf = np.concatenate([P for _, P in fine])[sel]
+        cmean = np.mean(rows, axis=0)
+        min_conf = float(cc.get("min_conf", 0.3))
+        sep_hz = float(cc["min_sep_hz"])              # one channel apart: inside a station's sidebands is the same station
+        sep = max(1, int(sep_hz / self.df))
+        mx = maximum_filter1d(cmean, 2 * sep + 1)
+        peaks = np.flatnonzero((cmean >= mx - 1e-9) & (cmean >= min_conf))
+        peaks = peaks[np.argsort(cmean[peaks])[::-1][: int(cc["candidates"])]]
+        # candidates keep their identity while they stay put: a peak near a playing frequency is that one
+        cands = {}
+        for key, ch in self.channels.items():
+            k = int(np.argmin(np.abs(self.f - ch["f"])))
+            if key in self.composer.members and cmean[k] >= 0.5 * min_conf:
+                cands[key] = ch["f"]
+        for k in peaks:
+            f = float(self.f[k])
+            if any(abs(f - fo) < sep_hz for fo in cands.values()):
+                continue
+            cands[int(round(f / self.fine_df))] = f
+        specs = {}
+        for key, f in cands.items():
+            A = self._sidebands(Pf, f, g)
+            if A is not None:
+                specs[key] = A
+        t_c = time.time()
+        roles, parts, tot, info = self.composer.choose(specs, tb, cc, g)
+        self.timing["compose"] = time.time() - t_c
+        # play: demodulate the members (and any fading out) for [a, b)
+        b = tb
+        a = self.cmix_until if self.cmix_until is not None and 0 <= b - self.cmix_until < 3 * hop else b - hop
+        n = int(round((b - a) * AUDIO_FS))
+        if n < 160:
+            return
+        new = {k: 1.0 for k in roles}
+        for k in roles:
+            if k not in self.channels:
+                self.channels[k] = {"f": cands[k], "car_off": 0.0, "has_carrier": False, "det": None, "hp_zi": None,
+                                    "gain": SmoothGain(), "den": None, "band": None}
+        keys = [k for k in set(new) | set(self.cgain) if k in self.channels]
+        outs = dict(zip(keys, self.pool.map(lambda k: self._channel_audio(self.channels[k], a, n, cfg), keys)))
+        mix = np.zeros(n, np.float32)
+        for k in keys:                                   # crossfade: joining members rise, leaving ones fall
+            mix += np.linspace(self.cgain.get(k, 0.0), new.get(k, 0.0), n, dtype=np.float32) * outs[k]
+        self.cgain = new
+        self.channels = {k: v for k, v in self.channels.items() if k in new}
+        if roles:
+            self.last_hit = time.time()                  # always playing something: not "nothing caught"
+        mix /= np.sqrt(max(1, len(roles)))
+        y = self.clevel.process(mix) if roles or keys else mix
+        self.cmix_until = a + n / AUDIO_FS
+        vad = None
+        if roles and stage2.vad_available():
+            p = vad_probs_batch([mix])[0]
+            vad = float(np.mean(np.sort(p)[len(p) // 2:])) if len(p) else None
+        # the piece: a virtual detection the client shows and plays like any other
+        c = self.cmix
+        if c is None or b - c["t0"] >= float(cc["segment_s"]):
+            if c is not None:
+                self._cmix_close(cfg)
+            c = self.cmix = {"id": Track._next, "t0": a, "t1": a, "chunks": [], "comps": [], "open": {},
+                             "conf": 0.0, "conf_hist": [], "parts": collections.defaultdict(list), "info": {},
+                             "clips": [], "wavs": []}
+            Track._next += 1
+            first = True
+        else:
+            first = False
+        c["chunks"].append((a, y))
+        c["t1"] = self.cmix_until
+        c["conf"] = tot
+        c["conf_hist"].append((round(b, 2), round(tot, 3)))
+        for p, v in parts.items():
+            c["parts"][p].append(v)
+        if vad is not None:
+            c["parts"]["vad"].append(vad)
+        c["info"] = {**{k: round(v, 1) for k, v in info.items()}, "components": len(roles)}
+        for k, role in roles.items():
+            f = self.fc + self.channels[k]["f"]
+            iv = c["open"].get(k)
+            if iv is None:
+                iv = c["open"][k] = {"id": k, "f": f, "role": role, "t0": a, "t1": c["t1"]}
+                c["comps"].append(iv)
+            iv.update(f=f, role=role, t1=c["t1"])
+        for k in [k for k in c["open"] if k not in roles]:
+            del c["open"][k]
+        if len(c["comps"]) > 400:
+            c["comps"] = c["comps"][-400:]
+        box = self._cmix_box()
+        self.emit({"type": "det" if first else "det_update", "box": box})
+        self.emit({"type": "audio", "id": c["id"], "t": round(a, 4), "rate": AUDIO_FS,
+                   "pcm": _b64((np.clip(y, -1, 1) * 32767).astype(np.int16))})
+        self.emit({"type": "compose", "t": round(b, 2), "score": round(tot, 3),
+                   "parts": {p: round(v, 3) for p, v in parts.items()}, "vad": None if vad is None else round(vad, 3),
+                   "info": c["info"], "members": [{"id": k, "f": self.fc + self.channels[k]["f"], "role": r}
+                                                  for k, r in roles.items()], "candidates": len(specs)})
+
+    def _channel_audio(self, ch, a, n, cfg):
+        """n samples of a playing frequency's audio from stream time a: demodulated from the raw IQ like a
+        track (carrier found and centred, synchronous AM or the suppressed-carrier loop), then the
+        playback chain (high-pass, voice band, noise reduction, level)."""
+        au = cfg["audio"]
+        out = np.zeros(n, np.float32)
+        pad = int(0.02 * self.fs)
+        s0 = int(round(a * self.fs))
+        s1 = s0 + int(round(n / AUDIO_FS * self.fs))
+        x, s0r = self._raw_span(s0 - pad, s1 + pad)
+        if len(x) < 2 * pad + 100:
+            return out
+        bw = channel_hz(au)
+        iq, env = demod(x, self.fs, ch["f"] + ch["car_off"], bw, 0)
+        cut = int(round((s0 - s0r) / self.fs * AUDIO_FS))
+        iq, env = iq[cut:cut + n], env[cut:cut + n]
+        off, share = carrier_line(iq, bw)
+        was = ch["has_carrier"]
+        if share is not None:
+            ch["has_carrier"] = share >= 0.3 or (was and share >= 0.1)
+        if ch["has_carrier"] and off:
+            iq = (iq * np.exp(-2j * np.pi * off * np.arange(len(iq)) / AUDIO_FS)).astype(np.complex64)
+            ch["car_off"] += off
+            if abs(ch["car_off"]) > bw:
+                ch["car_off"], ch["has_carrier"] = 0.0, False
+        if ch["det"] is None:
+            ch["det"] = detector_for(au, 0)
+        if ch["det"] is not None:
+            env = ch["det"].process(iq)
+        if ch["hp_zi"] is None:
+            self._hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
+            ch["hp_zi"] = sosfilt_zi(self._hp) * float(env[0] if len(env) else 0)
+            if au.get("denoise", True):
+                ch["den"] = StreamingDenoiser(au.get("denoise_strength", 1.0), au.get("denoise_floor_db", -18.0))
+            if au.get("voice_band", True):
+                ch["band"] = VoiceBand(au.get("voice_lo_hz", 300), au.get("voice_hi_hz", 3000))
+        y, ch["hp_zi"] = sosfilt(self._hp, env, zi=ch["hp_zi"])
+        y = y.astype(np.float32)
+        y = ch["band"].process(y) if ch["band"] else y
+        y = ch["den"].process(y) if ch["den"] else y
+        y = ch["gain"].process(y)
+        out[: min(n, len(y))] = y[:n]
+        return out
+
+    def _cmix_box(self):
+        c = self.cmix
+        fr = [iv["f"] for iv in c["comps"]] or [self.fc]
+        hist = [v for _, v in c["conf_hist"]] or [0.0]
+        return {"id": c["id"], "chain": c["id"], "t0": c["t0"], "t1": c["t1"], "fmin": min(fr), "fmax": max(fr),
+                "path": [], "conf": round(c["conf"], 3), "conf_max": round(max(hist), 3),
+                "scores": {p: round(float(np.mean(v)), 3) for p, v in c["parts"].items() if v},
+                "info": c["info"], "wavs": list(c["wavs"]), "clips": list(c["clips"]), "detected": True,
+                "mode": "mix", "audio_t0": c["t0"], "composed": True,
+                "components": [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in iv.items()} for iv in c["comps"]]}
+
+    def _cmix_close(self, cfg):
+        """End the current piece of the mix: keep it (memory or disk) and transcribe it, like a detection."""
+        c = self.cmix
+        if c is None:
+            return
+        self.cmix = None
+        box = self._cmix_box_of(c)
+        self.box_hist.append(box)
+        try:
+            self._cmix_keep(c, box, cfg)
+        finally:
+            self.emit({"type": "det_end", "box": box})
+
+    def _cmix_keep(self, c, box, cfg):
+        if not c["chunks"]:
+            return
+        a = np.concatenate([y for _, y in c["chunks"]])
+        if len(a) < AUDIO_FS // 2:
+            return
+        rec = cfg["record"]
+        utc = datetime.fromtimestamp(self.utc0 + c["t0"], timezone.utc)
+        fr = [iv["f"] for iv in c["comps"]] or [self.fc]
+        conf_max = box["conf_max"]
+        meta = {
+            "id": c["id"], "chain": c["id"], "segment": 0, "epoch": self.t_origin, "composed": True,
+            "utc_start": utc.isoformat(), "stream_t0": c["t0"], "stream_t1": c["t1"],
+            "duration_s": round(len(a) / AUDIO_FS, 2),
+            "freq_hz": {"mean": float(np.mean(fr)), "min": min(fr), "max": max(fr)},
+            "path": [], "components": box["components"],
+            "confidence": {"final": c["conf"], "max": conf_max, "history": c["conf_hist"][-600:]},
+            "scores": box["scores"], "info": c["info"], "fc": self.fc, "fs": self.fs, "mode": "mix",
+            "sdr": cfg["sdr"], "compose": cfg["compose"],
+        }
+        pcm16 = (np.clip(a, -1, 1) * 32767).astype(np.int16)
+        save = rec["enabled"] and not self.oneshot and not self.storage["paused"] and conf_max >= float(cfg["compose"].get("save_score", 0.5))
+        meta_path = None
+        if save:
+            meta_path = self._write_recording(meta, pcm16, None, f"{utc:%Y%m%d-%H%M%S}_mix{c['id']}", cfg)
+        else:
+            meta.update(saved=False, key=f"mem:{int(self.t_origin)}:{c['id']}:0", files={})
+            meta["clip"] = "/api/clip?key=" + meta["key"]
+            if not self.oneshot:
+                self._mem_put(meta, pcm16, cfg)
+        box["clips"] = [meta["clip"]]
+        self.emit({"type": "recording", "meta": {k: v for k, v in meta.items() if k not in ("compose", "sdr")}})
+        if self.transcriber and cfg["whisper"]["enabled"]:
+            self.transcriber.submit({"kind": "track", "id": c["id"], "chain": c["id"], "audio": a.astype(np.float32),
+                                     "wav": meta["files"].get("wav"), "keys": [meta["key"]],
+                                     "meta_paths": [meta_path] if meta_path else []}, priority=conf_max)
+
+    def _cmix_box_of(self, c):
+        keep, self.cmix = self.cmix, c
+        try:
+            return self._cmix_box()
+        finally:
+            self.cmix = keep
 
     # ---------------- recordings ----------------
     def _finish(self, tr, cfg, final):
