@@ -1186,14 +1186,25 @@ class Engine:
             p = vad_probs_batch([mix])[0]
             vad = float(np.mean(np.sort(p)[len(p) // 2:])) if len(p) else None
         # the piece: a virtual detection the client shows and plays like any other
+        # Long runs are cut into pieces of at most segment_s; each new piece starts with the last
+        # overlap_s of the one before (audio and the signals playing then), so no word is lost at a cut.
         c = self.cmix
-        if c is None or b - c["t0"] >= float(cc["segment_s"]):
-            if c is not None:
+        if c is None or self.cmix_until - c["t0"] > float(cc["segment_s"]) + 1e-6:
+            prev = c
+            if prev is not None:
                 self._cmix_close(cfg)
             c = self.cmix = {"id": Track._next, "t0": a, "t1": a, "chunks": [], "comps": [], "open": {},
                              "conf": 0.0, "conf_hist": [], "parts": collections.defaultdict(list), "info": {},
                              "clips": [], "wavs": []}
             Track._next += 1
+            ov = int(round(float(cc.get("overlap_s", 0.5)) * AUDIO_FS))
+            if prev is not None and ov > 0 and prev["chunks"] and abs(prev["t1"] - a) < 0.05:
+                tail = np.concatenate([y_ for _, y_ in prev["chunks"]])[-ov:]
+                c["t0"] = a - len(tail) / AUDIO_FS
+                c["chunks"].append((c["t0"], tail))
+                for k, iv in prev["open"].items():
+                    c["open"][k] = dict(iv, t0=c["t0"], t1=a)
+                    c["comps"].append(c["open"][k])
             first = True
         else:
             first = False

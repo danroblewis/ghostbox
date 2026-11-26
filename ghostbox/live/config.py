@@ -168,7 +168,8 @@ DEFAULT = {
                 "max_components": 4, "min_components": 1, "window_s": 3.0, "hold_s": 2.0,
                 "w_pitch": 1.0, "w_voice2": 0.5, "w_formants": 1.0, "w_syllables": 1.0,
                 "cost": 0.02,                    # score each extra component must earn
-                "segment_s": 20.0,               # the mix is recorded and transcribed in pieces this long
+                "segment_s": 8.0,                # the mix is recorded and transcribed in pieces at most this long,
+                "overlap_s": 0.5,                # each starting with this much of the piece before
                 "save_score": 0.5},              # pieces whose score reached this are written to disk
     # Frequency ranges neither mode uses (known stations, carriers): [{"lo": Hz, "hi": Hz, "label": ""}]
     "blocked": [],

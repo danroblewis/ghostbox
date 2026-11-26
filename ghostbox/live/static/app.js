@@ -899,7 +899,8 @@ function composeCard() {
         slider("Formants", ["compose", "w_formants"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Syllable rhythm", ["compose", "w_syllables"], 0, 2, 0.1, v => v.toFixed(1)),
         el("h3", { class: "sub" }, "Recording"),
-        slider("Record pieces of", ["compose", "segment_s"], 5, 60, 5, v => v + " s"),
+        slider("Cut pieces after", ["compose", "segment_s"], 3, 60, 1, v => v + " s"),
+        slider("Overlap with the piece before", ["compose", "overlap_s"], 0, 2, 0.1, v => v.toFixed(1) + " s"),
         slider("Save to disk above", ["compose", "save_score"], 0, 1, 0.05, pct),
       ] : [])),
     blockedCard());
@@ -1806,7 +1807,7 @@ async function openDetail(opts) {
   box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
     el("span", { style: "flex:1" }), el("span", { class: "t3 kbdhint", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
     renderBase ? abControls(renderBase, clip, !!info.composed)
-      : el("div", { class: "note" }, info.composed ? "Still being recorded: the filters can re-render this mix once its piece ends (every " + ((S.cfg.compose || {}).segment_s || 20) + " s)." : "A/B listening needs this detection's IQ, which isn't available.")));
+      : el("div", { class: "note" }, info.composed ? "Still being recorded: the filters can re-render this mix once its piece ends (every " + ((S.cfg.compose || {}).segment_s || 8) + " s at most)." : "A/B listening needs this detection's IQ, which isn't available.")));
   // ---- downloads and actions
   const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
   const dl = (label, href, name, title) => el("a", { class: "btn", href, download: name, title }, label);
