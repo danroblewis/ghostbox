@@ -100,8 +100,9 @@ const isConfView = v => v === "layered" || v === "why" || (v || "").startsWith("
 // colours of the layers in the "why" view (by position in the layer list)
 const LAYER_COLORS = [[255, 196, 64], [64, 200, 255], [255, 96, 160], [120, 230, 120], [190, 140, 255], [255, 140, 80], [80, 230, 210], [230, 230, 230]];
 function hexRGB(h) { const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(h || ""); return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [12, 13, 14]; }
+const confCut = () => composing() ? ((S.cfg.compose || {}).candidate_floor ?? 0.15) : S.minConf;
 function paintConf(c, img) {                      // below Min confidence: background; above: colour by confidence
-  const cut = Math.round(S.minConf * 255), why = c.view === "why", bg = hexRGB(TH.bg);
+  const cut = Math.round(confCut() * 255), why = c.view === "why", bg = hexRGB(TH.bg);
   for (let r = 0; r < c.n; r++) {
     const src = (c.n - 1 - r) * c.w, dst = r * c.w * 4;
     for (let x = 0; x < c.w; x++) {
@@ -304,10 +305,13 @@ function draw() {
   updateRowProgress();
   updateVoiceGains();
 }
-// Composed voice: each component a line at its frequency for as long as it was in the mix, labelled with
-// the voice part it gave; the piece's score and transcript beside the rightmost one.
-const ROLE = { pitch: ["pitch", "Pitch comb"], voice2: ["2nd voice", "Second pitch comb"], formants: ["formants", "Formant (F1/F2)"],
-  syllables: ["syllables", "Syllable rhythm"], texture: ["texture", "Adds little on its own"] };
+// Composed voice: each key (one channel's low / mid / high band) a line at its channel's frequency for as
+// long as it played, labelled with its band and the voice part it gave; the piece's confidence and
+// transcript beside the rightmost one.
+const ROLE = { pitch: ["pitch", "Pitch comb"], formants: ["formant", "Formants (F1/F2)"], syllables: ["rhythm", "Syllable rhythm"],
+  together: ["together", "Moves with the other channels"], coverage: ["fills band", "Fills a missing band"], fill: ["fill", "Adds little on its own"],
+  texture: ["fill", "Adds little on its own"] };
+const BAND_X = { low: -1, mid: 0, high: 1 };
 function drawComposed(d, top, pps, dpr, now) {
   const b = d.box, comps = b.components || [];
   const playing = d.playing.some(([a, z]) => now >= a && now <= z);
@@ -315,15 +319,15 @@ function drawComposed(d, top, pps, dpr, now) {
   const labels = [];
   ctx.save(); ctx.strokeStyle = TH.accent; ctx.fillStyle = TH.accent; ctx.lineCap = "round";
   for (const c of comps) {
-    const x = xOf(c.f), ya = (top - c.t1) * pps, yb = (top - c.t0) * pps;
+    const x = xOf(c.f) + (BAND_X[c.band] || 0) * 4 * dpr, ya = (top - c.t1) * pps, yb = (top - c.t0) * pps;
     if (yb < -20 || ya > cv.height + 20) continue;
     xmin = Math.min(xmin, x); xmax = Math.max(xmax, x); ymin = Math.min(ymin, ya); ymax = Math.max(ymax, yb);
     ctx.globalAlpha = playing ? 0.95 : 0.6; ctx.lineWidth = (playing ? 3 : 2) * dpr;
     ctx.beginPath(); ctx.moveTo(x, ya); ctx.lineTo(x, yb); ctx.stroke();
-    const lab = (ROLE[c.role] || [c.role])[0], ly = Math.max(14 * dpr, ya + 11 * dpr), lw = ctx.measureText(lab).width;
+    const lab = (c.band ? c.band + " " : "") + (ROLE[c.role] || [c.role])[0], ly = Math.max(14 * dpr, ya + 11 * dpr), lw = ctx.measureText(lab).width;
     if (yb - ya > 36 * dpr && !labels.some(([lx, lyy, w]) => Math.abs(lyy - ly) < 14 * dpr && x + 4 * dpr < lx + w + 6 * dpr && lx < x + 4 * dpr + lw + 6 * dpr)) {
       labels.push([x + 4 * dpr, ly, lw]);
-      ctx.globalAlpha = c.role === "texture" ? 0.45 : playing ? 1 : 0.75; ctx.fillText(lab, x + 4 * dpr, ly);
+      ctx.globalAlpha = c.role === "texture" || c.role === "fill" ? 0.45 : playing ? 1 : 0.75; ctx.fillText(lab, x + 4 * dpr, ly);
     }
   }
   ctx.restore();
@@ -336,6 +340,7 @@ function drawComposed(d, top, pps, dpr, now) {
   if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, Math.min(lx, cv.width - 200 * dpr), ly + 16 * dpr, tx.no_speech_prob > 0.6, playing, TH.accent);
 }
 function drawBlocked(H, dpr) {
+  BLK.rects = [];
   const ranges = [...((S.cfg && S.cfg.blocked) || [])];
   if (BLK.drag) ranges.push({ lo: Math.min(BLK.drag.f0, BLK.drag.f1), hi: Math.max(BLK.drag.f0, BLK.drag.f1), label: "Block…", live: true });
   for (const r of ranges) {
@@ -348,8 +353,13 @@ function drawBlocked(H, dpr) {
     ctx.globalAlpha = 0.25; ctx.strokeStyle = TH.text; ctx.lineWidth = dpr;
     for (let x = x0 - H; x < x0 + w; x += 10 * dpr) { ctx.beginPath(); ctx.moveTo(x, H); ctx.lineTo(x + H, 0); ctx.stroke(); }
     ctx.restore();
-    ctx.save(); ctx.fillStyle = TH.text; ctx.globalAlpha = 0.9; ctx.font = `${11 * dpr}px ${TH.sans}`;
-    ctx.fillText(r.label || "blocked", x0 + 3 * dpr, 30 * dpr); ctx.restore();
+    ctx.save(); ctx.font = `${11 * dpr}px ${TH.sans}`;
+    const txt = (r.label || "blocked") + (r.live ? "" : "  ✕"), tw = ctx.measureText(txt).width;
+    let ly = 20;                                         // stagger labels of neighbouring ranges so each ✕ is clickable
+    while (BLK.rects.some(([a, b, c]) => b === ly && x0 / dpr < c + 4 && (x0 + tw + 7 * dpr) / dpr > a)) ly += 17;
+    ctx.globalAlpha = 0.85; ctx.fillStyle = TH.bg; ctx.fillRect(x0 + 1 * dpr, ly * dpr, tw + 6 * dpr, 15 * dpr);
+    ctx.globalAlpha = 1; ctx.fillStyle = TH.text; ctx.fillText(txt, x0 + 4 * dpr, (ly + 11) * dpr); ctx.restore();
+    BLK.rects.push([(x0 + 1 * dpr) / dpr, ly, (x0 + tw + 7 * dpr) / dpr, ly + 15, r.live ? null : r]);
   }
 }
 function caption(text, x, y, doubtful, playing, color) {
@@ -390,7 +400,12 @@ function updateNav() {
   $("#followBtn").style.display = S.follow ? "none" : "inline-flex";
   $("#liveBtn").style.display = S.paused || S.delay > Math.max(8, +lsGet("gb_delay", 4) + 2) ? "inline-flex" : "none";
 }
-const BLK = { mode: false, drag: null };
+const BLK = { mode: false, drag: null, rects: [] };
+function blockLabelAt(x, y) { return BLK.rects.find(([a, b, c, d, r]) => r && x >= a && x <= c && y >= b && y <= d); }
+function unblock(r) {
+  if (!confirm(`Unblock ${r.label ? r.label + " (" : ""}${fmtFshort(r.lo)} – ${fmtFshort(r.hi)}${r.label ? ")" : ""}?`)) return;
+  patch({ blocked: (S.cfg.blocked || []).filter(x => !(x.lo === r.lo && x.hi === r.hi)) }, 50); buildDetector();
+}
 const fAtX = (x, r) => S.fmin + x / r.width * (S.fmax - S.fmin);
 cv.addEventListener("mousedown", e => {
   const [x, y, r] = canvasPos(e);
@@ -413,6 +428,7 @@ window.addEventListener("mouseup", e => {
   if (!downAt) return;
   const [x, y] = canvasPos(e); const moved = Math.hypot(x - downAt[0], y - downAt[1]); downAt = null;
   if (moved > 4) return;
+  const bl = blockLabelAt(x, y); if (bl) { unblock(bl[4]); return; }
   const d = boxAt(x, y);
   if (d) { togglePlay(detKey(d), d); return; }
   const top = topTime(); if (top === null) return;          // empty spot: play from here
@@ -422,7 +438,7 @@ cv.addEventListener("mousemove", e => {
   const [x, y, r] = canvasPos(e); const top = topTime(); if (top === null) return;
   if (dragging) { setPlayhead(dragTop - y / S.pps, y / S.pps); return; }
   if (BLK.drag) { BLK.drag.f1 = fAtX(x, r); }
-  if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else
+  if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else if (blockLabelAt(x, y)) cv.style.cursor = "pointer"; else
   cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : boxAt(x, y) ? "pointer" : "crosshair";
   const f = S.fmin + x / r.width * (S.fmax - S.fmin), tip = $("#tip");
   tip.style.display = "block"; tip.style.left = Math.min(x + 14, r.width - 170) + "px"; tip.style.top = (y + 14) + "px";
@@ -740,7 +756,7 @@ function recRow(r) {
     onOpen: () => openDetail({ key: r.key }), onPlay: () => togglePlay(recKey(r), null, r),
     saved: r.saved !== false, onSave: () => saveDetection(r) });
 }
-const mixLabel = comps => `Mix ×${new Set((comps || []).map(c => c.id)).size}`;
+const mixLabel = comps => `Mix ×${new Set((comps || []).map(c => Math.round(c.f / 500))).size}`;   // channels
 let liveTimer = null;
 function renderLive() {
   if (liveTimer) return;
@@ -852,7 +868,7 @@ function buildLegend() {                                   // what the colours o
   lg.style.display = show ? "" : "none"; if (!show) return;
   lg.replaceChildren(el("div", { class: "t2", style: "margin-bottom:3px" }, S.view === "why" ? "Colour: strongest layer · brightness: confidence" : "Brightness: confidence (any layer, more if several)"),
     ...(S.view === "why" ? layersOf().map((l, i) => el("div", { class: "lgrow" }, el("i", { style: `background:rgb(${LAYER_COLORS[i].join(",")})` }), `${labelOf(l.id)} ×${l.weight}`)) : []),
-    el("div", { class: "t3", style: "margin-top:3px" }, `Hidden below ${Math.round(S.minConf * 100)}% (Min confidence)`));
+    el("div", { class: "t3", style: "margin-top:3px" }, `Hidden below ${Math.round(confCut() * 100)}% (candidate floor)`));
 }
 for (const b of document.querySelectorAll("#modeSeg button")) b.addEventListener("click", e => {
   e.currentTarget.blur(); const on = b.dataset.m === "1"; if (on === composing()) return;
@@ -869,10 +885,14 @@ const layersOf = () => ((S.cfg && S.cfg.compose && S.cfg.compose.layers) || []).
 function onCompose(m) {
   if (!composing()) return;
   const p = m.parts || {}, pc = v => Math.round((v || 0) * 100);
-  const roles = (m.members || []).map(x => (ROLE[x.role] || [x.role])[0]);
-  $("#composeLine").textContent = `${(m.members || []).length} of ${m.candidates} candidates · pitch ${pc(p.pitch)} · 2nd voice ${pc(p.voice2)} · formants ${pc(p.formants)} · syllables ${pc(p.syllables)}`
+  const line = $("#composeLine");
+  line.textContent = `${m.heard ? "▶" : "muted"} ${pc(m.conf)}% · ${(m.members || []).length} bands from ${m.channels} of ${m.candidates} channels`
+    + ` · pitch ${pc(p.pitch)} · formants ${pc(p.formants)} · rhythm ${pc(p.syllables)} · together ${pc(p.together)} · bands ${pc(p.coverage)}`
     + (m.vad != null ? ` · ML voice ${pc(m.vad)}` : "");
-  $("#composeLine").title = `Score ${pc(m.score)}%. Candidates: peaks of the layered confidence above Min confidence. Playing: ${(m.members || []).map(x => fmtFshort(x.f) + " (" + (ROLE[x.role] || [x.role])[0] + ")").join(", ")}`;
+  line.classList.toggle("muted", !m.heard);
+  line.title = `The chosen set's confidence ${pc(m.conf)}% (structure ${pc(m.structure)}% blended with the ML voice detector on the mix). `
+    + (m.heard ? "At or above Min confidence: heard." : "Below Min confidence: silent.")
+    + ` Bands: ${(m.members || []).map(x => fmtFshort(x.f) + " " + x.band + " (" + (ROLE[x.role] || [x.role])[0] + ")").join(", ")}`;
 }
 
 function composeCard() {
@@ -883,21 +903,24 @@ function composeCard() {
     el("div", { class: "card" + (on ? "" : " off") },
       el("div", { class: "hd" }, toggle(on, v => setComposing(v)), "Composed voice",
         el("span", { class: "tag" }, on ? "on" : "individual voices")),
-      el("div", { class: "note", style: "margin-top:-2px" }, "No tracking: every frequency gets a confidence from the layers below, straight from the IQ. Peaks above Min confidence are candidates, and each second the ones whose sidebands together make the most voice (a moving pitch comb, a second voice, formants, syllable rhythm) are demodulated and played. One that has it all plays alone. Signals are only picked and levelled, never shifted or reshaped."),
+      el("div", { class: "note", style: "margin-top:-2px" }, "One voice, assumed split across several channels. Every frequency gets a confidence from the layers below, straight from the IQ; its peaks above the candidate floor are candidate channels. Each channel is split into low / mid / high bands, and each second the bands from at least two channels that together make the most voice (a moving pitch comb, formants, syllable rhythm, channels moving together, all bands present) are layered. Channels are only band-filtered and levelled, never shifted. Min confidence is for the whole set: below it, nothing plays."),
       ...(on ? [layersEditor(),
         el("h3", { class: "sub" }, "Choosing"),
-        slider("Most at once", ["compose", "max_components"], 1, 12, 1),
-        slider("Fewest at once", ["compose", "min_components"], 1, 6, 1),
-        slider("Keep a signal at least", ["compose", "hold_s"], 0, 10, 0.5, v => v + " s"),
+        slider("Candidate floor (also the layer views' cutoff)", ["compose", "candidate_floor"], 0, 1, 0.01, pct),
+        slider("Fewest channels at once", ["compose", "min_channels"], 1, 6, 1),
+        slider("Most bands at once", ["compose", "max_components"], 2, 15, 1),
+        slider("Keep a band at least", ["compose", "hold_s"], 0, 10, 0.5, v => v + " s"),
         slider("Judge over the last", ["compose", "window_s"], 1.5, 6, 0.5, v => v + " s"),
         slider("Candidates", ["compose", "candidates"], 4, 60, 1),
         slider("Candidates at least apart", ["compose", "min_sep_hz"], 2000, 30000, 500, v => (v / 1e3) + " kHz"),
-        slider("Cost per extra signal", ["compose", "cost"], 0, 0.1, 0.005, v => v.toFixed(3)),
-        el("h3", { class: "sub" }, "What a voice needs (scored on the mix)"),
+        slider("Cost per extra band", ["compose", "cost"], 0, 0.1, 0.005, v => v.toFixed(3)),
+        el("h3", { class: "sub" }, "What a voice needs (scored on the layered bands)"),
         slider("Pitch comb", ["compose", "w_pitch"], 0, 2, 0.1, v => v.toFixed(1)),
-        slider("Second voice", ["compose", "w_voice2"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Formants", ["compose", "w_formants"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Syllable rhythm", ["compose", "w_syllables"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("Channels moving together", ["compose", "w_together"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("Low, mid and high all present", ["compose", "w_coverage"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("ML voice detector's share of confidence", ["compose", "vad_weight"], 0, 1, 0.05, pct),
         el("h3", { class: "sub" }, "Recording"),
         slider("Cut pieces after", ["compose", "segment_s"], 3, 60, 1, v => v + " s"),
         slider("Overlap with the piece before", ["compose", "overlap_s"], 0, 2, 0.1, v => v.toFixed(1) + " s"),
@@ -936,7 +959,7 @@ function blockedCard() {
   const save = () => { patch({ blocked: list }, 50); buildDetector(); };
   return el("div", {},
     el("h2", {}, "Blocked frequencies"),
-    el("div", { class: "note", style: "margin-top:-4px" }, "Ranges neither mode will use: known stations, carriers. Shift-drag across the waterfall (or use Block on the waterfall bar) to add one."),
+    el("div", { class: "note", style: "margin-top:-4px" }, "Ranges neither mode will use: known stations, carriers. Shift-drag across the waterfall (or use Block on the waterfall bar) to add one; click a range's ✕ label on the waterfall, or × here, to remove it."),
     ...list.map((r, i) => {
       const name = el("input", { class: "field", value: r.label || "", placeholder: "label", style: "flex:1;min-width:0" });
       name.addEventListener("change", () => { list[i].label = name.value; patch({ blocked: list }, 50); });
@@ -1685,6 +1708,7 @@ function connect() {
       }
       case "config": {
         S.cfg = m.config; buildViewList(); S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
+        if (isConfView(S.view)) repaintAll();               // the candidate floor may have moved
         buildTop(); buildMode(); if (!$("#detector").contains(document.activeElement)) buildDetector(); break;
       }
       case "reset": if (m.fmax) { S.fmin = m.fmin; S.fmax = m.fmax; } break;
@@ -1824,10 +1848,10 @@ async function openDetail(opts) {
   const kv = [];
   const fmtMode = m => m === 1 ? "USB" : m === -1 ? "LSB" : m === 0 ? "AM" : null;
   if (info.composed) {
-    const by = new Map(); for (const c of info.composed) { const o = by.get(c.id) || { f: c.f, roles: new Set(), s: 0 }; o.roles.add(c.role); o.s += c.t1 - c.t0; by.set(c.id, o); }
-    kv.push(["Components", `${by.size} signals mixed`]);
-    for (const o of [...by.values()].sort((a, b) => b.s - a.s).slice(0, 12))
-      kv.push([fmtF(o.f), `${o.s.toFixed(1)} s · ${[...o.roles].map(r => (ROLE[r] || [r, r])[1]).join(", ")}`]);
+    const by = new Map(); for (const c of info.composed) { const o = by.get(c.id) || { f: c.f, band: c.band, roles: new Set(), s: 0 }; o.roles.add(c.role); o.s += c.t1 - c.t0; by.set(c.id, o); }
+    kv.push(["Components", `${by.size} bands from ${new Set([...by.values()].map(o => Math.round(o.f))).size} channels`]);
+    for (const o of [...by.values()].sort((a, b) => a.f - b.f || b.s - a.s).slice(0, 14))
+      kv.push([fmtF(o.f) + (o.band ? " · " + o.band : ""), `${o.s.toFixed(1)} s · ${[...o.roles].map(r => (ROLE[r] || [r, r])[1]).join(", ")}`]);
   } else kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
   if (info.confFinal != null) kv.push(["Confidence", `max ${Math.round(info.conf * 100)}%, final ${Math.round(info.confFinal * 100)}%`]);
   const I = { ...(info.info || {}), ...(info.mode != null ? { mode: info.mode } : {}) };
