@@ -18,7 +18,7 @@ import numpy as np
 
 from .config import CHECKS, GROUPS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
-from .engine import Engine, iq_cut_wav, render_segments
+from .engine import Engine, iq_cut_wav, render_mix, render_segments
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
 from .survey import Survey
@@ -440,6 +440,15 @@ def make_app(args):
             meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
             if meta is None:
                 raise web.HTTPNotFound()
+            if meta.get("composed"):                 # a composed-voice piece: every component, re-mixed
+                pcm = await loop.run_in_executor(None, render_mix, meta, eng.ring_segments, au)
+                if pcm is None:
+                    raise web.HTTPNotFound(text="this mix's IQ is no longer in the IQ ring (or IQ recording is off)")
+                import io
+                from scipy.io import wavfile
+                buf = io.BytesIO()
+                wavfile.write(buf, 16000, pcm)
+                return web.Response(body=buf.getvalue(), content_type="audio/wav")
             t0, t1 = meta["stream_t0"] - pre, meta["stream_t1"] + post
             segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
             if not segs:

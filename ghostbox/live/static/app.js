@@ -1778,7 +1778,7 @@ async function openDetail(opts) {
       tx = meta.transcript || S.tx.get(meta.id) || null;
       clip = meta.clip || (meta.files && meta.files.wav ? "/rec/" + meta.files.wav : null);
       iqUrl = meta.composed ? null : "/api/iq?key=" + encodeURIComponent(meta.key);
-      if (meta.composed) { info.composed = meta.components || []; info.extra = info.extra.filter(([k]) => k !== "Chain / segment"); }
+      if (meta.composed) { info.composed = meta.components || []; info.key = meta.key; info.extra = info.extra.filter(([k]) => k !== "Chain / segment"); }
       if (meta.epoch && Math.abs(meta.epoch - S.epoch) < 1e-3) jump = meta.stream_t1;
     } else if (b) {
       info = { f: (b.fmin + b.fmax) / 2, fmin: b.fmin, fmax: b.fmax, dur: b.t1 - b.t0, conf: b.conf, scores: b.scores || {}, info: b.info || {}, when: clockTime(b.t0) + " (still live)", composed: b.composed ? b.components || [] : null };
@@ -1786,7 +1786,7 @@ async function openDetail(opts) {
     }
   }
   if (!DT.open) return;
-  const renderBase = iqUrl ? iqUrl.split("?")[1] : null;
+  const renderBase = iqUrl ? iqUrl.split("?")[1] : info.composed && info.key ? "key=" + encodeURIComponent(info.key) : null;
   DT.clip = clip;
   // ---- header, transcript
   box.replaceChildren();
@@ -1805,7 +1805,8 @@ async function openDetail(opts) {
   pl.addEventListener("click", e => { if (!DT.buf) return; const r = pl.getBoundingClientRect(); dtSeek((e.clientX - r.left) / r.width * DT.buf.duration); });
   box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
     el("span", { style: "flex:1" }), el("span", { class: "t3 kbdhint", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
-    info.composed ? "" : renderBase ? abControls(renderBase, clip) : el("div", { class: "note" }, "A/B listening needs this detection's IQ, which isn't available.")));
+    renderBase ? abControls(renderBase, clip, !!info.composed)
+      : el("div", { class: "note" }, info.composed ? "Still being recorded: the filters can re-render this mix once its piece ends (every " + ((S.cfg.compose || {}).segment_s || 20) + " s)." : "A/B listening needs this detection's IQ, which isn't available.")));
   // ---- downloads and actions
   const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
   const dl = (label, href, name, title) => el("a", { class: "btn", href, download: name, title }, label);
@@ -1848,6 +1849,11 @@ async function openDetail(opts) {
       const r = await fetch(clip); if (!r.ok) throw new Error("gone");
       DT.buf = await AC.decodeAudioData(await r.arrayBuffer());
     } catch (e) { playBtn.disabled = true; time.textContent = "Audio no longer available"; }
+  } else if (opts.live && (opts.live.chunks || []).length) {   // still live: what has streamed in so far
+    const ch = opts.live.chunks, t0 = ch[0].t, end = ch[ch.length - 1].t + ch[ch.length - 1].pcm.length / 16000;
+    const buf = AC.createBuffer(1, Math.max(1, Math.round((end - t0) * 16000)), 16000), d = buf.getChannelData(0);
+    for (const c of ch) { const o = Math.round((c.t - t0) * 16000); for (let i = 0; i < c.pcm.length && o + i < d.length; i++) d[o + i] = c.pcm[i] / 32768; }
+    DT.buf = buf; playBtn.disabled = false;
   } else time.textContent = "No audio recorded";
   if (!DT.open) return;
   if (DT.buf) {
@@ -1919,7 +1925,7 @@ function dtTick() {
   if (tm) tm.textContent = `${t.toFixed(1)} / ${DT.buf.duration.toFixed(1)} s`;
 }
 // A/B: the same clip re-rendered from its IQ with another demodulator, noise reduction or voice band.
-function abControls(base, clip) {
+function abControls(base, clip, composed) {
   const au = S.cfg.audio;
   DT.ab = { demod: "rec", denoise: au.denoise !== false, band: au.voice_band !== false }; DT.tunedUrl = null;
   const seg = (items, key) => el("div", { class: "abseg" }, ...items.map(([v, l]) => el("button", { class: "btn" + (DT.ab[key] === v ? " on" : ""), "data-v": String(v),
@@ -1932,7 +1938,8 @@ function abControls(base, clip) {
     seg([["rec", "Recorded"], ["auto", "Auto"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["suppressed", "No carrier"], ["sync_sb", "Sync sideband"]], "demod"),
     el("span", { class: "t2" }, "Noise reduction"), seg([[true, "On"], [false, "Off"]], "denoise"),
     el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note),
-    el("div", { style: "display:flex;gap:10px;align-items:center;margin-top:10px" }, tuneBtn,
+    composed ? el("div", { class: "note" }, "Each signal in the mix is demodulated again from the IQ with these settings and mixed back where it played.")
+      : el("div", { style: "display:flex;gap:10px;align-items:center;margin-top:10px" }, tuneBtn,
       el("span", { class: "t3", style: "font-size:12px" }, "Finds the demodulation and filtering that make this one signal most voice-like.")),
     tuneOut);
 }

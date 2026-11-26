@@ -174,6 +174,34 @@ def render_segments(segs, t0, t1, pts, au, mode=0, offset_hz=0.0):
     return (audio * 32767).astype(np.int16)
 
 
+def render_mix(meta, ring_segments, au):
+    """A composed-voice piece re-rendered from the IQ ring with audio settings `au`: every component
+    demodulated for the time it played and mixed back in place (equal power where several overlap).
+    ring_segments(epoch, t0, t1) finds the IQ. Returns int16 PCM at 16 kHz or None if no IQ is left."""
+    t0, t1 = float(meta["stream_t0"]), float(meta["stream_t1"])
+    n = int(round((t1 - t0) * AUDIO_FS))
+    mix, cover = np.zeros(n, np.float32), np.zeros(n, np.float32)
+    got = False
+    for c in meta.get("components") or []:
+        a, b = max(t0, float(c["t0"])), min(t1, float(c["t1"]))
+        if b - a < 0.1:
+            continue
+        loaded = load_iq(ring_segments(meta["epoch"], a, b), a, b)
+        if loaded is None:
+            continue
+        y = render_clip(detect_clip(baseband(loaded, [[a, float(c["f"])]], au), au, 0), au)
+        i = int(round((loaded[1] - t0) * AUDIO_FS))
+        lo, hi = max(0, i), min(n, i + len(y))
+        if hi > lo:
+            mix[lo:hi] += y[lo - i: hi - i]
+            cover[lo:hi] += 1
+            got = True
+    if not got:
+        return None
+    y = SmoothGain().process(mix / np.sqrt(np.maximum(cover, 1)))
+    return (np.clip(y, -1, 1) * 32767).astype(np.int16)
+
+
 def carrier_line(iq, bw_hz, min_n=4096):
     """(offset Hz, share) of the strongest line in a 16 kHz narrowband channel: its offset from the
     centre and its share of the channel's power (within +-3 bins). (None, None) if too short."""
