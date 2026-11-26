@@ -5,6 +5,8 @@ Ghost signals can't be labelled, but the band's background can be measured. Auto
 1. takes the newest few minutes of continuous raw IQ for the current band (the IQ ring);
 2. runs the detector over it once, unthrottled, with permissive thresholds so that every
    candidate is kept along with all of its check scores;
+   Candidates are found with the active checks plus the defaults for any check at weight 0, and
+   every check is scored on them (also the ones at 0), so calibration can switch any check back on;
 3. searches check-weight combinations offline (confidence is just a weighted geometric mean of
    those scores, so trying hundreds costs milliseconds), scoring each by how speech-like its
    top detections are at the requested rate, judged by the ML voice detector (whose own weight
@@ -24,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from . import stage1
-from .config import CHECKS
+from .config import CHECKS, DEFAULT
 from .engine import Engine
 from .sources import FileSource
 
@@ -44,7 +46,10 @@ ENOUGH = 10                          # candidates needed to tune on
 # Switched off only if that strictly improves things (a tie keeps them): the modulation checks decide
 # which kinds of signal can be found at all, and co-modulation / hop continuity only matter in the
 # moments they apply, which a few minutes of recording may not contain.
-PROTECT = {c["id"] for c in CHECKS if c.get("family")} | {"comod", "hop"}
+# Sliding twinning costs several times the CPU of plain twinning: it's tried like any other check but
+# never starts switched on, and stays off on a tie.
+COSTLY = {"slide"}
+PROTECT = ({c["id"] for c in CHECKS if c.get("family")} | {"comod", "hop"}) - COSTLY
 SKIP = {"vad", "profile"}            # the judge itself; the profile is learned live, not from a replay
 
 
@@ -96,7 +101,7 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
     Objective: mean judge score of the K most confident candidates. Starting with every check
     on, each check in turn is tried at weights 0 / 0.5 / 1 / 2 with the others fixed; a check
     stays off (weight 0) when that's at least as good, otherwise it keeps its best weight.
-    A few passes, from the current weights and from all-on; the better result wins."""
+    A few passes, from all-on, the current weights and the defaults; the best result wins."""
     ids = [c["id"] for c in CHECKS if c["id"] not in SKIP and (available is None or c["id"] in available)]
     X = np.array([[b["scores"].get(i, np.nan) for i in ids] for b in boxes], dtype=float)
     X = np.where(np.isnan(X), 0.5, X)                   # a check that couldn't run is neutral
@@ -138,7 +143,10 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
                     trial[lv] = evaluate(v)
                 top = max(trial.values())
                 keep = trial.get(w[j], -2) >= top - 0.005
-                if ids[j] in PROTECT:
+                if ids[j] in COSTLY:
+                    # on only if strictly better
+                    pick = max(trial, key=trial.get) if top > trial[0.0] + 0.005 else 0.0
+                elif ids[j] in PROTECT:
                     # off only if strictly better; otherwise keep the current weight on a tie
                     pick = w[j] if keep else max(trial, key=trial.get)
                 else:
@@ -151,12 +159,13 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
                 break
         return w, best
 
-    current = np.array([live_checks[i]["weight"] if live_checks[i]["enabled"] else 0.0 for i in ids])
+    current = np.array([float(live_checks.get(i, {}).get("weight", 0)) for i in ids])
+    defaults = np.array([float(DEFAULT["checks"][i]["weight"]) for i in ids])
     if keep and current.sum() > 0:                      # rank with the current checks, no search
         w_best, best_score = current, evaluate(current)
     else:
-        runs = [descend(np.ones(len(ids)))]
-        if current.sum() > 0:
+        runs = [descend(np.array([0.0 if i in COSTLY else 1.0 for i in ids])), descend(defaults)]
+        if current.sum() > 0 and not np.allclose(current, defaults):
             runs.append(descend(np.maximum(current, 0)))
         w_best, best_score = max(runs, key=lambda r: r[1])
 
@@ -170,8 +179,7 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
     decisions.sort(key=lambda d: (-d["on"], -d["effect"]))
 
     # final confidence as the live detector will compute it (including the ML check at its own weight)
-    vad = live_checks["vad"]
-    w_vad = vad["weight"] if vad["enabled"] else 0.0
+    w_vad = vad_weight(live_checks)
     vad_s = np.nan_to_num(np.array([b["scores"].get("vad", 0.5) for b in boxes], float), nan=0.5)
     conf_full = conf_of(w_best, vad_s, w_vad)
     order = np.sort(conf_full)[::-1]
@@ -180,7 +188,7 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
     show = float(order[K_show - 1])
     capture = float(order[min(n, 3 * K) - 1])
     return {
-        "weights": {i: float(w) for i, w in zip(ids, w_best)},
+        "weights": {i: float(w) for i, w in zip(ids, w_best)}, "vad_weight": w_vad,
         "decisions": decisions,
         "target_count": K, "voice_like": voicey,
         "score_before": evaluate(current) if current.sum() > 0 else 0.0,
@@ -191,18 +199,34 @@ def optimise(boxes, minutes, per_min, live_checks, floor=0.3, available=None, ke
     }
 
 
+def finding_checks(checks):
+    """The checks an analysis replay finds candidates with: the active ones as they are, plus the
+    default weight for any check at 0 that is on by default. Candidates come from the stage-1 checks,
+    so with these switched off nothing could ever be found, and calibration couldn't learn its way
+    back. (Not every check at once: that flattens the combined score so nothing stands out.)"""
+    out = copy.deepcopy(checks)
+    for c in CHECKS:
+        cur, d = out.setdefault(c["id"], dict(c["default"])), DEFAULT["checks"][c["id"]]
+        if float(cur.get("weight", 0)) <= 0 and d["weight"] > 0:
+            cur.update(weight=d["weight"], enabled=True)
+    return out
+
+
+def vad_weight(checks):
+    """The ML voice detector judges calibration, so a calibrated detector always uses it."""
+    w = float(checks.get("vad", {}).get("weight", 0))
+    return w if w > 0 else float(DEFAULT["checks"]["vad"]["weight"])
+
+
 def analysis_config(cfg):
-    """Config for an analysis replay: permissive candidate finding with the checks as they are now
-    (switching everything on flattens the combined score so nothing stands out), every check
-    computed for each candidate (score_all) so a search can try any of them, nothing written."""
+    """Config for an analysis replay: candidates found with finding_checks (the active checks, plus
+    the defaults for any at 0), every check computed for each candidate (score_all, including the ones
+    at weight 0) so a search can try any of them, nothing written."""
     tcfg = copy.deepcopy(cfg)
     tcfg["detect"].update(TUNE_DETECT)
-    score_all = {c["id"] for c in CHECKS if c["id"] not in SKIP
-                 and (c["id"] != "slide" or tcfg["checks"]["slide"]["enabled"])} | {"vad"}
-    if not any(tcfg["checks"][c["id"]]["enabled"] for c in CHECKS if c["stage"] == 1 and c["id"] != "profile"):
-        for k in ("twinning", "syllabic", "comb"):       # nothing to find candidates with: a basic set
-            tcfg["checks"][k]["enabled"] = True
-    tcfg["checks"]["profile"]["enabled"] = False        # learned live; a replay mustn't feed it
+    tcfg["checks"] = finding_checks(cfg["checks"])
+    score_all = {c["id"] for c in CHECKS if c["id"] not in SKIP} | {"vad"}
+    tcfg["checks"]["profile"].update(enabled=False, weight=0.0)   # learned live; a replay mustn't feed it
     for k in ("whisper", "record", "iq_ring"):
         tcfg[k]["enabled"] = False
     return tcfg, score_all
@@ -234,14 +258,35 @@ def analyse_iq(root, tcfg, score_all, paths, fs, fc, dur, step=0, progress=None,
 
 
 def calibrate_boxes(boxes, cfg, minutes, per_min, available):
-    """Weights and thresholds from analysed candidates (see optimise); keeps the current checks
-    when (almost) nothing is speech-like, since a search against noise would be arbitrary."""
+    """Weights and thresholds from analysed candidates (see optimise). When (almost) nothing is
+    speech-like a search against noise would be arbitrary: then the candidate-finding set is kept
+    (the active checks, with any that were off back at their defaults), never a set that can't find anything."""
     floor = cfg["autotune"].get("floor", 0.3)
     res = optimise(boxes, minutes, per_min, cfg["checks"], floor=floor, available=available)
     if res["voice_like"] < 3:
-        res = optimise(boxes, minutes, per_min, cfg["checks"], floor=floor, available=available, keep=True)
+        res = optimise(boxes, minutes, per_min, finding_checks(cfg["checks"]), floor=floor, available=available, keep=True)
         res["decisions"], res["kept_checks"] = [], True
     return res
+
+
+def live_patch(res, found):
+    """Config patch that puts a calibration result live. found: the candidate-finding settings
+    the analysis needed; live keeps CPU in check (fewer candidates and tracks than the analysis)."""
+    checks = {i: {"weight": w} for i, w in res["weights"].items()}
+    checks["vad"] = {"weight": res["vad_weight"]}
+    return {"checks": checks,
+            "detect": {**found, "max_tracks": 16, "max_candidates": 8, "threshold": res["capture_threshold"]}}
+
+
+def check_changes(before, after):
+    """[{id, label, before, after}] for every check whose weight a calibration changed."""
+    labels = {c["id"]: c["label"] for c in CHECKS}
+    out = []
+    for i, a in after.items():
+        b = float(before.get(i, {}).get("weight", 0))
+        if abs(b - float(a.get("weight", 0))) > 0.01:
+            out.append({"id": i, "label": labels.get(i, i), "before": round(b, 2), "after": round(float(a["weight"]), 2)})
+    return out
 
 
 def rescore(box, checks):
@@ -271,7 +316,7 @@ class AutoTune:
         with self._lock:
             if self.state.get("state") == "running":
                 return False
-            self.state = {"state": "running", "progress": 0.0, "auto": auto,
+            self.state = {"state": "running", "progress": 0.0, "auto": auto, "changes": [],
                           "message": ("Automatic: " if auto else "") + "Finding recorded IQ…"}
         threading.Thread(target=self._run, args=(float(minutes), float(per_min)), daemon=True).start()
         return True
@@ -282,6 +327,22 @@ class AutoTune:
         self.apply(self.prev)
         self.prev = None
         self._set(state="reverted", message="Previous detector settings restored.")
+        return True
+
+    def use_survey(self, patch, cal, message):
+        """Tune to a surveyed step and put that step's calibration live (Revert undoes it). Automatic
+        recalibration, if on, still refines it once enough IQ is recorded at the new frequency."""
+        with self._lock:
+            if self.state.get("state") == "running":
+                return False
+        cfg = self.config.get()
+        self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
+        self.apply(patch)
+        self.show_conf = cal["show_threshold"]
+        self.state = {"state": "survey", "message": message, "show_threshold": cal["show_threshold"],
+                      "changes": check_changes(self.prev["checks"], patch.get("checks", {})),
+                      "weights": {i: v["weight"] for i, v in patch.get("checks", {}).items()}}
+        self.emit({"type": "autotune", **self.state})
         return True
 
     def _run(self, minutes, per_min):
@@ -307,33 +368,33 @@ class AutoTune:
                 if len(boxes) >= ENOUGH:
                     break
             found = {**TUNE_DETECT, **LADDER[step]}
+            self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
             if len(boxes) < 5:
-                # still too little to learn weights from: keep the checks, but apply working tracking
-                # and the loosest candidate finding so the live detector has its best chance
-                self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
-                self.apply({"detect": {**found, "max_tracks": 16, "max_candidates": 8, "threshold": 0.0}})
-                self._set(state="quiet", progress=1.0,
+                # too little to learn weights from: the candidate-finding checks (anything that was off
+                # and is on by default comes back), working tracking and the loosest candidate finding,
+                # so the live detector has its best chance
+                checks = {c["id"]: {"weight": tcfg["checks"][c["id"]]["weight"]} for c in CHECKS if c["id"] != "profile"}
+                self.apply({"checks": checks, "detect": {**found, "max_tracks": 16, "max_candidates": 8, "threshold": 0.0}})
+                self._set(state="quiet", progress=1.0, changes=check_changes(self.prev["checks"], checks),
+                          weights={i: v["weight"] for i, v in checks.items()},
                           message=f"Only {len(boxes)} candidate signal{'s' if len(boxes) != 1 else ''} in {dur / 60:.1f} min "
-                                  "even at the loosest settings. Check weights unchanged; tracking and candidate "
-                                  "finding set as loose as they go.")
+                                  "even at the loosest settings. Checks set to the candidate-finding set; tracking and "
+                                  "candidate finding as loose as they go. If the band is really this empty, check the "
+                                  "antenna and gain (Receiver > Test).")
                 return
             self._set(progress=0.95, message=f"Searching settings over {len(boxes)} candidates…")
-            avail = score_all - SKIP
-            res = calibrate_boxes(boxes, cfg, dur / 60, per_min, avail)
-            self.prev = {"checks": copy.deepcopy(cfg["checks"]), "detect": copy.deepcopy(cfg["detect"])}
-            live_detect = {**found, "max_tracks": 16, "max_candidates": 8,   # the analysis pass is wide open;
-                           "threshold": res["capture_threshold"]}                      # live keeps CPU in check
+            res = calibrate_boxes(boxes, cfg, dur / 60, per_min, score_all - SKIP)
             labels = {c["id"]: c["label"] for c in CHECKS}
             for d in res["decisions"]:
                 d["label"] = labels.get(d["id"], d["id"])
-            patch = {"checks": {i: {"weight": w, "enabled": w > 0} for i, w in res["weights"].items()},
-                     "detect": live_detect}
+            patch = live_patch(res, found)
             self.apply(patch)
             band = [fc - fs / 2, fc + fs / 2]
             if cfg["sdr"].get("fmin_hz") is not None:
                 band = [cfg["sdr"]["fmin_hz"], cfg["sdr"]["fmax_hz"]]
             self.show_conf = res["show_threshold"]
-            self._set(state="done", progress=1.0, result={
+            self._set(state="done", progress=1.0, changes=check_changes(self.prev["checks"], patch["checks"]),
+                      weights={i: v["weight"] for i, v in patch["checks"].items()}, result={
                 **res, "minutes": round(dur / 60, 2), "candidates": len(boxes),
                 "candidates_per_min": round(len(boxes) / (dur / 60), 1), "per_min": per_min, "band": band},
                 message="Applied.")

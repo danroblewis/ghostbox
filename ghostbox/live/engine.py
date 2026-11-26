@@ -160,6 +160,23 @@ def render_segments(segs, t0, t1, pts, au, mode=0, offset_hz=0.0):
     return (audio * 32767).astype(np.int16)
 
 
+def carrier_line(iq, bw_hz, min_n=4096):
+    """(offset Hz, share) of the strongest line in a 16 kHz narrowband channel: its offset from the
+    centre and its share of the channel's power (within +-3 bins). (None, None) if too short."""
+    n = min(len(iq), 32768)
+    if n < min_n:
+        return None, None
+    S = np.abs(np.fft.fft(iq[-n:] * np.hanning(n))) ** 2
+    f = np.fft.fftfreq(n, 1 / AUDIO_FS)
+    ch = np.abs(f) < bw_hz
+    k = int(np.argmax(np.where(ch, S, 0)))
+    tot = S[ch].sum()
+    if tot <= 0:
+        return None, None
+    idx = np.arange(k - 3, k + 4) % n
+    return float(f[k]), float(S[idx].sum() / tot)
+
+
 def demod(x, fs, f_offset, bw_hz, mode=0):
     """Mix x (complex, at fs) down by f_offset (scalar or per-sample Hz), decimate to 16 kHz.
     mode 0: AM (envelope). +1/-1: upper/lower single sideband (product detector: keep one side,
@@ -213,10 +230,14 @@ class Track:
         self.wavs = []                   # recording files for click-to-play
         self.clips = []                  # playable URLs (saved WAV or in-memory clip)
         self.modes = []                  # per frame: 0 AM, +1 USB, -1 LSB (from stage 1)
+        self.car_off = 0.0               # Hz from the track's frequency to its carrier (when it has one)
+        self.has_carrier = False         # a steady carrier dominates the channel: AM on that carrier
         self.pitch = []                  # per frame: (t, f0_hz, comb strength) at this track's frequency
         self.hop_ref = None              # pitch where the previous hop of this chain ended
 
     def mode(self):
+        if self.has_carrier:             # a carrier says AM, whatever stage 1 guessed
+            return 0
         recent = self.modes[-25:]
         if not recent:
             return 0
@@ -349,6 +370,7 @@ class Engine:
         self.profile = BandProfile(self.root / "live_data" / "profiles" / pkey, len(self.f))
         self.baseline = None
         self.wf_lo = None
+        self.wf_base, self.wf_base_n = None, 0           # power-change view: per-column running average (dB)
         self.analyzed_until = self.n_samples / self.fs
         self.utc0 = self.t_origin
         self._close_iq()
@@ -513,6 +535,22 @@ class Engine:
         self.wf_lo = lo if self.wf_lo is None else 0.9 * self.wf_lo + 0.1 * lo
         q = np.clip((db - self.wf_lo) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
         self._chunk("power", ts, q, cfg)
+        self._chunk("power_change", ts, self._power_change(db, cfg["display"]), cfg)
+
+    def _power_change(self, db, disp):
+        """Power change view: how far each column rises above its own running average, so steady
+        carriers cancel and only what's new shows. The average starts as a plain mean (so it's useful
+        within seconds of a retune) and becomes an exponential average with memory change_tau_s."""
+        if self.wf_base is None or self.wf_base.shape != db.shape[1:]:
+            self.wf_base, self.wf_base_n = db[0].astype(np.float64), 0
+        k_min = 1.0 / max(1.0, float(disp.get("change_tau_s", 30.0)) * self.fr)
+        out = np.empty(db.shape, np.float32)
+        for i in range(len(db)):
+            out[i] = db[i] - self.wf_base
+            self.wf_base_n += 1
+            self.wf_base += max(k_min, 1.0 / self.wf_base_n) * (db[i] - self.wf_base)
+        lo, rng = float(disp.get("change_floor_db", 6.0)), max(1.0, float(disp.get("change_range_db", 24.0)))
+        return np.clip((out - lo) / rng * 255, 0, 255).astype(np.uint8)
 
     def _chunk(self, mode, ts, q, cfg):
         """One waterfall chunk (n rows): sent to clients watching `mode` and kept as history."""
@@ -868,13 +906,29 @@ class Engine:
         if len(x) < 2 * pad + 100:
             return
         t_samp = (s0r + np.arange(len(x))) / self.fs
-        f = tr.freq_at(t_samp)
+        f = tr.freq_at(t_samp) + tr.car_off
         au = cfg["audio"]
-        mode = tr.mode()
-        iq, env = demod(x, self.fs, f, channel_hz(au), mode)
+        iq, env = demod(x, self.fs, f, channel_hz(au), tr.mode())
         cut = int(round((s0 - s0r) / self.fs * AUDIO_FS))
         n = int(round((s1 - s0) / self.fs * AUDIO_FS))
         iq, env = iq[cut:cut + n], env[cut:cut + n]
+        # Carrier: the track's frequency is only known to an analysis bin, and stage 1 sometimes takes
+        # an AM signal for SSB. Either way the carrier lands in the audio as a steady whistle. When a
+        # steady line holds a large share of the channel, demodulate AM centred on it instead.
+        off, share = carrier_line(iq, channel_hz(au))
+        was = tr.has_carrier
+        if share is not None:
+            tr.has_carrier = share >= 0.3 or (was and share >= 0.1)
+        if tr.has_carrier:
+            if off:
+                iq = (iq * np.exp(-2j * np.pi * off * np.arange(len(iq)) / AUDIO_FS)).astype(np.complex64)
+                tr.car_off += off                            # later chunks are mixed down onto it directly
+                if abs(tr.car_off) > channel_hz(au):          # wandered out of the channel: start over
+                    tr.car_off, tr.has_carrier = 0.0, False
+            env = np.abs(iq).astype(np.float32)
+        elif was:
+            tr.car_off = 0.0
+        mode = tr.mode()
         kind = (au.get("demod", "auto"), mode)
         if tr.det_kind != kind:                              # (re)create the detector: setting or AM/SSB changed
             tr.det_kind, tr.det = kind, detector_for(au, mode)

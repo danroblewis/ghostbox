@@ -859,25 +859,44 @@ function buildDetector() {
           return ta; })()),
       el("div", { class: "note" }, `Most confident clips are transcribed first. Done ${ws.done ?? 0}, skipped as stale ${ws.stale ?? 0}, dropped (queue full) ${ws.dropped ?? 0}.`),
       ws.error ? el("div", { class: "err" }, ws.error) : null));
-  for (const stage of [1, 2]) {
-    root.append(el("h2", {}, stage === 1 ? "Whole-band IQ checks" : "Per-detection checks"),
-      el("div", { class: "note", style: "margin-top:-4px" }, stage === 1
-        ? "Every frequency at once, straight from the IQ. Each has a waterfall view; only enabled checks are computed. AM and SSB checks are alternatives: whichever fits a signal better counts."
-        : "Run on each detected candidate."));
-    for (const ch of S.checks.filter(x => x.stage === stage)) {
-      const cc = c.checks[ch.id];
-      const card = el("div", { class: "card" + (cc.enabled ? "" : " off") },
-        el("div", { class: "hd" }, toggle(cc.enabled, v => { patch(setPath(["checks", ch.id, "enabled"], v)); card.classList.toggle("off", !v); }), ch.label,
-          ch.family ? el("span", { class: "tag", title: "Alternative modulation hypothesis" }, ch.family === "dsb" ? "AM" : "SSB")
-            : ch.id === "profile" && S.status.profile ? el("span", { class: "tag" }, `learned ${S.status.profile.learned_min} min`) : null),
-        el("div", { class: "desc" }, ch.desc),
-        slider("Weight", ["checks", ch.id, "weight"], 0, 3, 0.05, v => v.toFixed(2)),
-        ...ch.params.map(p => slider(p.label, ["checks", ch.id, p.key], p.min, p.max, p.step)));
-      if (ch.id === "vad" && S.status.vad === false) card.append(el("div", { class: "err" }, "Silero VAD not available on the server."));
-      root.append(card);
-    }
+  root.append(el("h2", {}, "Checks"),
+    el("div", { class: "note", style: "margin-top:-4px" }, "Each check's weight sets how much it counts; 0 switches it off and it isn't computed at all. Calibration tries every check, including the ones at 0. ▲ marks the weight the last calibration chose."),
+    el("div", { style: "display:flex;gap:8px;margin:6px 0 2px" }, el("button", { class: "btn", onclick: () => {
+      if (!confirm("Put every check's weight back to its default?")) return;
+      patch({ checks: Object.fromEntries(S.checks.map(ch => [ch.id, { weight: ch.default.weight }])) }, 50); buildDetector();
+    } }, "Reset checks to defaults")));
+  for (const g of S.groups) {
+    const list = S.checks.filter(x => x.group === g.id); if (!list.length) continue;
+    root.append(el("h3", { class: "chkgroup" }, g.label, g.note ? el("span", { class: "t3" }, " · " + g.note) : ""));
+    for (const ch of list) root.append(checkRow(ch));
   }
   root.append(el("div", { style: "margin:14px 0 20px" }, el("button", { class: "btn", onclick: async () => { if (confirm("Reset every setting to its default?")) await fetch("/api/reset", { method: "POST" }); } }, "Reset all settings")));
+}
+
+// One row per check: name, ⓘ (tap: what it does), weight slider (0 = off), and ⋯ for its parameters.
+function checkRow(ch) {
+  const cc = S.cfg.checks[ch.id], calW = (TUNE.state.weights || {})[ch.id];
+  const fmtW = v => v > 0 ? v.toFixed(2) : "off";
+  const out = el("output", {}, fmtW(+cc.weight));
+  const inp = el("input", { type: "range", min: 0, max: 3, step: 0.05, value: cc.weight, "aria-label": ch.label + " weight" }); fillRange(inp);
+  const desc = el("div", { class: "desc", hidden: true }, ch.desc);
+  const params = ch.params.length ? el("div", { class: "chkparams", hidden: true }, ...ch.params.map(p => slider(p.label, ["checks", ch.id, p.key], p.min, p.max, p.step))) : null;
+  const tag = ch.family ? el("span", { class: "tag", title: "Alternative modulation hypothesis" }, ch.family === "dsb" ? "AM" : "SSB")
+    : ch.id === "profile" && S.status.profile ? el("span", { class: "tag" }, `${S.status.profile.learned_min} min`) : null;
+  const row = el("div", { class: "chk" + (+cc.weight > 0 ? "" : " off") },
+    el("label", { title: ch.label }, el("span", { class: "nm" }, ch.label), tag),
+    el("button", { class: "ib", title: "What it does", "aria-label": "About " + ch.label, onclick: () => { desc.hidden = !desc.hidden; } }, "ⓘ"),
+    el("span", { class: "wt" }, inp, calW != null ? el("i", { class: "calmark", title: `Calibration chose ${fmtW(calW)}`, style: `left:calc(5px + (100% - 10px) * ${Math.min(1, calW / 3)})` }) : null),
+    out,
+    params ? el("button", { class: "ib", title: "Parameters", "aria-label": ch.label + " parameters", onclick: () => { params.hidden = !params.hidden; } }, "⋯") : el("span"));
+  inp.addEventListener("input", () => {
+    fillRange(inp); const v = +inp.value; out.textContent = fmtW(v); row.classList.toggle("off", v <= 0);
+    patch(setPath(["checks", ch.id, "weight"], v));
+  });
+  const box = el("div", { class: "chkbox" }, row, desc);
+  if (params) box.append(params);
+  if (ch.id === "vad" && S.status.vad === false) box.append(el("div", { class: "err" }, "Silero VAD not available on the server."));
+  return box;
 }
 
 // ---------------- calibration (auto-tune) ----------------
@@ -900,7 +919,12 @@ function tuneCard() {
       el("span", { class: "num", style: `text-align:right;color:${d.on ? "var(--text)" : "var(--text-3)"}` }, d.on ? "× " + d.weight : "off")));
     out.replaceChildren(el("div", {}, `Calibrated on ${r.candidates} candidates, ${r.voice_like} speech-like.`),
       rows.length ? el("details", { style: "margin-top:6px" }, el("summary", {}, "Check settings chosen"), ...rows) : "");
-  } else if (st.state === "quiet" || st.state === "reverted") out.textContent = st.message;
+  } else if (st.state === "quiet" || st.state === "reverted" || st.state === "survey") out.textContent = st.message;
+  if (!running && (st.changes || []).length) {
+    const f = v => v > 0 ? v.toFixed(2) : "off";
+    out.append(el("div", { class: "note", style: "margin:6px 0 0" }, "Checks changed: " + st.changes.map(c => `${c.label} ${f(c.before)} → ${f(c.after)}`).join(" · ")));
+  }
+  const undo = ["done", "quiet", "survey"].includes(st.state) ? el("button", { class: "btn", onclick: async () => { await fetch("/api/autotune/revert", { method: "POST" }); } }, "Undo calibration") : null;
   return el("div", { class: "card", style: "border-top:0;padding-top:0" },
     el("h2", { style: "margin-top:12px" }, "Calibration"),
     el("div", { class: "row wide" }, el("label", { title: "Calibrates after any receiver change, and recalibrates whenever nothing is caught for the time below" }, "Recalibrate automatically"),
@@ -909,7 +933,7 @@ function tuneCard() {
     slider("Max detections per min", ["autotune", "per_min"], 1, 30, 1, v => v + " / min"),
     slider("Voice-likeness floor", ["autotune", "floor"], 0, 0.9, 0.05, v => Math.round(v * 100) + "%"),
     readyBlock(),
-    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go),
+    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go, undo),
     out);
 }
 
@@ -976,10 +1000,17 @@ function onSurvey(m) {
   if (!$("#detector").contains(document.activeElement) && m.state !== "running") buildDetector();
 }
 function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); $("#mapBtn").classList.remove("on"); buildViewList(); }
-function surveyTune(f) {
-  const step = SV.meta ? SV.meta.step_hz : S.cfg.sdr.sample_rate * 0.8;
-  patch({ sdr: { center_hz: Math.round(f), fmin_hz: Math.round(f - step / 2), fmax_hz: Math.round(f + step / 2) } }, 50);
+// Tune here: the server moves the receiver and puts the calibration of the survey step under f live.
+async function surveyTune(f) {
+  const file = SV.file || (SV.meta && SV.meta.file);
   closeSurvey();
+  try {
+    const r = await (await fetch("/api/survey/tune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ f, file: SV.file ? file : null }) })).json();
+    if (r.error) toast(r.error); else if (r.message) toast(r.message);
+  } catch (e) {
+    const step = SV.meta ? SV.meta.step_hz : S.cfg.sdr.sample_rate * 0.8;
+    patch({ sdr: { center_hz: Math.round(f), fmin_hz: Math.round(f - step / 2), fmax_hz: Math.round(f + step / 2) } }, 50);
+  }
 }
 // The survey follows the toolbar: View picks the map, the colour map applies, Min confidence filters the boxes.
 function surveyView() { return SV.meta && SV.meta.views.includes(S.view) ? S.view : "power"; }
@@ -1227,6 +1258,7 @@ function onTune(m) {
   if (FIELD.on && was === "running" && m.state !== "running")
     toast(m.state === "done" && m.result ? `Calibrated on ${m.result.candidates} candidates, ${m.result.voice_like} speech-like` : (m.message || "Calibration finished"));
   if (m.state === "done" && was === "running" && m.result) setMinConf(m.result.show_threshold);
+  if (m.state === "survey" && m.show_threshold != null) setMinConf(m.show_threshold);
   if (!$("#detector").contains(document.activeElement) || m.state !== "running") buildDetector();
 }
 
@@ -1332,6 +1364,10 @@ async function buildSDR() {
     slider("Recordings size", ["record", "max_mb"], 100, 20000, 100, v => (v >= 1000 ? (v / 1000).toFixed(1) + " GB" : v + " MB")),
     slider("Always keep free on disk", ["storage", "min_free_gb"], 1, 100, 1, v => v + " GB"),
     slider("Waterfall history (memory)", ["display", "history_min"], 2, 60, 1, v => v + " min"),
+    el("div", { class: "note" }, "Power change view: each frequency compared with its own recent average, so steady carriers disappear and only what rises above usual shows."),
+    slider("Power change: compare with the last", ["display", "change_tau_s"], 2, 600, 1, v => v >= 60 ? (v / 60).toFixed(1) + " min" : v + " s"),
+    slider("Power change: ignore rises below", ["display", "change_floor_db"], 0, 20, 0.5, v => v + " dB"),
+    slider("Power change: colour range", ["display", "change_range_db"], 5, 60, 1, v => v + " dB"),
     el("div", { class: "note" }, `Rings delete their oldest files when full. Raw IQ is 2 bytes per sample: ${(2 * sdr.sample_rate / 1e6).toFixed(0)} MB/s at the current rate, so ${c.iq_ring.max_gb} GB holds about ${Math.round(c.iq_ring.max_gb * 1e9 / (2 * sdr.sample_rate))} s. If free disk space drops below the limit, the IQ ring is trimmed further and then all writing pauses (detection keeps running).`));
 }
 
@@ -1366,16 +1402,16 @@ function setView(mode) {
 }
 $("#view").addEventListener("change", e => setView(e.target.value));
 
-// Waterfall views: only checks that are enabled are computed, so only those are listed.
+// Waterfall views: checks at weight 0 are not computed, so only those are listed.
 function availableViews() {
   const sv = SV.open && SV.meta ? new Set(SV.meta.views) : null;
-  return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].enabled) || (sv && sv.has(v.id)));
+  return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].weight > 0) || (sv && sv.has(v.id)));
 }
 function buildViewList() {
   const vs = availableViews(), sel = $("#view");
   const opts = [...vs.filter(v => !v.check).map(v => el("option", { value: v.id }, v.label))];
   const checks = vs.filter(v => v.check);
-  if (checks.length) opts.push(el("optgroup", { label: "Detector maps (enabled checks)" }, ...checks.map(v => el("option", { value: v.id }, v.label))));
+  if (checks.length) opts.push(el("optgroup", { label: "Detector maps (checks above 0)" }, ...checks.map(v => el("option", { value: v.id }, v.label))));
   sel.replaceChildren(...opts);
   if (!vs.some(v => v.id === S.view)) { if (S.view !== "power") setView("power"); }
   else sel.value = S.view;
@@ -1416,7 +1452,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello": {
-        S.cfg = m.config; S.checks = m.checks; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
+        S.cfg = m.config; S.checks = m.checks; S.groups = m.check_groups || []; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
         fetch("/api/marks").then(r => r.json()).then(x => { S.marks = x; }).catch(() => {});
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;

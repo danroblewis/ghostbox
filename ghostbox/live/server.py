@@ -16,7 +16,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 import numpy as np
 
-from .config import CHECKS, PRESETS, SENSITIVITY, VIEWS, Config
+from .config import CHECKS, GROUPS, PRESETS, SENSITIVITY, VIEWS, Config
 from .autotune import AutoTune, pick_segments
 from .engine import Engine, iq_cut_wav, render_segments
 from .transcribe import strip_stock
@@ -146,7 +146,7 @@ def make_app(args):
         hub = state["hub"]
         eng = state["engine"]
         await sock.send_str(json.dumps({
-            "type": "hello", "config": config.get(), "checks": CHECKS, "views": VIEWS,
+            "type": "hello", "config": config.get(), "checks": CHECKS, "check_groups": GROUPS, "views": VIEWS,
             "asr_models": [[k, v[2]] for k, v in ASR_MODELS.items()],
             "root": str(ROOT.resolve()),
             "presets": {k: v["label"] for k, v in PRESETS.items()},
@@ -252,6 +252,41 @@ def make_app(args):
         else:
             res = await asyncio.get_running_loop().run_in_executor(None, sv.meta)
         return web.json_response({"state": sv.state, "result": res}, dumps=lambda o: json.dumps(o, default=float))
+
+    async def survey_tune(request):
+        """Tune here from the survey map: move the receiver to f and put the calibration of the survey
+        step containing f live, so the live detector starts where the survey left off."""
+        b = await request.json()
+        f, file = float(b["f"]), b.get("file")
+        if file and not SAFE.match(file):
+            raise web.HTTPNotFound()
+        sv = state["survey"]
+        if sv.running:
+            return web.json_response({"error": "A survey is running."}, status=409)
+        m = await asyncio.get_running_loop().run_in_executor(None, sv.load, file) if file else sv.meta()
+        m = m or {}
+        c = config.get()
+        step_hz = m.get("step_hz") or c["sdr"]["sample_rate"] * 0.8
+        sdr = {"center_hz": round(f), "fmin_hz": round(f - step_hz / 2), "fmax_hz": round(f + step_hz / 2)}
+        st = next((s for s in m.get("steps", []) if s["lo"] <= f < s["hi"]), None)
+        cal = (st or {}).get("calibration")
+        if not cal:
+            apply({"sdr": sdr})
+            return web.json_response({"ok": True, "calibrated": False, "message": (
+                "That step was too quiet to calibrate; detector settings unchanged." if st else "Tuned.")})
+        checks = {k: {"weight": w} for k, w in cal["weights"].items()}
+        if not cal.get("full"):                          # older surveys saved only the checks that were on
+            checks = {**{x["id"]: {"weight": 0.0} for x in CHECKS if x["id"] not in ("vad", "profile")}, **checks}
+        patch = {"sdr": sdr, "checks": checks, **({"detect": cal["detect"]} if cal.get("detect") else {})}
+        n = int(round((st["lo"] - m.get("lo", st["lo"])) / step_hz)) + 1
+        msg = (f"Using the survey's calibration from step {n} ({st['lo'] / 1e6:.3f}–{st['hi'] / 1e6:.3f} MHz: "
+               f"{cal['candidates']} candidates, {cal['voice_like']} speech-like)."
+               + (" Automatic recalibration refines it once enough IQ is recorded here." if c["autotune"]["auto"] else ""))
+        if not state["tune"].use_survey(patch, cal, msg):
+            apply({"sdr": sdr})
+            return web.json_response({"ok": True, "calibrated": False,
+                                      "message": "Calibration is running; tuned without the survey's settings."})
+        return web.json_response({"ok": True, "calibrated": True, "show_threshold": cal["show_threshold"], "message": msg})
 
     async def survey_image(request):
         """One view of a survey as raw uint8 [rows, columns] (meta says the shape)."""
@@ -673,6 +708,7 @@ def make_app(args):
     app.router.add_get("/api/survey", get_survey)
     app.router.add_post("/api/survey", start_survey)
     app.router.add_post("/api/survey/stop", stop_survey)
+    app.router.add_post("/api/survey/tune", survey_tune)
     app.router.add_get("/api/survey/image", survey_image)
     app.router.add_get("/api/survey/preview", survey_preview)
     app.router.add_get("/api/survey/clip", survey_clip)

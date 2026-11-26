@@ -198,7 +198,8 @@ The **?** button in the page shows the same steps.
 5. **Survey a wide range.** Click *Map*, then *New*, enter a range (e.g. 0.5-30 MHz) and a dwell
    per step (1 min), and start. It steps across the range, calibrates and transcribes each step,
    and fills in the map as it goes (with a 4 MHz span, 0.5-30 MHz is 10 steps, about 12 minutes).
-   Zoom with the scroll wheel, click a box for details, and use *Tune here* to listen live.
+   Zoom with the scroll wheel, click a box for details, and use *Tune here* to listen live:
+   the live detector starts with the calibration the survey made for that step.
 6. **Keep what you found.** Detections at least 70% confident (adjustable) are saved to
    `recordings/` automatically; save others from the list before closing. The raw IQ ring is a
    rolling buffer, so download the *IQ WAV* of anything important from its detail window.
@@ -222,7 +223,8 @@ every frame by a set of checks, each giving 0-1:
 - Novelty and prominence: evidence is compared with each bin's running baseline and its
   neighbours, and optionally with a learned per-band profile ("unusual for this band").
 
-The scores are combined as a weighted geometric mean. Candidate bins are linked over time into
+The scores are combined as a weighted geometric mean. A check's weight is its only switch: at 0
+it is off and not computed at all. Candidate bins are linked over time into
 tracks that may slide in frequency or hop to another channel.
 
 **Per-detection checks (stage 2).** Each track is demodulated from the raw IQ along exactly its
@@ -234,7 +236,9 @@ neural voice-activity detector. The result is the detection's confidence.
 
 **Calibration.** There are no labelled "ghost" signals to train on, but the band's background can
 be measured. Calibration replays the last few minutes of recorded IQ through the detector with
-permissive thresholds, keeps every candidate with all its check scores, then searches check-weight
+permissive thresholds (candidates are found with the active checks plus the defaults for any at
+0, so switched-off checks can never leave it with nothing to find), keeps every candidate with
+the scores of every check, including the ones at 0, then searches check-weight
 combinations offline, choosing the one whose top detections the ML voice detector rates most
 speech-like at the target rate (the ML check's own weight is held fixed so it can't vote for
 itself). It sets the weights and thresholds accordingly; on a quiet band that means more sensitive

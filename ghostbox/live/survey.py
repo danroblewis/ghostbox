@@ -26,8 +26,8 @@ import numpy as np
 from scipy.io import wavfile
 
 from . import stage1
-from .autotune import (ENOUGH, SKIP, TUNE_DETECT, analyse_iq, analysis_config, calibrate_boxes,
-                       pick_segments, rescore)
+from .autotune import (ENOUGH, LADDER, SKIP, TUNE_DETECT, analyse_iq, analysis_config, calibrate_boxes,
+                       finding_checks, live_patch, pick_segments, rescore)
 from .config import CHECKS
 
 ROWS = 60                      # time rows per step (the map is wide and short)
@@ -269,7 +269,7 @@ class Survey:
         i, n = job["i"], res["n_steps"]
         tcfg, score_all = analysis_config(cfg0)
         tcfg["sdr"].update(center_hz=job["fc"], sample_rate=job["fs"], fmin_hz=job["lo"], fmax_hz=job["hi"])  # this step's band
-        score_all |= STAGE1_IDS - SKIP - ({"slide"} if not cfg0["checks"]["slide"]["enabled"] else set())
+        score_all |= STAGE1_IDS - SKIP
         boxes = []
         for ladder in (0, 2):                              # loosen once if the step is very quiet
             st = {"lo": job["lo"], "col_hz": (job["hi"] - job["lo"]) / job["per"], "ncols": job["per"],
@@ -287,13 +287,14 @@ class Survey:
                 break
         # calibrate on this step's candidates, then re-evaluate them with the calibrated settings
         cal = None
-        checks = copy.deepcopy(cfg0["checks"])
+        checks = finding_checks(cfg0["checks"])            # what found the candidates
         show = float(cfg0["detect"]["threshold"])
         if len(boxes) >= 5:
             self.state["worker"] = f"calibrating step {i + 1} of {n}"
             cal = calibrate_boxes(boxes, cfg0, job["dur"] / 60, cfg0["autotune"]["per_min"], score_all - SKIP)
             for k, w in cal["weights"].items():
                 checks[k] = {**checks[k], "enabled": w > 0, "weight": w}
+            checks["vad"] = {**checks["vad"], "enabled": True, "weight": cal["vad_weight"]}
             show = cal["show_threshold"]
         t_a = st["t_a"] or 0.0
         sess0 = t_a - 1.0                                  # the replay's timeline starts with the first file
@@ -345,8 +346,11 @@ class Survey:
                 maps["score"] = (np.clip(g, 0, 1) * 255).astype(np.uint8)
         summary = None
         if cal:
+            # everything needed to put this step's calibration live again (Tune here)
+            lp = live_patch(cal, {**TUNE_DETECT, **LADDER[ladder]})
             summary = {"candidates": len(boxes), "voice_like": cal["voice_like"], "kept_checks": bool(cal.get("kept_checks")),
-                       "show_threshold": show, "weights": {k: w for k, w in cal["weights"].items() if w > 0}}
+                       "show_threshold": show, "capture_threshold": cal["capture_threshold"],
+                       "weights": {k: v["weight"] for k, v in lp["checks"].items()}, "detect": lp["detect"], "full": True}
         return {"lo": job["lo"], "hi": job["hi"], "cols": job["per"], "fc": job["fc"], "fs": job["fs"],
                 "iq_files": [Path(p).name for p in job["paths"]], "floor_db": floor, "pow": pw.astype(np.float32),
                 "maps": maps, "tracks": sorted(tracks, key=lambda t: t["t0"]), "calibration": summary,

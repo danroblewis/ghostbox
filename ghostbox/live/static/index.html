@@ -138,6 +138,22 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .card .hd{display:flex;align-items:center;gap:8px;font-weight:600}
 .card .hd .tag{margin-left:auto;font-size:11px;font-weight:400;color:var(--text-3)}
 .card .desc{color:var(--text-2);font-size:12px;margin:3px 0 6px}
+.chkgroup{font-size:12px;font-weight:600;margin:14px 0 2px;color:var(--text-2)}
+.chkgroup .t3{font-weight:400}
+.chkbox{border-top:1px solid var(--line)}
+.chk{display:grid;grid-template-columns:minmax(0,1fr) 26px 120px 40px 26px;align-items:center;gap:6px;min-height:32px}
+.chk>label{white-space:nowrap;overflow:hidden;min-width:0;display:flex;align-items:center;gap:6px}
+.chk>label .nm{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.chk>label .tag{font-size:11px;color:var(--text-3);flex-shrink:0}
+.chk output{font-family:var(--mono);font-size:12px;text-align:right}
+.chk.off>label,.chk.off output{color:var(--text-3)}
+.chk .ib{background:none;border:0;color:var(--text-3);cursor:pointer;font:inherit;padding:4px 0;min-height:28px}
+.chk .ib:hover,.chk .ib:focus-visible{color:var(--text)}
+.chk .wt{position:relative;display:block}
+.chk .wt input{width:100%;display:block}
+.chk .calmark{position:absolute;bottom:-5px;width:0;height:0;margin-left:-4px;border:4px solid transparent;border-bottom:5px solid var(--accent);border-top:0;pointer-events:none}
+.chkbox .desc{color:var(--text-2);font-size:12px;margin:0 0 6px}
+.chkparams{padding:0 0 6px 12px}
 .note{color:var(--text-3);font-size:12px;margin:8px 0}
 #survey{position:absolute;inset:0;z-index:5;background:var(--bg);display:flex;flex-direction:column;padding:10px 14px;gap:6px;overflow:auto}
 .svhead{display:flex;align-items:center;gap:12px;height:30px;flex-wrap:nowrap}
