@@ -5,6 +5,7 @@ fixed order, each optional. They only change what you hear; detection never sees
   notch     steady tones (carrier whistles, hum, data tones) found and removed
   hp / lp   high-pass / low-pass (rumble / hiss)
   nr        noise reduction (spectral gating, the same as live playback)
+  voice     voice shaper: the clip's own pitch period and formant peaks reinforced, hiss between ducked
   presence  speech-presence boost around 2.5 kHz (dB)
   gate      mutes what stays near the noise floor between sounds (dB above it)
   comp      evens out loud and quiet parts (0..1)
@@ -17,6 +18,7 @@ from scipy.ndimage import maximum_filter1d, median_filter, uniform_filter1d
 from scipy.signal import butter, istft, resample_poly, sosfiltfilt, stft
 
 from .audio import StreamingDenoiser
+from .voicefx import VoiceShaper
 
 FS = 16000
 
@@ -27,6 +29,7 @@ FILTERS = [
     ("hp", "High-pass", 250.0, 50.0, 1000.0, 10.0, "Hz"),
     ("lp", "Low-pass", 3200.0, 1000.0, 7000.0, 100.0, "Hz"),
     ("nr", "Noise reduction", 1.0, 0.2, 3.0, 0.1, "x"),
+    ("voice", "Voice shaper (pitch + formants from the clip itself)", 0.6, 0.1, 1.0, 0.05, ""),
     ("presence", "Speech presence boost", 6.0, 1.0, 15.0, 1.0, "dB"),
     ("gate", "Noise gate", 6.0, 0.0, 20.0, 1.0, "dB"),
     ("comp", "Leveller (compressor)", 0.5, 0.1, 0.9, 0.05, ""),
@@ -123,6 +126,8 @@ def apply(y, params):
         y = sosfiltfilt(butter(6, p["lp"], btype="lowpass", fs=FS, output="sos"), y).astype(np.float32)
     if "nr" in p:
         y = StreamingDenoiser(p["nr"], -18.0).process(np.concatenate([y, np.zeros(512, np.float32)]))[512:]
+    if "voice" in p:
+        y = VoiceShaper(p["voice"], p["voice"], 12.0).process(y)
     if "presence" in p:
         y = _peak(y, 2500.0, p["presence"])
     if "gate" in p:

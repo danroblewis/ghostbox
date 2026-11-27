@@ -22,7 +22,8 @@ from scipy.ndimage import maximum_filter1d, uniform_filter1d
 
 from .stage2 import formant_score
 
-PARTS = ("pitch", "formants", "syllables", "together", "coverage")
+PARTS = ("voiced", "pitch", "formants", "syllables", "together", "coverage")
+BAND_PITCH_SHARE = (0.6, 0.3, 0.1)       # how much of a channel's heard pitch each band (low, mid, high) carries
 # (name, low Hz, high Hz, level dB relative to the low band: a speech-like spectral tilt)
 BANDS = [("low", 250.0, 900.0, 0.0), ("mid", 900.0, 1800.0, -4.0), ("high", 1800.0, 3400.0, -9.0)]
 
@@ -158,6 +159,13 @@ def score(M, g=AUDIO, members=()):
                 cors.append(float(np.mean(a.get("envr", a["env"]) * b.get("envr", b["env"]))))
     out["together"] = float(np.clip((np.mean(cors) - 0.15) / 0.45, 0, 1)) if cors else 0.0
     out["coverage"] = len({m["band"] for m in members}) / len(BANDS)
+    # voiced: a channel's demodulated audio repeats at a pitch period (measured on the audio itself, the
+    # strongest sign of a real voice), times the share of that channel's pitch the set plays
+    share = {}
+    for m in members:
+        share[m["ch"]] = share.get(m["ch"], 0.0) + BAND_PITCH_SHARE[m["band"]]
+    out["voiced"] = max((min(1.0, s) * float(next(m.get("voiced", 0.0) for m in members if m["ch"] == ch))
+                         for ch, s in share.items()), default=0.0)
     return out, info
 
 

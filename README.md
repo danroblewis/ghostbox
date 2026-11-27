@@ -260,8 +260,14 @@ play. Each second, the peaks of that confidence (one channel apart) are candidat
 candidate's sound is read straight off the fine IQ spectrum (its sidebands, added). Starting from
 what is already playing, the candidates whose sidebands together score highest are chosen, on a
 moving pitch comb, a second comb on another note, two gliding formants and syllable rhythm. Those
-are demodulated and mixed. One station that has it all plays alone. Candidates are only picked
-and levelled, never shifted or reshaped. The mix is recorded and transcribed in pieces like a
+are demodulated and mixed. One station that has it all plays alone. The strongest candidates are
+also demodulated each hop just to listen: whether their audio repeats at a pitch period (measured
+on the whitened audio below 1 kHz) is the *heard pitch* part, the strongest sign of a real voice.
+Candidates are only picked, band-filtered and levelled, never shifted. The mix then goes through a
+voice shaper (`voicefx.py`, like a speech codec's postfilter), driven only by the mix's own pitch
+and spectral envelope: the pitch period it has is reinforced, its envelope peaks are sharpened like
+formants, and the hiss between voiced stretches is turned down. The same shaper is in the detail
+dialog's filter rack for any clip. The mix is recorded and transcribed in pieces like a
 detection. *Blocked frequencies* (Block button, or shift-drag on the waterfall) are ranges neither
 mode uses.
 
@@ -278,7 +284,8 @@ Common filler phrases that Whisper produces from noise are filtered out.
 ## Repository layout
 
 - `ghostbox/live/` - the live app: `server.py` (web server and API), `engine.py` (pipeline),
-  `stage1.py` / `stage2.py` (checks), `audio.py` (demodulators, playback processing),
+  `stage1.py` / `stage2.py` (checks), `audio.py` (demodulators, playback processing), `compose.py` / `voicefx.py` (composed voice,
+  voice shaper), `afilters.py` (listening filters),
   `autotune.py` (calibration), `audiotune.py` (tune to a detection), `survey.py`, `asr.py` /
   `transcribe.py` (speech recognition), `sources.py` (receivers), `config.py` (settings and
   defaults), `static/` (web page).

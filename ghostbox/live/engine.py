@@ -34,7 +34,7 @@ from scipy.ndimage import maximum_filter1d, uniform_filter1d
 from scipy.signal import butter, firwin, resample_poly, sosfilt, sosfilt_zi, sosfiltfilt
 
 from ..maps import power_frames
-from . import compose, stage1, stage2
+from . import compose, stage1, stage2, voicefx
 from .config import CHECKS
 from .sources import _to_complex, make_source
 from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, VoiceBand, channel_hz, detector_for, fade, render_clip
@@ -207,6 +207,8 @@ def render_mix(meta, ring_segments, au):
             got = True
     if not got:
         return None
+    if any("lo" in c for c in meta.get("components") or []):
+        mix = voicefx.shape(mix, meta.get("compose") or {})
     y = SmoothGain().process(mix if any("lo" in c for c in meta.get("components") or []) else mix / np.sqrt(np.maximum(cover, 1)))
     return (np.clip(y, -1, 1) * 32767).astype(np.int16)
 
@@ -364,6 +366,7 @@ class Engine:
         self.c_fine = collections.deque()           # composing: (frame times, fine power [frames, fine bins]) per hop
         self.channels = {}                          # composing: channel id -> demodulator state of a playing frequency
         self.ckeys, self.kstate = {}, {}            # composing: key id -> key (channel, band); key -> band filter / level
+        self.cshape, self.cvoice = None, {}
         self.cgate, self.cvad = 0.0, []             # composing: mix heard (Min confidence) last hop; recent ML voice
         self.compose_offline = False                # compose in a one-shot replay too (tests / replays)
         self.transcriber = Transcriber(config, emit, on_result=self._on_transcript) if transcribe else None
@@ -1111,6 +1114,7 @@ class Engine:
     def _compose_reset(self):
         self.composer, self.cgain, self.cmix_until, self.channels = compose.Composer(), {}, None, {}
         self.ckeys, self.kstate, self.cgate, self.cvad = {}, {}, 0.0, []
+        self.cshape, self.cvoice = None, {}
         self.c_conf.clear()
         self.c_fine.clear()
 
@@ -1181,7 +1185,7 @@ class Engine:
             A = self._sidebands(Pf, f, g)
             if A is not None:
                 for bi, key in compose.keys_of(A, g, ch_id).items():
-                    keys[f"{ch_id}:{bi}"] = dict(key, f=f)
+                    keys[f"{ch_id}:{bi}"] = dict(key, f=f, voiced=self.cvoice.get(ch_id, 0.0))
         t_c = time.time()
         roles, parts, tot, info = self.composer.choose(keys, tb, cc, g)
         self.timing["compose"] = time.time() - t_c
@@ -1199,8 +1203,23 @@ class Engine:
             if ch_id not in self.channels:
                 self.channels[ch_id] = {"f": self.ckeys[k]["f"], "car_off": 0.0, "has_carrier": False, "det": None,
                                         "hp_zi": None, "gain": SmoothGain(), "den": None, "band": None}
-        chans = sorted({self.ckeys[k]["ch"] for k in sounding})
+        # listen to the strongest candidates too (not heard): whether their audio has a pitch feeds "voiced"
+        probe = int(cc.get("probe", 8))
+        by_conf = sorted(cands, key=lambda c_: -cmean[int(np.argmin(np.abs(self.f - cands[c_])))])[:probe]
+        for ch_id in by_conf:
+            if ch_id not in self.channels:
+                self.channels[ch_id] = {"f": cands[ch_id], "car_off": 0.0, "has_carrier": False, "det": None,
+                                        "hp_zi": None, "gain": SmoothGain(), "den": None, "band": None}
+        chans = sorted({self.ckeys[k]["ch"] for k in sounding} | set(by_conf))
         outs = dict(zip(chans, self.pool.map(lambda c_: self._channel_audio(self.channels[c_], a, n, cfg, band=False), chans)))
+        for c_ in chans:
+            ch = self.channels[c_]
+            ch.setdefault("vo", voicefx.Voicing())
+            ch.setdefault("vh", collections.deque())
+            ch["vh"].append((b, voicefx.voiced_score(ch["vo"].process(outs[c_]))))
+            while ch["vh"] and ch["vh"][0][0] <= b - W:
+                ch["vh"].popleft()
+            self.cvoice[c_] = float(np.mean([v for _, v in ch["vh"]]))
         mix = np.zeros(n, np.float32)
         for k in sounding:                               # crossfade: joining keys rise, leaving ones fall
             key = self.ckeys[k]
@@ -1214,8 +1233,23 @@ class Engine:
             mix += np.linspace(self.cgain.get(k, 0.0), new.get(k, 0.0), n, dtype=np.float32) * yk
         self.cgain = new
         live_ch = {self.ckeys[k]["ch"] for k in new}
-        self.channels = {c_: v for c_, v in self.channels.items() if c_ in live_ch}
+        self.channels = {c_: v for c_, v in self.channels.items() if c_ in live_ch or c_ in by_conf}
+        self.cvoice = {c_: v for c_, v in self.cvoice.items() if c_ in self.channels}
         self.kstate = {k: v for k, v in self.kstate.items() if k in new}
+        # voice shaping (from the mix's own pitch and envelope): harmonics and formants already there
+        # brought out, the hiss between voiced stretches turned down
+        voiced = None
+        if sounding:
+            if self.cshape is None:
+                self.cshape = voicefx.VoiceShaper(cc.get("shape_pitch", 0.6), cc.get("shape_formant", 0.6),
+                                                  cc.get("shape_duck_db", 12.0))
+            else:
+                self.cshape.set(cc.get("shape_pitch", 0.6), cc.get("shape_formant", 0.6), cc.get("shape_duck_db", 12.0))
+            k0 = len(self.cshape.voicing)
+            mix = self.cshape.process(mix)
+            vs = self.cshape.voicing[k0:]
+            self.cshape.voicing = self.cshape.voicing[-50:]
+            voiced = float(np.mean(np.array(vs) > 0.45)) if vs else None
         y = self.clevel.process(mix) if sounding else mix
         self.cmix_until = a + n / AUDIO_FS
         # the set's confidence: structure, blended with what the ML voice detector hears in the actual mix
@@ -1234,6 +1268,7 @@ class Engine:
                    for k, r in roles.items()]
         status = {"type": "compose", "t": round(b, 2), "conf": round(conf, 3), "structure": round(tot, 3),
                   "vad": None if vad is None else round(vad, 3), "heard": bool(gate),
+                  "voiced": None if voiced is None else round(voiced, 2),
                   "parts": {p_: round(v, 3) for p_, v in parts.items()}, "members": members,
                   "channels": len(live_ch), "candidates": len(cands), "keys": len(keys)}
         if roles:

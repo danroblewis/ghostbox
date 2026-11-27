@@ -308,7 +308,7 @@ function draw() {
 // Composed voice: each key (one channel's low / mid / high band) a line at its channel's frequency for as
 // long as it played, labelled with its band and the voice part it gave; the piece's confidence and
 // transcript beside the rightmost one.
-const ROLE = { pitch: ["pitch", "Pitch comb"], formants: ["formant", "Formants (F1/F2)"], syllables: ["rhythm", "Syllable rhythm"],
+const ROLE = { voiced: ["voiced", "Its audio has a pitch"], pitch: ["pitch", "Pitch comb"], formants: ["formant", "Formants (F1/F2)"], syllables: ["rhythm", "Syllable rhythm"],
   together: ["together", "Moves with the other channels"], coverage: ["fills band", "Fills a missing band"], fill: ["fill", "Adds little on its own"],
   texture: ["fill", "Adds little on its own"] };
 const BAND_X = { low: -1, mid: 0, high: 1 };
@@ -887,8 +887,9 @@ function onCompose(m) {
   const p = m.parts || {}, pc = v => Math.round((v || 0) * 100);
   const line = $("#composeLine");
   line.textContent = `${m.heard ? "▶" : "muted"} ${pc(m.conf)}% · ${(m.members || []).length} bands from ${m.channels} of ${m.candidates} channels`
-    + ` · pitch ${pc(p.pitch)} · formants ${pc(p.formants)} · rhythm ${pc(p.syllables)} · together ${pc(p.together)} · bands ${pc(p.coverage)}`
-    + (m.vad != null ? ` · ML voice ${pc(m.vad)}` : "");
+    + ` · voiced ${pc(p.voiced)} · pitch ${pc(p.pitch)} · formants ${pc(p.formants)} · rhythm ${pc(p.syllables)} · together ${pc(p.together)} · bands ${pc(p.coverage)}`
+    + (m.vad != null ? ` · ML voice ${pc(m.vad)}` : "")
+    + (m.voiced != null ? ` · mix voiced ${pc(m.voiced)}` : "");
   line.classList.toggle("muted", !m.heard);
   line.title = `The chosen set's confidence ${pc(m.conf)}% (structure ${pc(m.structure)}% blended with the ML voice detector on the mix). `
     + (m.heard ? "At or above Min confidence: heard." : "Below Min confidence: silent.")
@@ -915,12 +916,18 @@ function composeCard() {
         slider("Candidates at least apart", ["compose", "min_sep_hz"], 2000, 30000, 500, v => (v / 1e3) + " kHz"),
         slider("Cost per extra band", ["compose", "cost"], 0, 0.1, 0.005, v => v.toFixed(3)),
         el("h3", { class: "sub" }, "What a voice needs (scored on the layered bands)"),
-        slider("Pitch comb", ["compose", "w_pitch"], 0, 2, 0.1, v => v.toFixed(1)),
+        slider("Heard pitch (demodulated audio repeats at a pitch period)", ["compose", "w_voiced"], 0, 3, 0.1, v => v.toFixed(1)),
+        slider("Channels listened to each hop", ["compose", "probe"], 0, 16, 1),
+        slider("Pitch comb (in the IQ spectrum)", ["compose", "w_pitch"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Formants", ["compose", "w_formants"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Syllable rhythm", ["compose", "w_syllables"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Channels moving together", ["compose", "w_together"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("Low, mid and high all present", ["compose", "w_coverage"], 0, 2, 0.1, v => v.toFixed(1)),
         slider("ML voice detector's share of confidence", ["compose", "vad_weight"], 0, 1, 0.05, pct),
+        el("h3", { class: "sub" }, "Voice shaping (from the mix's own pitch and envelope)"),
+        slider("Reinforce the pitch it has", ["compose", "shape_pitch"], 0, 1, 0.05, pct),
+        slider("Sharpen the formants it has", ["compose", "shape_formant"], 0, 1, 0.05, pct),
+        slider("Turn down hiss between voiced sounds", ["compose", "shape_duck_db"], 0, 30, 1, v => v + " dB"),
         el("h3", { class: "sub" }, "Recording"),
         slider("Cut pieces after", ["compose", "segment_s"], 3, 60, 1, v => v + " s"),
         slider("Overlap with the piece before", ["compose", "overlap_s"], 0, 2, 0.1, v => v.toFixed(1) + " s"),

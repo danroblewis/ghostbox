@@ -169,8 +169,12 @@ DEFAULT = {
                 "candidate_floor": 0.15, "min_conf": 0.3, "vad_weight": 0.5,
                 "candidates": 24, "min_sep_hz": 7000,
                 "max_components": 6, "min_channels": 2, "window_s": 3.0, "hold_s": 2.0,
+                "w_voiced": 1.5, "probe": 8,     # the top `probe` candidates demodulated each hop to hear their pitch
                 "w_pitch": 1.0, "w_formants": 1.0, "w_syllables": 1.0, "w_together": 1.0, "w_coverage": 0.5,
                 "cost": 0.01,                    # score each extra key must earn
+                # voice shaping of the mix, from its own pitch and envelope (voicefx): period reinforced,
+                # envelope peaks sharpened, hiss between voiced stretches turned down (0 = off each)
+                "shape_pitch": 0.6, "shape_formant": 0.6, "shape_duck_db": 12.0,
                 "segment_s": 8.0,                # the mix is recorded and transcribed in pieces at most this long,
                 "overlap_s": 0.5},               # each starting with this much of the piece before
     # Frequency ranges neither mode uses (known stations, carriers): [{"lo": Hz, "hi": Hz, "label": ""}]
