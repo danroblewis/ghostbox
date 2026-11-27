@@ -120,7 +120,7 @@ def make_app(args):
                       "fmin": getattr(eng, "f_lo", 0), "fmax": getattr(eng, "f_hi", 0),
                       "frame_rate": getattr(eng, "fr", 25)},
         }, default=float))
-        hub.clients[q] = {"pipe"}
+        hub.clients[q] = {"pipe", "power"}         # the view shown, and the raw one (under a mask overlay)
 
         async def writer():
             while True:
@@ -138,7 +138,7 @@ def make_app(args):
                     except ValueError:
                         continue
                     if m.get("type") == "view" and valid_view(m.get("mode")):
-                        hub.clients[q] = {m["mode"]}
+                        hub.clients[q] = {m["mode"], "power"}
         finally:
             hub.clients.pop(q, None)
             wt.cancel()

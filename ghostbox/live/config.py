@@ -24,8 +24,6 @@ DEFAULT = {
     },
     "analysis": {"bin_hz": 125, "frame_rate": 25, "hop_s": 1.0,
                  "settle_s": 1.5},              # how far behind live the waterfall is shown (s)
-    # Frequency ranges marked on the waterfall (known stations, steady lines): [{"lo": Hz, "hi": Hz, "label": ""}]
-    "blocked": [],
     # The pipeline (pipeline.py): steps in order, [{"type", "on", "params"}]: radio steps (IQ in, IQ out),
     # then the sum of everything into sound, then audio steps. Types: pipeline.STEPS.
     "pipeline": [],
@@ -92,6 +90,25 @@ def hackrf_gains(gain_db):
     return lna, vga
 
 
+def migrate(cfg):
+    """Older saved configs: a Band-pass with one centre/width becomes a list of ranges; blocked
+    frequencies become the ranges of a Band-stop step (they now remove those ranges from the sound)."""
+    steps = cfg.setdefault("pipeline", [])
+    for st in steps:
+        p = st.get("params") or {}
+        if st.get("type") == "bandpass" and "ranges" not in p and p.get("center_hz"):
+            c, w = float(p["center_hz"]), float(p.get("width_hz") or 6000)
+            st["params"] = {"ranges": [{"lo": round(c - w / 2), "hi": round(c + w / 2)}],
+                            "edge_hz": p.get("edge_hz", 300), "click_width_hz": w}
+    blocked = [r for r in cfg.pop("blocked", None) or [] if isinstance(r, dict) and "lo" in r and "hi" in r]
+    if blocked and not any(st.get("type") == "bandstop" for st in steps):
+        n = sum(1 for st in steps if st.get("type") in ("flatten", "bandpass", "bandstop"))
+        steps.insert(n, {"type": "bandstop", "on": True, "params": {
+            "ranges": [{"lo": r["lo"], "hi": r["hi"], **({"label": r["label"]} if r.get("label") else {})} for r in blocked],
+            "edge_hz": 300, "click_width_hz": 6000}})
+    return cfg
+
+
 def prune_to(defaults, cfg):
     """Drop keys cfg has that defaults doesn't (recursively, where the default is a non-empty dict)."""
     for k in [k for k in cfg if k not in defaults]:
@@ -123,6 +140,7 @@ class Config:
                 deep_merge(self._cfg, json.loads(self.path.read_text()))
             except Exception:
                 pass
+        migrate(self._cfg)
         prune_to(DEFAULT, self._cfg)
         self.version = 0
 

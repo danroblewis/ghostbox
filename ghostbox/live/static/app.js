@@ -31,7 +31,9 @@ const S = {
   cfg: null, presets: {}, views: [], status: {},
   epoch: 0, fmin: 0, fmax: 1, fr: 25, hop: 1, lag: 2.75,
   offsets: [], offset: null,
-  view: lsGet("gb_view", "pipe"), chunks: new Map(),   // t0 key -> chunk (current view)
+  view: lsGet("gb_view", "pipe"), chunks: new Map(),
+  raw: new Map(),                                       // t0 key -> chunk of the raw waterfall (shown under a mask)
+  masks: null, maskShow: null,                          // the radio steps' masks; which one is shown (step index, "all")   // t0 key -> chunk (current view)
   recs: [],
   delay: +lsGet("gb_delay", 4), pps: +lsGet("gb_pps", 25),
   follow: true, viewTop: 0,
@@ -108,13 +110,13 @@ function paintChunk(c) {
 // repainted lazily while drawing (a few per frame), so continuous auto-scaling stays cheap.
 S.lutVer = 0; S.autoScale = lsGet("gb_autoscale", "1") === "1"; S.visible = [];
 function addChunk(m) {
-  if ((m.mode || "power") !== S.view) return;
-  const key = m.t0.toFixed(3);
-  if (S.chunks.has(key)) return;
-  const c = { t0: m.t0, dt: m.dt, n: m.n, w: m.w, fmin: m.fmin, fmax: m.fmax, vals: b64bytes(m.rows), view: m.mode || "power" };
+  const mode = m.mode || "power", key = m.t0.toFixed(3);
+  const maps = [mode === S.view ? S.chunks : null, mode === "power" ? S.raw : null].filter(Boolean);
+  if (!maps.length || maps.every(mp => mp.has(key))) return;
+  const c = { t0: m.t0, dt: m.dt, n: m.n, w: m.w, fmin: m.fmin, fmax: m.fmax, vals: b64bytes(m.rows), view: mode };
   c.cv = document.createElement("canvas"); c.cv.width = c.w; c.cv.height = c.n; c.ctx = c.cv.getContext("2d");
   paintChunk(c); c.ver = S.lutVer; c.fresh = nowS();
-  S.chunks.set(key, c);
+  for (const mp of maps) mp.set(key, c);
 }
 function repaintAll() { LUT = makeLUT(); S.lutVer++; }
 function autoScale() {                                     // follow what's on screen: noise floor (20th pct) .. peaks (99.8th)
@@ -132,13 +134,14 @@ function autoScale() {                                     // follow what's on s
 setInterval(autoScale, 400);
 function evictChunks(top) {
   const keepFrom = top - 15 * 60, keepTo = top + 120;
-  for (const [k, c] of S.chunks) if (c.t0 < keepFrom || c.t0 > keepTo) S.chunks.delete(k);
+  for (const mp of [S.chunks, S.raw]) for (const [k, c] of mp) if (c.t0 < keepFrom || c.t0 > keepTo) mp.delete(k);
 }
 let histBusy = false, histTimer = null;
 async function fetchHistory(t0, t1) {
   if (histBusy) return; histBusy = true;
   try {
-    const r = await (await fetch(`/api/history?view=${encodeURIComponent(S.view)}&t0=${t0}&t1=${t1}`)).json();
+    const views = [...new Set([S.view, "power"])].join(",");    // the view shown and the raw one (under a mask)
+    const r = await (await fetch(`/api/history?views=${views}&t0=${t0}&t1=${t1}`)).json();
     for (const c of r.chunks) addChunk(c);
   } catch (e) {} finally { histBusy = false; if (S.fadeFrom && S.fadeStart == null) S.fadeStart = performance.now(); }
 }
@@ -199,7 +202,8 @@ function draw() {
     if (k >= 1) { S.fadeFrom = null; S.fadeStart = null; S.fadeWait = null; }
     else { ctx.globalAlpha = k; ctx.fillStyle = TH.bg; }
   }
-  for (const c of S.chunks.values()) {
+  const masking = S.maskShow != null && S.masks;
+  for (const c of (masking ? S.raw : S.chunks).values()) {
     const tEnd = c.t0 + c.n * c.dt;
     if (tEnd < top - span || c.t0 > top) continue;
     S.visible.push(c);
@@ -208,8 +212,8 @@ function draw() {
     ctx.drawImage(c.cv, x0, (top - tEnd) * pps, x1 - x0, c.n * c.dt * pps + 0.6);
   }
   ctx.globalAlpha = 1;
-  drawBlocked(H, dpr);
-  drawBands(H, dpr);
+  if (masking) drawMask(H, dpr);
+  drawRanges(H, dpr);
   // grid: clock times on the left, frequency across the top
   ctx.font = `${11 * dpr}px ${TH.mono}`;
   ctx.strokeStyle = TH.grid; ctx.fillStyle = TH.text; ctx.lineWidth = 1;
@@ -252,41 +256,99 @@ function draw() {
   if (Math.random() < 0.01) evictChunks(top);
   updateRowProgress();
 }
-// each band-pass step's range: outlined down the waterfall, labelled at the top
-function drawBands(H, dpr) {
-  for (const it of (S.cfg && S.cfg.pipeline) || []) {
-    if (it.type !== "bandpass" || it.on === false) continue;
-    const c = (it.params || {}).center_hz, w = (it.params || {}).width_hz ?? 6000; if (!c) continue;
-    const xa = xOf(c - w / 2), xb = xOf(c + w / 2); if (xb < 0 || xa > cv.width) continue;
-    ctx.save(); ctx.strokeStyle = TH.mark; ctx.globalAlpha = 0.85; ctx.lineWidth = dpr; ctx.setLineDash([3 * dpr, 3 * dpr]);
-    for (const x of xb - xa < 3 * dpr ? [(xa + xb) / 2] : [xa, xb]) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
-    ctx.setLineDash([]); ctx.font = `${11 * dpr}px ${TH.sans}`; ctx.fillStyle = TH.mark; ctx.globalAlpha = 1;
-    ctx.fillText(`Band-pass ${fmtF(c)}`, Math.min(cv.width - 150 * dpr, xb + 4 * dpr), 58 * dpr);
-    ctx.restore();
+// A step's mask, like a sprite's alpha mask: white = kept, black = removed, grey = partly (soft edges,
+// Flatten's cuts), drawn over the whole waterfall while its step is hovered. Gains above 1 (Flatten's
+// boosts) are white too.
+function maskCanvas() {
+  const m = S.masks, key = S.maskShow + "|" + m.ver;
+  if (S.maskCv && S.maskCv.key === key) return S.maskCv;
+  const code = S.maskShow === "all" ? m.all : m.steps[String(S.maskShow)]; if (!code) return null;
+  const v = b64bytes(code), cv1 = document.createElement("canvas"); cv1.width = v.length; cv1.height = 1;
+  const c1 = cv1.getContext("2d"), img = c1.createImageData(v.length, 1);
+  for (let i = 0; i < v.length; i++) {
+    const g = Math.min(1, Math.pow(10, (v[i] / 255 * 80 - 60) / 20)), o = i * 4;   // amplitude gain, 0..1
+    img.data[o] = img.data[o + 1] = img.data[o + 2] = Math.round(255 * g); img.data[o + 3] = 255;
   }
+  c1.putImageData(img, 0, 0); cv1.key = key; S.maskCv = cv1;
+  return cv1;
 }
-function drawBlocked(H, dpr) {
-  BLK.rects = [];
-  const ranges = [...((S.cfg && S.cfg.blocked) || [])];
-  if (BLK.drag) ranges.push({ lo: Math.min(BLK.drag.f0, BLK.drag.f1), hi: Math.max(BLK.drag.f0, BLK.drag.f1), label: "Block…", live: true });
-  for (const r of ranges) {
-    const x0 = Math.max(0, xOf(r.lo)), x1 = Math.min(cv.width, xOf(r.hi));
-    if (x1 < 0 || x0 > cv.width) continue;
+function drawMask(H, dpr) {
+  const m = S.masks, mc = maskCanvas(); if (!mc) return;
+  ctx.save(); ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mc, xOf(m.fmin), 0, xOf(m.fmax) - xOf(m.fmin), H);
+  const items = S.cfg.pipeline || [], it = S.maskShow === "all" ? null : items[S.maskShow];
+  // a band-pass whose centre is outside the span keeps nothing here: say so, or an all-dark mask is a mystery
+  const away = (S.maskShow === "all" ? items.filter(x => x.on !== false) : it ? [it] : []).filter(x => x.type === "bandpass"
+    && x.params && x.params.center_hz && (x.params.center_hz < m.fmin || x.params.center_hz > m.fmax));
+  const txt = (S.maskShow === "all" ? "Mask: every radio step together (what reaches SUM)" : `Mask: ${it ? stepType(it.type).label : ""}`)
+    + (it && it.on === false ? " (switched off)" : "") + " · white = kept, black = removed"
+    + (away.length ? ` · the band-pass at ${fmtF(away[0].params.center_hz)} is outside this span, so it removes everything` : "");
+  ctx.font = `${12 * dpr}px ${TH.sans}`; const tw = ctx.measureText(txt).width, ty = H - 46 * dpr;
+  ctx.globalAlpha = 0.92; ctx.fillStyle = TH.bg; ctx.fillRect(8 * dpr, ty - 14 * dpr, tw + 12 * dpr, 20 * dpr);
+  ctx.globalAlpha = 1; ctx.fillStyle = TH.text; ctx.fillText(txt, 14 * dpr, ty);
+  ctx.restore();
+}
+function onMasks(m) { S.masks = { ...m, ver: (S.masks ? S.masks.ver : 0) + 1 }; }
+const showMask = which => { S.maskShow = which; };
+
+// Every range of every Band-pass / Band-stop step on the waterfall: a band-pass range outlined
+// (dashed), a band-stop range hatched; each with a label whose ✕ removes it. A step that's switched
+// off is drawn faint. While dragging, the range being made is drawn too.
+const RNG = { target: null, drag: null, rects: [] };     // target: step index that a drag / click adds to
+function drawRanges(H, dpr) {
+  RNG.rects = [];
+  const items = (S.cfg && S.cfg.pipeline) || [], list = [];
+  items.forEach((it, i) => { if (it.type === "bandpass" || it.type === "bandstop") (it.params.ranges || []).forEach((r, j) => list.push({ ...r, i, j, stop: it.type === "bandstop", off: it.on === false })); });
+  if (RNG.drag) { const t = items[RNG.drag.i]; list.push({ lo: Math.min(RNG.drag.f0, RNG.drag.f1), hi: Math.max(RNG.drag.f0, RNG.drag.f1), live: true, stop: t ? t.type === "bandstop" : true }); }
+  ctx.save(); ctx.font = `${11 * dpr}px ${TH.sans}`;
+  for (const r of list) {
+    const x0 = Math.max(0, xOf(r.lo)), x1 = Math.min(cv.width, xOf(r.hi)); if (x1 < 0 || x0 > cv.width) continue;
     const w = Math.max(2 * dpr, x1 - x0);
-    ctx.save();
-    ctx.globalAlpha = r.live ? 0.35 : 0.6; ctx.fillStyle = TH.bg; ctx.fillRect(x0, 0, w, H);
-    ctx.beginPath(); ctx.rect(x0, 0, w, H); ctx.clip();
-    ctx.globalAlpha = 0.25; ctx.strokeStyle = TH.text; ctx.lineWidth = dpr;
-    for (let x = x0 - H; x < x0 + w; x += 10 * dpr) { ctx.beginPath(); ctx.moveTo(x, H); ctx.lineTo(x + H, 0); ctx.stroke(); }
+    ctx.save(); ctx.globalAlpha = r.off ? 0.35 : 1;
+    if (r.stop) {                                          // hatched: removed
+      ctx.globalAlpha *= r.live ? 0.4 : 0.6; ctx.fillStyle = TH.bg; ctx.fillRect(x0, 0, w, H);
+      ctx.beginPath(); ctx.rect(x0, 0, w, H); ctx.clip(); ctx.globalAlpha = (r.off ? 0.35 : 1) * 0.3; ctx.strokeStyle = TH.text; ctx.lineWidth = dpr;
+      for (let x = x0 - H; x < x0 + w; x += 10 * dpr) { ctx.beginPath(); ctx.moveTo(x, H); ctx.lineTo(x + H, 0); ctx.stroke(); }
+    } else {                                               // outlined: kept
+      ctx.strokeStyle = TH.mark; ctx.lineWidth = dpr; ctx.setLineDash([3 * dpr, 3 * dpr]);
+      for (const x of w < 3 * dpr ? [x0 + w / 2] : [x0, x0 + w]) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+    }
     ctx.restore();
-    ctx.save(); ctx.font = `${11 * dpr}px ${TH.sans}`;
-    const txt = (r.label || "blocked") + (r.live ? "" : "  ✕"), tw = ctx.measureText(txt).width;
-    let ly = 20;                                         // stagger labels of neighbouring ranges so each ✕ is clickable
-    while (BLK.rects.some(([a, b, c]) => b === ly && x0 / dpr < c + 4 && (x0 + tw + 7 * dpr) / dpr > a)) ly += 17;
-    ctx.globalAlpha = 0.85; ctx.fillStyle = TH.bg; ctx.fillRect(x0 + 1 * dpr, ly * dpr, tw + 6 * dpr, 15 * dpr);
-    ctx.globalAlpha = 1; ctx.fillStyle = TH.text; ctx.fillText(txt, x0 + 4 * dpr, (ly + 11) * dpr); ctx.restore();
-    BLK.rects.push([(x0 + 1 * dpr) / dpr, ly, (x0 + tw + 7 * dpr) / dpr, ly + 15, r.live ? null : r]);
+    const txt = (r.stop ? "Band-stop" : "Band-pass") + (r.live ? "…" : (r.off ? " (off)" : "") + "  ✕"), tw = ctx.measureText(txt).width;
+    let ly = 20;                                           // stagger neighbouring labels so each ✕ is clickable
+    while (RNG.rects.some(([a, b, c]) => b === ly && x0 / dpr < c + 4 && (x0 + tw + 7 * dpr) / dpr > a)) ly += 17;
+    ctx.globalAlpha = 0.88; ctx.fillStyle = TH.bg; ctx.fillRect(x0 + dpr, ly * dpr, tw + 6 * dpr, 15 * dpr);
+    ctx.globalAlpha = r.off ? 0.5 : 1; ctx.fillStyle = r.stop ? TH.text : TH.mark; ctx.fillText(txt, x0 + 4 * dpr, (ly + 11) * dpr);
+    if (!r.live) RNG.rects.push([(x0 + dpr) / dpr, ly, (x0 + tw + 7 * dpr) / dpr, ly + 15, r.i, r.j]);
   }
+  ctx.restore();
+}
+const rangeLabelAt = (x, y) => RNG.rects.find(([a, b, c, d]) => x >= a && x <= c && y >= b && y <= d);
+function removeRange(i, j) {
+  const items = pipeItems(), it = items[i]; if (!it) return;
+  it.params.ranges = (it.params.ranges || []).filter((_, k) => k !== j);
+  savePipe(items, 50); S.cfg.pipeline = items; buildPipe(); buildChain();
+}
+function addRange(i, lo, hi) {
+  const items = pipeItems(), it = items[i]; if (!it) return;
+  it.params.ranges = [...(it.params.ranges || []), { lo: Math.round(lo), hi: Math.round(hi) }];
+  savePipe(items, 50); S.cfg.pipeline = items; buildPipe(); buildChain();
+  toast(`${stepType(it.type).label}: ${fmtFshort(lo)} – ${fmtFshort(hi)}`);
+}
+// the step a shift-drag or the Band-stop button adds to: the first Band-stop, made at the end of the radio steps if there is none
+function bandStopIndex() {
+  const items = pipeItems(); let i = items.findIndex(x => x.type === "bandstop");
+  if (i < 0) {
+    const t = stepType("bandstop"); i = items.filter(x => stepType(x.type).domain === "radio").length;
+    items.splice(i, 0, { type: "bandstop", on: true, params: { ...t.default, ranges: [] } });
+    savePipe(items, 50); S.cfg.pipeline = items;
+  }
+  return i;
+}
+function setRangeTarget(i) {
+  RNG.target = i; $("#blockBtn").classList.toggle("on", i != null && (S.cfg.pipeline[i] || {}).type === "bandstop");
+  if (i != null) toast(`Drag across the waterfall (or click) to add a range to ${stepType(S.cfg.pipeline[i].type).label}.`);
+  buildPipe();
 }
 function niceStep(x) { const p = Math.pow(10, Math.floor(Math.log10(x))); const m = x / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
 
@@ -310,23 +372,26 @@ function updateNav() {
   $("#followBtn").style.display = S.follow ? "none" : "inline-flex";
   $("#liveBtn").style.display = S.paused || S.delay > Math.max(8, +lsGet("gb_delay", 4) + 2) ? "inline-flex" : "none";
 }
-const BLK = { mode: false, drag: null, rects: [] };
-function blockLabelAt(x, y) { return BLK.rects.find(([a, b, c, d, r]) => r && x >= a && x <= c && y >= b && y <= d); }
-function unblock(r) {
-  patch({ blocked: (S.cfg.blocked || []).filter(x => !(x.lo === r.lo && x.hi === r.hi)) }, 50); buildGeneral();
-}
 const fAtX = (x, r) => S.fmin + x / r.width * (S.fmax - S.fmin);
 cv.addEventListener("mousedown", e => {
   const [x, y, r] = canvasPos(e);
-  if (e.shiftKey || BLK.mode) { BLK.drag = { f0: fAtX(x, r), f1: fAtX(x, r) }; e.preventDefault(); return; }
+  if (rangeLabelAt(x, y)) { downAt = [x, y]; return; }    // (a ✕ label: handled on release)
+  if (e.shiftKey || RNG.target != null) {                // make a range: drag across, or click for one of the default width
+    const i = RNG.target != null ? RNG.target : bandStopIndex();
+    RNG.drag = { i, f0: fAtX(x, r), f1: fAtX(x, r), x0: x }; e.preventDefault(); return;
+  }
   if (Math.abs(y - playLineY()) < 7) { dragging = true; dragTop = topTime(); e.preventDefault(); return; }
   downAt = [x, y];
 });
 window.addEventListener("mouseup", e => {
-  if (BLK.drag) {
-    const d = BLK.drag; BLK.drag = null;
-    addBlock(Math.min(d.f0, d.f1), Math.max(d.f0, d.f1));
-    if (BLK.mode) setBlockMode(false);
+  if (RNG.drag) {
+    const d = RNG.drag; RNG.drag = null;
+    const [x] = canvasPos(e), it = (S.cfg.pipeline || [])[d.i];
+    if (it) {
+      if (Math.abs(x - d.x0) < 4) { const w = (it.params || {}).click_width_hz || 6000; addRange(d.i, d.f0 - w / 2, d.f0 + w / 2); }
+      else addRange(d.i, Math.min(d.f0, d.f1), Math.max(d.f0, d.f1));
+    }
+    setRangeTarget(null);
     return;
   }
   if (dragging) {
@@ -337,20 +402,16 @@ window.addEventListener("mouseup", e => {
   if (!downAt) return;
   const [x, y] = canvasPos(e); const moved = Math.hypot(x - downAt[0], y - downAt[1]); downAt = null;
   if (moved > 4) return;
-  const bl = blockLabelAt(x, y); if (bl) { unblock(bl[4]); return; }
-  if (S.pick) {                                            // picking a step's frequency
-    const items = pipeItems(), it = items[S.pick.i];
-    if (it) { it.params[S.pick.key] = Math.round(fAtX(x, canvasPos(e)[2])); savePipe(items, 50); toast(`${stepType(it.type).label} at ${fmtF(it.params[S.pick.key])}`); }
-    S.pick = null; buildPipe(); return;
-  }
+  const rl = rangeLabelAt(x, y); if (rl) { removeRange(rl[4], rl[5]); return; }
   const top = topTime(); if (top === null) return;          // empty spot: play from here
   setPlayhead(top - y / S.pps, y / S.pps); restartPlayback();
 });
 cv.addEventListener("mousemove", e => {
+  if (S.maskShow != null) S.maskShow = null;                // (the hover that showed it may have missed its "leave")
   const [x, y, r] = canvasPos(e); const top = topTime(); if (top === null) return;
   if (dragging) { setPlayhead(dragTop - y / S.pps, y / S.pps); return; }
-  if (BLK.drag) { BLK.drag.f1 = fAtX(x, r); }
-  if (S.pick) cv.style.cursor = "copy"; else if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else if (blockLabelAt(x, y)) cv.style.cursor = "pointer"; else
+  if (RNG.drag) { RNG.drag.f1 = fAtX(x, r); }
+  if (rangeLabelAt(x, y)) cv.style.cursor = "pointer"; else if (RNG.target != null || e.shiftKey || RNG.drag) cv.style.cursor = "col-resize"; else
   cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : "crosshair";
   const f = S.fmin + x / r.width * (S.fmax - S.fmin), tip = $("#tip");
   tip.style.display = "block"; tip.style.left = Math.min(x + 14, r.width - 170) + "px"; tip.style.top = (y + 14) + "px";
@@ -670,9 +731,13 @@ function buildChain() {
   const chip = (label, cls, title, onclick) => el("button", { class: "chip " + cls, title, onclick }, label);
   const sep = () => el("span", { class: "chipsep" }, "›");
   parts.push(chip("Raw IQ", S.view === "power" ? "on" : "", "The receiver's IQ, untouched: click to see it on the waterfall", () => setView("power")));
-  const step = it => { const t = stepType(it.type); parts.push(sep(), chip(t.label, it.on === false ? "off" : "", t.desc, () => { if (t.domain === "radio") setView("pipe"); openPipe(); })); };
+  const hover = (c, which) => { c.addEventListener("mouseenter", () => showMask(which)); c.addEventListener("mouseleave", () => showMask(null)); return c; };
+  const step = it => {
+    const t = stepType(it.type), c = chip(t.label, it.on === false ? "off" : "", t.desc + (t.domain === "radio" ? "\n(Hover: its mask on the waterfall)" : ""), () => { if (t.domain === "radio") setView("pipe"); openPipe(); });
+    parts.push(sep(), t.domain === "radio" ? hover(c, items.indexOf(it)) : c);
+  };
   items.filter(it => stepType(it.type).domain === "radio").forEach(step);
-  parts.push(sep(), chip("SUM", "sum" + (S.view === "pipe" ? " on" : ""), "The power of everything left in the band, 16,000 times a second: the sound. The waterfall shows what goes into it.", () => setView("pipe")));
+  parts.push(sep(), hover(chip("SUM", "sum" + (S.view === "pipe" ? " on" : ""), "The power of everything left in the band, 16,000 times a second: the sound. The waterfall shows what goes into it.\n(Hover: every radio step's mask together)", () => setView("pipe")), "all"));
   items.filter(it => stepType(it.type).domain === "audio").forEach(step);
   parts.push(sep(), el("span", { class: "t3", style: "font-size:12px;flex:none" }, "level › speaker"));
   box.replaceChildren(...parts);
@@ -690,19 +755,21 @@ function buildPipe() {
     const desc = el("div", { class: "desc", hidden: true }, t.desc);
     const sliders = t.params.map(p => {
       const v = it.params[p.key] ?? t.default[p.key];
-      if (p.kind === "freq") {                             // an absolute frequency: type it in MHz, or pick it on the waterfall
-        const inp = el("input", { class: "field", type: "number", step: "0.0001", value: (v / 1e6).toFixed(4), style: "width:110px" });
-        inp.addEventListener("change", () => { it.params[p.key] = Math.round(+inp.value * 1e6); save(50, false); });
-        const pick = el("button", { class: "btn" + (S.pick && S.pick.i === i ? " on" : ""), title: "Then click the waterfall at the frequency you want",
-          onclick: () => { S.pick = { i, key: p.key }; pick.classList.add("on"); toast("Click the waterfall at the frequency you want."); } }, "Pick on waterfall");
-        return el("div", { class: "row wide" }, el("label", {}, p.label), el("span", { style: "display:flex;gap:6px;align-items:center;justify-content:flex-end" }, inp, el("span", { class: "t3" }, "MHz"), pick));
+      if (p.kind === "ranges") {                           // a list of ranges: each with ×, and a button to add one on the waterfall
+        const rs = it.params.ranges || [];
+        const rows = rs.map((r, j) => el("div", { class: "prange" }, el("span", { class: "num" }, `${fmtF(r.lo)} – ${fmtF(r.hi)}`),
+          el("span", { class: "t3 num" }, `${((r.hi - r.lo) / 1e3).toFixed(1)} kHz`),
+          el("button", { class: "ib", title: "Remove this range", onclick: () => { rs.splice(j, 1); save(50, true); } }, "×")));
+        const add = el("button", { class: "btn" + (RNG.target === i ? " on" : ""), onclick: () => setRangeTarget(RNG.target === i ? null : i) },
+          RNG.target === i ? "Drag on the waterfall… (click to cancel)" : "+ Add a range on the waterfall");
+        return el("div", {}, ...(rows.length ? rows : [el("div", { class: "note", style: "margin:2px 0" }, "No ranges yet.")]), el("div", { style: "margin:4px 0 6px" }, add));
       }
       const out = el("output", {}, fmtParam(p, v));
       const r = el("input", { type: "range", min: p.min, max: p.max, step: p.step, value: v }); fillRange(r);
       r.addEventListener("input", () => { fillRange(r); out.textContent = fmtParam(p, +r.value); it.params[p.key] = +r.value; save(120); });
       return el("div", { class: "row" }, el("label", { title: p.label }, p.label), r, out);
     });
-    return el("div", { class: "pstep" + (on ? "" : " off") },
+    return el("div", { class: "pstep" + (on ? "" : " off"), ...(t.domain === "radio" ? { onmouseenter: () => showMask(i), onmouseleave: () => showMask(null) } : {}) },
       el("div", { class: "prow" }, toggle(on, v => { it.on = v; save(50, true); }), el("strong", {}, t.label),
         el("button", { class: "ib", title: "What it does", onclick: () => { desc.hidden = !desc.hidden; } }, "ⓘ"),
         el("button", { class: "ib", title: "Remove this step", onclick: () => { items.splice(i, 1); save(50, true); } }, "×")),
@@ -715,12 +782,10 @@ function buildPipe() {
     sel.addEventListener("change", () => {
       const t = stepType(sel.value); if (!sel.value) return;
       const at = domain === "radio" ? items.filter(x => stepType(x.type).domain === "radio").length : items.length;
-      const params = { ...t.default };
-      for (const p of t.params) if (p.kind === "freq" && !params[p.key]) params[p.key] = Math.round(S.cfg.sdr.center_hz + (S.fmax - S.fmin) / 4);
+      const params = JSON.parse(JSON.stringify(t.default));
       items.splice(at, 0, { type: t.type, on: true, params });
-      const fp = t.params.find(p => p.kind === "freq");
-      if (fp) { S.pick = { i: at, key: fp.key }; toast("Click the waterfall at the frequency you want."); }
       save(50, true); if (domain === "radio") setView("pipe");
+      if (t.params.some(p => p.kind === "ranges")) { S.cfg.pipeline = items; setRangeTarget(at); }
     });
     return sel;
   };
@@ -734,32 +799,11 @@ function buildPipe() {
     el("div", { class: "note", style: "margin-top:12px" }, "Last, always: the level is evened out slowly, so the sound stays at a comfortable loudness."));
 }
 
-// Blocked frequencies: known stations and steady lines, marked on the waterfall.
-function blockedCard() {
-  const list = (S.cfg.blocked || []).map(r => ({ ...r }));
-  const save = () => { patch({ blocked: list }, 50); buildGeneral(); };
-  return el("div", {},
-    el("h2", {}, "Blocked frequencies"),
-    el("div", { class: "note", style: "margin-top:-4px" }, "Ranges marked on the waterfall: known stations, steady lines. Nothing uses them yet. Shift-drag across the waterfall (or use Block on the waterfall bar) to add one; click a range's ✕ label on the waterfall, or × here, to remove it."),
-    ...list.map((r, i) => {
-      const name = el("input", { class: "field", value: r.label || "", placeholder: "label", style: "flex:1;min-width:0" });
-      name.addEventListener("change", () => { list[i].label = name.value; patch({ blocked: list }, 50); });
-      return el("div", { class: "row blrow" }, el("span", { class: "num t2" }, `${fmtFshort(r.lo)} – ${fmtFshort(r.hi)}`), name,
-        el("button", { class: "ib", title: "Unblock", onclick: () => { list.splice(i, 1); save(); } }, "×"));
-    }),
-    list.length ? "" : el("div", { class: "note" }, "None."));
-}
-function setBlockMode(on) {
-  BLK.mode = on; $("#blockBtn").classList.toggle("on", on);
-  if (on) toast("Drag across the waterfall to block a frequency range.");
-}
-$("#blockBtn").addEventListener("click", e => { e.currentTarget.blur(); setBlockMode(!BLK.mode); });
-function addBlock(lo, hi) {
-  if (hi - lo < 500) return;
-  const list = [...(S.cfg.blocked || []), { lo: Math.round(lo), hi: Math.round(hi), label: "" }];
-  patch({ blocked: list }, 50); buildGeneral();
-  toast(`Blocked ${fmtFshort(lo)} – ${fmtFshort(hi)}. Unblock or label it in ⚙ › General › Blocked frequencies.`);
-}
+$("#blockBtn").addEventListener("click", e => {
+  e.currentTarget.blur();
+  if (RNG.target != null && (S.cfg.pipeline[RNG.target] || {}).type === "bandstop") return setRangeTarget(null);
+  setRangeTarget(bandStopIndex());
+});
 
 // ---------------- top bar (receiver) ----------------
 const RATES = { hackrf: [2e6, 4e6, 8e6, 10e6, 16e6, 20e6], rtlsdr: [1.024e6, 1.4e6, 1.8e6, 2.048e6, 2.4e6], file: [] };
@@ -817,7 +861,7 @@ $("#gain").addEventListener("change", e => patch({ sdr: { gain_db: +e.target.val
 $("#amp").addEventListener("click", () => { patch({ sdr: { amp: !S.cfg.sdr.amp } }, 50); buildTop(); });
 
 
-// ---------------- general tab: calibration, transcription, blocked frequencies ----------------
+// ---------------- general tab: calibration, transcription ----------------
 function buildGeneral() {
   const root = $("#general"), c = S.cfg; root.replaceChildren();
   root.append(tuneCard()); tickReady();
@@ -838,7 +882,6 @@ function buildGeneral() {
           ta.addEventListener("change", () => patch({ whisper: { filter_phrases: ta.value.split("\n").map(x => x.trim()).filter(Boolean) } }, 50));
           return ta; })()),
       ws.error ? el("div", { class: "err" }, ws.error) : null));
-  root.append(blockedCard());
   root.append(el("div", { style: "margin:14px 0 20px" }, el("button", { class: "btn", onclick: async () => { if (confirm("Reset every setting to its default?")) await fetch("/api/reset", { method: "POST" }); } }, "Reset all settings")));
 }
 
@@ -1403,6 +1446,7 @@ function connect() {
       case "status": setStatus(m); break;
       case "wf": addChunk(m); break;
       case "audio": onAudio(m); break;
+      case "masks": onMasks(m); break;
       case "autotune": onTune(m); break;
       case "survey": onSurvey(m); break;
       case "mark": (S.marks = S.marks || []).push(m); break;

@@ -166,6 +166,8 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .pstep .desc{color:var(--text-2);font-size:12px;margin:2px 0 6px}
 .psum{margin:14px 0 4px;padding:8px 10px;border-top:1px dashed var(--line-strong);border-bottom:1px dashed var(--line-strong);color:var(--text-2);font-size:12.5px;text-align:center}
 .padd{margin:4px 0 0}
+.prange{display:flex;align-items:center;gap:10px;min-height:26px;font-size:12.5px}
+.prange .num:first-child{flex:1}
 .pstep .ib{background:none;border:0;color:var(--text-3);cursor:pointer;font:inherit;font-size:14px;padding:2px 5px;line-height:1}
 .pstep .ib:hover{color:var(--text)}
 body.nodets main{grid-template-columns:minmax(0,1fr) 0}
@@ -385,7 +387,7 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
     <div id="wfbar">
       <div id="pipeInfo" title="The pipeline: radio steps, the sum of everything into sound, audio steps. Click a step to adjust it."></div>
       <button id="pipeBtn" class="btn" title="Add, remove and adjust the steps">Pipeline…</button>
-      <button id="blockBtn" class="btn" title="Block a frequency range (known station, steady line): drag across the waterfall. Shift-drag works too.">Block</button>
+      <button id="blockBtn" class="btn" title="Remove a frequency range from the sound (adds it to the Band-stop step): drag across the waterfall, or click. Shift-drag works too.">Band-stop</button>
     </div>
     <div id="wfwrap">
       <canvas id="wf"></canvas><div id="tip"></div>

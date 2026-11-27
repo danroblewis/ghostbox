@@ -48,6 +48,15 @@ class _Spectral:
         self.inb = np.zeros(0, np.complex64)                    # input not yet in a full block
         self.ola = np.zeros(self.N - self.H, np.complex64)      # overlap-add carried to the next call
         self.fifo = np.zeros(self.N, np.complex64)              # output, one block behind the input
+        self.g_last = None                                      # the gains last applied (FFT order)
+
+    def curve(self, off):
+        """This step's mask: the amplitude gain it applies at frequency offsets `off` (Hz from the
+        centre), as last applied (None before the first block)."""
+        g = getattr(self, "mask", None) if getattr(self, "mask", None) is not None else self.g_last
+        if g is None:
+            return None
+        return np.interp(off, np.fft.fftshift(self.f), np.fft.fftshift(np.broadcast_to(g, (self.N,))))
 
     def gains(self, F):
         """Per-bin amplitude gain for these frames' spectra F [frames, N] (FFT order)."""
@@ -60,7 +69,8 @@ class _Spectral:
         if nfr:
             frames = sliding_window_view(inb[:(nfr - 1) * H + N], N)[::H]     # views, no copy
             F = sfft.fft(frames * self.w, axis=1, workers=-1)                   # single precision, all cores
-            F *= self.gains(F)
+            self.g_last = self.gains(F)
+            F *= self.g_last
             Y = sfft.ifft(F, axis=1, workers=-1, overwrite_x=True)
             Y *= self.w
             # overlap-add at half overlap: each output half-block = this frame's first half + the
@@ -133,41 +143,87 @@ class Flatten(_Spectral):
         return np.fft.ifftshift(10 ** (g_db / 20)).astype(np.float32)
 
 
-class BandPass(_Spectral):
-    """Band-pass: keep one range of the spectrum, `width_hz` wide around `center_hz` (an absolute
-    frequency), and set every other frequency to zero. SUM then plays that range's power: how its
-    energy rises and falls. The edges are tapered (raised cosine, `edge_hz` each side) so they don't
-    ring. Bins of ~60-120 Hz, so even a narrow range has clean edges; the output is 15-30 ms behind
-    the input."""
+def ranges_of(p):
+    """A step's ranges as [(lo, hi)] absolute Hz, from its "ranges" list (or an older single centre/width)."""
+    out = []
+    for r in p.get("ranges") or []:
+        try:
+            lo, hi = float(r["lo"]), float(r["hi"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if hi > lo:
+            out.append((lo, hi))
+    if not out and p.get("center_hz"):
+        c, w = float(p["center_hz"]), float(p.get("width_hz") or 6000)
+        out.append((c - w / 2, c + w / 2))
+    return out
 
-    domain, label = "radio", "Band-pass"
-    desc = ("Keeps one range of the spectrum and removes everything else, so the sound is that range alone. On an "
-            "AM signal it plays the voice; on the edge of an FM station it plays the station too, because the station "
-            "swings in and out of the range (slope detection); across a whole FM station it is almost silent.")
-    params = [{"key": "center_hz", "label": "Centre", "kind": "freq", "unit": "Hz"},
-              {"key": "width_hz", "label": "Width", "min": 500, "max": 50000, "step": 250, "unit": "Hz"},
-              {"key": "edge_hz", "label": "Soft edges", "min": 0, "max": 5000, "step": 50, "unit": "Hz"}]
-    default = {"center_hz": 0.0, "width_hz": 6000.0, "edge_hz": 300.0}
+
+class _Ranges(_Spectral):
+    """Base for the range masks: a list of frequency ranges, each 1 inside, falling to 0 over `edge_hz`
+    outside (raised cosine, so the edges don't ring); the ranges together are their union (a frequency
+    is in the mask if it is in any range). Bins of ~60-120 Hz, so even narrow ranges have clean edges;
+    the output is 15-30 ms behind the input."""
+
     bin_hz = 100.0
+    params = [{"key": "ranges", "label": "Ranges", "kind": "ranges"},
+              {"key": "edge_hz", "label": "Soft edges", "min": 0, "max": 5000, "step": 50, "unit": "Hz"},
+              {"key": "click_width_hz", "label": "Width of a clicked range", "min": 500, "max": 50000, "step": 250, "unit": "Hz"}]
+    default = {"ranges": [], "edge_hz": 300.0, "click_width_hz": 6000.0}
 
     def __init__(self, fs, fc=0.0, **p):
         super().__init__(fs, fc)
         self.key = None
         self.set(**p)
 
-    def set(self, center_hz=0.0, width_hz=6000.0, edge_hz=300.0):
-        key = (float(center_hz), float(width_hz), float(edge_hz))
+    def union(self, ranges, edge_hz):
+        m = np.zeros(self.N, np.float32)
+        edge = max(float(edge_hz), self.df)
+        for lo, hi in ranges:
+            c, half = (lo + hi) / 2 - self.fc, (hi - lo) / 2
+            t = np.clip((np.abs(self.f - c) - half) / edge, 0, 1)    # 0 inside, 1 beyond the soft edge
+            m = np.maximum(m, (0.5 + 0.5 * np.cos(np.pi * t)).astype(np.float32))
+        return m
+
+    def set(self, **p):
+        key = json_key(p)
         if key == self.key:
             return
         self.key = key
-        d = np.abs(self.f - (float(center_hz) - self.fc))      # each bin's distance from the centre (Hz)
-        half, edge = float(width_hz) / 2, max(float(edge_hz), self.df)
-        # 1 inside, a raised-cosine fall over `edge` outside, 0 beyond
-        t = np.clip((d - half) / edge, 0, 1)
-        self.mask = (0.5 + 0.5 * np.cos(np.pi * t)).astype(np.float32)
+        self.mask = self.shape(self.union(ranges_of(p), p.get("edge_hz", 300.0)))
 
     def gains(self, F):
         return self.mask
+
+
+class BandPass(_Ranges):
+    """Band-pass: keep only the ranges (all of them: one window or several) and set every other
+    frequency to zero. SUM then plays what is in them: how their energy rises and falls."""
+
+    domain, label = "radio", "Band-pass"
+    desc = ("Keeps only its ranges and removes everything else, so the sound is those ranges alone. Several ranges "
+            "in one Band-pass are all kept (two Band-pass steps in a row would keep only what is in both). On an AM "
+            "signal it plays the voice; on the edge of an FM station it plays the station too, because the station "
+            "swings in and out of the range (slope detection); across a whole FM station it is almost silent.")
+
+    def shape(self, union):
+        return union
+
+
+class BandStop(_Ranges):
+    """Band-stop: remove the ranges (all of them) and keep everything else."""
+
+    domain, label = "radio", "Band-stop"
+    desc = ("Removes its ranges and keeps everything else: known stations, steady lines, interference. Drag across "
+            "the waterfall with Band-stop (or shift-drag) to add a range.")
+
+    def shape(self, union):
+        return (1 - union).astype(np.float32)
+
+
+def json_key(p):
+    import json
+    return json.dumps(p, sort_keys=True, default=float)
 
 
 # ---------------- audio steps (sound in, sound out) ----------------
@@ -238,7 +294,7 @@ class LowPass:
         return out.astype(np.float32)
 
 
-STEPS = {"flatten": Flatten, "bandpass": BandPass, "audio_eq": AudioEQ, "lowpass": LowPass}
+STEPS = {"flatten": Flatten, "bandpass": BandPass, "bandstop": BandStop, "audio_eq": AudioEQ, "lowpass": LowPass}
 
 
 def catalog():
@@ -341,7 +397,7 @@ class Pipeline:
 
     def __init__(self, fs, n0=0, steps=(), fc=0.0):
         self.fs, self.fc = float(fs), float(fc)
-        self.radio, self.audio = [], []         # [(type, on, instance)]
+        self.radio, self.audio = [], []         # [(type, on, instance, index in the step list)]
         self.sum = SumToAudio(fs, n0)
         self.gain = SmoothGain()
         self.iq = None                          # the last block of IQ after the radio steps
@@ -350,34 +406,47 @@ class Pipeline:
     def configure(self, steps):
         old = {"radio": list(self.radio), "audio": list(self.audio)}
         new = {"radio": [], "audio": []}
-        for s in steps:
+        for idx, s in enumerate(steps):
             cls = STEPS.get(s.get("type"))
             if cls is None:
                 continue
             params = {**cls.default, **(s.get("params") or {})}
             pool = old[cls.domain]
-            j = next((i for i, (t, _, _) in enumerate(pool) if t == s["type"]), None)
+            j = next((i for i, e in enumerate(pool) if e[0] == s["type"]), None)
             if j is not None:
                 inst = pool.pop(j)[2]
                 inst.set(**params)
             else:
                 inst = cls(self.fs, self.fc, **params)
-            new[cls.domain].append((s["type"], bool(s.get("on", True)), inst))
+            new[cls.domain].append((s["type"], bool(s.get("on", True)), inst, idx))
         self.radio, self.audio = new["radio"], new["audio"]
 
     @property
     def radio_on(self):
-        return any(on for _, on, _ in self.radio)
+        return any(e[1] for e in self.radio)
+
+    def masks(self, off):
+        """The radio steps' masks at frequency offsets `off`: ({index in the step list: amplitude gain},
+        their product over the steps that are on: what reaches the sum)."""
+        each, total = {}, np.ones(len(off))
+        for _, on, s, idx in self.radio:
+            c = s.curve(off) if hasattr(s, "curve") else None
+            if c is None:
+                continue
+            each[idx] = c
+            if on:
+                total = total * c
+        return each, total
 
     def process(self, x):
-        for _, on, s in self.radio:
+        for _, on, s, _ in self.radio:
             if on:
                 x = s.process(x)
         self.iq = x
         k0, y = self.sum.process(x)
         if not len(y):
             return k0, y
-        for _, on, s in self.audio:
+        for _, on, s, _ in self.audio:
             if on:
                 y = s.process(y)
         return k0, self.gain.process(y)

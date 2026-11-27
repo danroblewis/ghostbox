@@ -18,7 +18,8 @@ summed.
 - **The pipeline**: radio steps change the IQ of the whole band, then the power of everything left
   is added up 16,000 times a second into sound (SUM), then audio steps change the sound. It plays
   a few seconds behind live, and every step can be added, switched and adjusted while listening.
-  Steps so far: *Flatten receiver* and *Band-pass* (radio), *Audio EQ* and *Low-pass* (audio).
+  Steps so far: *Flatten receiver*, *Band-pass* and *Band-stop* (radio), *Audio EQ* and
+  *Low-pass* (audio).
 - **IQ ring**: an optional rolling raw-IQ recording, so anything can be replayed or exported later.
 - **Surveys** that step the receiver across a wide range and map its power.
 - **Saved recordings** from before the rebuild stay browsable (transcript, playback, IQ export).
@@ -191,7 +192,7 @@ moment by moment, as 16,000 samples a second. That is
 the band's total power moment by moment (by Parseval's theorem, the same as adding up every column
 of a spectrum of that sliver). Its steady part (below 20 Hz, inaudible) is taken out.
 
-Radio steps that work frequency by frequency (Flatten receiver, Band-pass) share one mechanism:
+Radio steps that work frequency by frequency (Flatten receiver, Band-pass, Band-stop) share one mechanism:
 overlapping FFT blocks (sqrt-Hann windows at half overlap, which add back to exactly the input when
 every gain is 1), each frequency multiplied by a gain, then back to IQ.
 
@@ -201,11 +202,15 @@ every gain is 1), each frequency multiplied by a gain, then back to IQ.
   of each frequency's average power over a window wider than a station, default 1 MHz) and boosts
   or cuts the IQ to flatten it, in overlapping FFT blocks. At full strength FM stations fade from
   the sum.
-- *Band-pass* (radio): keeps one range of the spectrum (a centre frequency, typed in or picked on
-  the waterfall, and a width) and sets every other frequency to zero, with tapered edges; bins of
-  ~60-120 Hz. The sound is then that range's power alone: on an AM signal, its voice; on the edge
-  of an FM station, the station (it swings in and out of the range); across a whole FM station,
-  almost nothing (FM's power is constant). The first piece of a frequency-domain mask.
+- *Band-pass* (radio): keeps only its ranges (one or several: drag across the waterfall, or click
+  for a range of a set width) and sets every other frequency to zero, with tapered edges; bins of
+  ~60-120 Hz. The sound is then those ranges' power alone: on an AM signal, its voice; on the edge of
+  an FM station, the station (it swings in and out of the range); across a whole FM station, almost
+  nothing (FM's power is constant). Several ranges in one Band-pass are all kept; two Band-pass steps
+  in a row keep only what is in both, since steps multiply.
+- *Band-stop* (radio): the opposite, removes its ranges and keeps everything else. The *Band-stop*
+  button on the waterfall bar (or shift-drag) adds a range to it. Each range on the waterfall has a
+  label whose ✕ removes it.
 - *Audio EQ* (audio): a graphic equalizer, one peaking filter per octave from 63 Hz to 6.3 kHz.
 - *Low-pass* (audio): removes everything above a cutoff, steeply (Butterworth, order 8 by default).
 
@@ -214,7 +219,12 @@ power pulse at 40 kHz, and a plain 1/16,000 s average would turn that into a ton
 averages the power in exact 1/512,000 s slices, then low-passes in two stages (512 k -> 64 k ->
 16 k samples a second): changes up to 7 kHz pass unchanged, changes above 8 kHz are removed.
 
-The waterfall shows the IQ after the radio steps; *Raw IQ* on the chain bar shows it untouched. Before the sum everything is
+The waterfall shows the IQ after the radio steps; *Raw IQ* on the chain bar shows it untouched.
+Hovering a radio step (its chip on the chain bar, or its card in the Pipeline dialog) lays that
+step's mask over the waterfall like a sprite's alpha mask: white where it keeps, black where it
+removes, grey in between; hovering *SUM* shows all the radio steps' masks together, which is exactly
+what reaches the sum. (The mask is each step's per-frequency gain, sent
+by the server whenever it changes.) Before the sum everything is
 in the radio domain (radio frequency on the axis); after it, in the audio domain (the panel under
 the waterfall shows the sound's own spectrum). The page plays each chunk at its stream time plus a
 delay, so the sound stays locked to its place on the waterfall.

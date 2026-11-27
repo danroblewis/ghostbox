@@ -161,6 +161,7 @@ class Engine:
         self.raw = np.zeros(self.raw_keep, np.complex64)
         self.spec, self.spec_t = [], []                          # the last few hops' power frames (survey)
         self.wf_lo = {}                                          # per view: the waterfall's floor (dB), tracked
+        self._colf = None
         self._close_iq()
         self.pipe = None                                         # rebuilt for the new rate at the next hop
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
@@ -282,6 +283,10 @@ class Engine:
         # them, and what a step removed is simply black (a floor taken from a mostly-removed row would sink
         # to the silence and turn everything left into solid colour)
         q = np.clip((db - self.wf_lo["power"]) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
+        if getattr(self, "_colf", None) is None or len(self._colf) != q.shape[1]:
+            # each waterfall column's centre frequency (Hz from the centre): where the masks are drawn
+            fp = np.pad(self.f, (0, pad), mode="edge").reshape(-1, pool)
+            self._colf = fp.mean(axis=1)
         self._chunk(view, ts, q, cfg)
         if view == "power":
             self._last_q = q
@@ -330,10 +335,24 @@ class Engine:
             self._waterfall(P[:, self.keep], self._ts, cfg, view="pipe")
         else:
             self._chunk("pipe", self._ts, self._last_q, cfg)
+        if not self.oneshot and self._colf is not None:
+            self._send_masks()
         if self.oneshot or not len(y):
             return
         self.emit({"type": "audio", "id": "out", "t": round(k0 / AUDIO_FS, 5), "rate": AUDIO_FS,
                    "pcm": _b64((np.clip(y, -1, 1) * 32767).astype(np.int16))})
+
+    def _send_masks(self):
+        """Each radio step's mask at the waterfall's columns, and their product (what reaches the sum),
+        as dB from -60 to +20 coded 0..255, to draw over the waterfall."""
+        each, total = self.pipe.masks(self._colf)
+        code = lambda g: _b64(np.clip((20 * np.log10(np.maximum(g, 1e-6)) + 60) / 80 * 255, 0, 255).astype(np.uint8))
+        msg = {"type": "masks", "w": len(self._colf), "fmin": self.f_lo, "fmax": self.f_hi,
+               "steps": {str(i): code(g) for i, g in each.items()}, "all": code(total)}
+        key = json.dumps(msg, sort_keys=True)
+        if key != getattr(self, "_masks_key", None) or time.time() - getattr(self, "_masks_t", 0) > 5:
+            self._masks_key, self._masks_t = key, time.time()
+            self.emit(msg)
 
     # ---------------- saved recordings (from before the filters were removed) ----------------
     def detail(self, key):
