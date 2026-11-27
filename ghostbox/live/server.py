@@ -16,10 +16,9 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 import numpy as np
 
-from .config import CHECKS, GROUPS, PRESETS, SENSITIVITY, VIEWS, Config
+from .config import PRESETS, VIEWS, Config
 from .autotune import AutoTune, pick_segments
-from .engine import Engine, iq_cut_wav, render_mix, render_segments
-from .afilters import FILTERS as AFILTERS
+from .engine import Engine, iq_cut_wav, render_segments
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
 from .survey import Survey
@@ -43,7 +42,7 @@ class Hub:
 
     def __init__(self, loop):
         self.loop = loop
-        self.clients = {}            # queue -> waterfall view mode
+        self.clients = {}            # queue -> waterfall view modes watched (a set)
 
     def emit(self, msg):  # called from the engine thread
         mode = msg.get("mode") if msg.get("type") == "wf" else None
@@ -52,7 +51,7 @@ class Hub:
 
     def _fanout(self, data, mode=None):
         for q, m in list(self.clients.items()):
-            if mode is not None and m != mode:
+            if mode is not None and mode not in m:
                 continue
             if q.qsize() > 600:
                 try:
@@ -86,46 +85,10 @@ def make_app(args):
         hub = Hub(asyncio.get_running_loop())
         state["hub"] = hub
         state["engine"] = Engine(config, hub.emit, ROOT)
-        state["tune"] = AutoTune(ROOT, config, hub.emit, apply, session=lambda: state["engine"].session())
+        state["tune"] = AutoTune(ROOT, config, hub.emit, session=lambda: state["engine"].session())
         state["survey"] = Survey(ROOT, config, apply, lambda: state["engine"], hub.emit)
-        state["auto_task"] = asyncio.create_task(auto_tune_loop())
-
-    def rx_signature(c):
-        """Receiver settings: any change (frequency, span, gain, amp, range, device) re-arms auto-tune."""
-        return json.dumps({k: v for k, v in c["sdr"].items() if k != "file"}, sort_keys=True)
-
-    async def auto_tune_loop():
-        """With automatic recalibration on: calibrate after every receiver change once `minutes` of IQ
-        has been recorded since it, and recalibrate whenever nothing has been caught for `minutes`
-        (including after a run that found too little: it simply tries again later)."""
-        while True:
-            await asyncio.sleep(10)
-            try:
-                c = config.get()
-                at, tune, eng = c["autotune"], state["tune"], state["engine"]
-                sv = state["survey"]
-                if sv.running:
-                    continue
-                if not at["auto"] or c["sdr"]["source"] == "file" or tune.state.get("state") == "running":
-                    continue
-                if not c["iq_ring"]["enabled"]:                # auto-tune needs the IQ recording
-                    apply({"iq_ring": {"enabled": True}})
-                    continue
-                eng.show_conf = tune.show_conf if tune.show_conf is not None else c["detect"]["threshold"]
-                changed = tune.auto_band != rx_signature(c)
-                due = time.time() - max(eng.last_hit, tune.last_end, sv.ended_at) >= at["minutes"] * 60
-                if not (changed or due):
-                    continue
-                _, have = await asyncio.get_running_loop().run_in_executor(
-                    None, pick_segments, ROOT, c, at["minutes"], eng.session())
-                if have >= at["minutes"] * 60 * 0.95:
-                    tune.start(at["minutes"], at["per_min"], auto=True)
-            except Exception:
-                pass
 
     async def on_cleanup(app):
-        if state.get("auto_task"):
-            state["auto_task"].cancel()
         state["engine"].stop()
 
     async def no_cache(request, response):
@@ -147,18 +110,16 @@ def make_app(args):
         hub = state["hub"]
         eng = state["engine"]
         await sock.send_str(json.dumps({
-            "type": "hello", "config": config.get(), "checks": CHECKS, "check_groups": GROUPS, "views": VIEWS,
+            "type": "hello", "config": config.get(), "views": VIEWS,
             "asr_models": [[k, v[2]] for k, v in ASR_MODELS.items()],
-            "audio_filters": [dict(zip(("id", "label", "value", "min", "max", "step", "unit"), f)) for f in AFILTERS],
             "root": str(ROOT.resolve()),
             "presets": {k: v["label"] for k, v in PRESETS.items()},
-            "sensitivity": SENSITIVITY, "epoch": eng.t_origin,
-            "status": eng.status, "detections": eng.snapshot(),
+            "epoch": eng.t_origin, "status": eng.status,
             "reset": {"fc": getattr(eng, "fc", 0), "fs": getattr(eng, "fs", 0),
                       "fmin": getattr(eng, "f_lo", 0), "fmax": getattr(eng, "f_hi", 0),
                       "frame_rate": getattr(eng, "fr", 25)},
         }, default=float))
-        hub.clients[q] = "power"
+        hub.clients[q] = {"power"}
 
         async def writer():
             while True:
@@ -175,11 +136,8 @@ def make_app(args):
                         m = json.loads(msg.data)
                     except ValueError:
                         continue
-                    md = m.get("mode")
-                    if m.get("type") == "view" and isinstance(md, str) and (
-                            md in {v["id"] for v in VIEWS} or md in ("layered", "why")
-                            or (md.startswith("layer:") and md[6:] in {c["id"] for c in CHECKS})):
-                        hub.clients[q] = m["mode"]
+                    if m.get("type") == "view" and valid_view(m.get("mode")):
+                        hub.clients[q] = {m["mode"]}
         finally:
             hub.clients.pop(q, None)
             wt.cancel()
@@ -192,12 +150,17 @@ def make_app(args):
         state["hub"].emit({"type": "config", "config": cfg})
         return cfg
 
+    def valid_view(v):
+        return v in {x["id"] for x in VIEWS}
+
     async def history(request):
-        view = request.query.get("view", "power")
         t0, t1 = float(request.query.get("t0", 0)), float(request.query.get("t1", 1e12))
-        chunks, boxes = await asyncio.get_running_loop().run_in_executor(
-            None, state["engine"].history, view, t0, t1)
-        return web.json_response({"chunks": chunks, "boxes": boxes}, dumps=lambda o: json.dumps(o, default=float))
+        views = [v for v in (request.query.get("views") or request.query.get("view", "power")).split(",") if valid_view(v)][:64]
+        out = []
+        eng = state["engine"]
+        for v in views:
+            out += await asyncio.get_running_loop().run_in_executor(None, eng.history, v, t0, t1)
+        return web.json_response({"chunks": out, "boxes": []}, dumps=lambda o: json.dumps(o, default=float))
 
     async def get_config(request):
         return web.json_response(config.get())
@@ -206,7 +169,7 @@ def make_app(args):
         return web.json_response(apply(await request.json()))
 
     PRESET_DIR = ROOT / "live_data" / "presets"
-    PRESET_KEYS = ("sdr", "analysis", "detect", "checks", "audio")   # a preset = receiver + detector + playback
+    PRESET_KEYS = ("sdr", "analysis", "pipeline", "audio")   # a preset = receiver + analysis + pipeline + playback
 
     def saved_presets():
         out = []
@@ -222,7 +185,7 @@ def make_app(args):
         return web.json_response({"builtin": {k: v["label"] for k, v in PRESETS.items()}, "saved": saved_presets()})
 
     async def save_preset(request):
-        """Save the current receiver + detector + playback settings. File name: date, device, range, name."""
+        """Save the current receiver + analysis + pipeline + playback settings. File name: date, device, range, name."""
         name = re.sub(r"[^A-Za-z0-9 _.-]+", "", str((await request.json()).get("name", "")).strip())[:60] or "preset"
         c = config.get()
         sdr = c["sdr"]
@@ -259,8 +222,7 @@ def make_app(args):
         return web.json_response({"state": sv.state, "result": res}, dumps=lambda o: json.dumps(o, default=float))
 
     async def survey_tune(request):
-        """Tune here from the survey map: move the receiver to f and put the calibration of the survey
-        step containing f live, so the live detector starts where the survey left off."""
+        """Tune here from the survey map: move the receiver to f, one survey step wide."""
         b = await request.json()
         f, file = float(b["f"]), b.get("file")
         if file and not SAFE.match(file):
@@ -268,30 +230,10 @@ def make_app(args):
         sv = state["survey"]
         if sv.running:
             return web.json_response({"error": "A survey is running."}, status=409)
-        m = await asyncio.get_running_loop().run_in_executor(None, sv.load, file) if file else sv.meta()
-        m = m or {}
-        c = config.get()
-        step_hz = m.get("step_hz") or c["sdr"]["sample_rate"] * 0.8
-        sdr = {"center_hz": round(f), "fmin_hz": round(f - step_hz / 2), "fmax_hz": round(f + step_hz / 2)}
-        st = next((s for s in m.get("steps", []) if s["lo"] <= f < s["hi"]), None)
-        cal = (st or {}).get("calibration")
-        if not cal:
-            apply({"sdr": sdr})
-            return web.json_response({"ok": True, "calibrated": False, "message": (
-                "That step was too quiet to calibrate; detector settings unchanged." if st else "Tuned.")})
-        checks = {k: {"weight": w} for k, w in cal["weights"].items()}
-        if not cal.get("full"):                          # older surveys saved only the checks that were on
-            checks = {**{x["id"]: {"weight": 0.0} for x in CHECKS if x["id"] not in ("vad", "profile")}, **checks}
-        patch = {"sdr": sdr, "checks": checks, **({"detect": cal["detect"]} if cal.get("detect") else {})}
-        n = int(round((st["lo"] - m.get("lo", st["lo"])) / step_hz)) + 1
-        msg = (f"Using the survey's calibration from step {n} ({st['lo'] / 1e6:.3f}–{st['hi'] / 1e6:.3f} MHz: "
-               f"{cal['candidates']} candidates, {cal['voice_like']} speech-like)."
-               + (" Automatic recalibration refines it once enough IQ is recorded here." if c["autotune"]["auto"] else ""))
-        if not state["tune"].use_survey(patch, cal, msg):
-            apply({"sdr": sdr})
-            return web.json_response({"ok": True, "calibrated": False,
-                                      "message": "Calibration is running; tuned without the survey's settings."})
-        return web.json_response({"ok": True, "calibrated": True, "show_threshold": cal["show_threshold"], "message": msg})
+        m = (await asyncio.get_running_loop().run_in_executor(None, sv.load, file) if file else sv.meta()) or {}
+        step_hz = m.get("step_hz") or config.get()["sdr"]["sample_rate"] * 0.8
+        apply({"sdr": {"center_hz": round(f), "fmin_hz": round(f - step_hz / 2), "fmax_hz": round(f + step_hz / 2)}})
+        return web.json_response({"ok": True, "message": "Tuned."})
 
     async def survey_image(request):
         """One view of a survey as raw uint8 [rows, columns] (meta says the shape)."""
@@ -378,44 +320,6 @@ def make_app(args):
             raise web.HTTPNotFound(text="this sample's IQ is no longer in the IQ ring")
         return segs, segs[0][0]["t0"], st, t
 
-    async def clip_source(q):
-        """(segments, t0, t1, path points, mode) of a detection (?key=) or survey sample (?survey=&track=)."""
-        au, eng, loop = config.get()["audio"], state["engine"], asyncio.get_running_loop()
-        pre, post = au.get("preroll_s", 0.5), au.get("postroll_s", 0.5)
-        if q.get("survey"):
-            if not SAFE.match(q["survey"]):
-                raise web.HTTPNotFound()
-            segs, base, st, t = survey_segments(q["survey"], int(q.get("track", -1)))
-            t0, t1 = base + t["iq_t"][0] - pre, base + t["iq_t"][1] + post
-            return segs, t0, t1, [[base + r, f] for r, f in t.get("path") or []] or [[t0, t["f"]]], t.get("mode", 0)
-        meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
-        if meta is None:
-            raise web.HTTPNotFound()
-        t0, t1 = meta["stream_t0"] - pre, meta["stream_t1"] + post
-        segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
-        if not segs:
-            raise web.HTTPNotFound(text="this detection's IQ is no longer in the IQ ring")
-        return segs, t0, t1, [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]], meta.get("mode", 0)
-
-    async def tune_audio(request):
-        """Search demodulation + filtering for this one detection (see audiotune)."""
-        from .audiotune import as_audio_settings, tune
-        from .engine import load_iq
-        q = dict(await request.json())
-        segs, t0, t1, pts, mode = await clip_source(q)
-        loop = asyncio.get_running_loop()
-
-        def job():
-            loaded = load_iq(segs, t0, t1)
-            if loaded is None:
-                return None
-            return tune(loaded, pts, config.get()["audio"], mode)
-        res = await loop.run_in_executor(None, job)
-        if res is None:
-            raise web.HTTPNotFound(text="no IQ for this detection")
-        res["apply"] = as_audio_settings(res["best"])
-        return web.json_response(res, dumps=lambda o: json.dumps(o, default=float))
-
     def wav_response(pcm):
         import io
         from scipy.io import wavfile
@@ -424,71 +328,29 @@ def make_app(args):
         return web.Response(body=buf.getvalue(), content_type="audio/wav")
 
     async def render(request):
-        """A detection / survey sample re-rendered from the IQ ring with other audio settings, for A/B:
-        ?demod=envelope|sync|sync_sb|auto &denoise=0|1 &band=0|1 (anything left out: as configured)."""
+        """A saved recording or survey sample taken again from the IQ ring, through the pipeline."""
         return wav_response(await render_pcm(request.query))
-
-    async def afilter(request):
-        """A clip through the listening filters (afilters): ?key= with src=played (the audio as
-        recorded) or anything render takes (re-rendered from the IQ first), plus one parameter per
-        filter that is on, e.g. &notch=6&gate=8&reverse=1."""
-        from . import afilters
-        q, loop = request.query, asyncio.get_running_loop()
-        params = {f[0]: q[f[0]] for f in afilters.FILTERS if q.get(f[0]) not in (None, "")}
-        try:
-            params = {k: float(v) for k, v in params.items()}
-        except ValueError:
-            raise web.HTTPBadRequest(text="bad filter value")
-        if q.get("src") == "played" and q.get("key"):
-            data = await loop.run_in_executor(None, state["engine"].clip, q["key"])
-            if data is None:
-                raise web.HTTPNotFound(text="audio no longer available")
-            import io
-            from scipy.io import wavfile
-            _, pcm = wavfile.read(io.BytesIO(data))
-        else:
-            pcm = await render_pcm(q)
-        y = await loop.run_in_executor(None, afilters.apply, pcm.astype(np.float32) / 32768, params)
-        return wav_response((np.clip(y, -1, 1) * 32767).astype(np.int16))
 
     async def render_pcm(q):
         eng, loop = state["engine"], asyncio.get_running_loop()
         au = dict(config.get()["audio"])
-        if q.get("demod") in ("auto", "envelope", "sync", "sync_sb", "suppressed"):
-            au["demod"] = q["demod"]
-        for k, key in (("denoise", "denoise"), ("band", "voice_band")):
-            if q.get(k) in ("0", "1"):
-                au[key] = q[k] == "1"
-        for k, key in (("lo", "voice_lo_hz"), ("hi", "voice_hi_hz"), ("strength", "denoise_strength"), ("floor", "denoise_floor_db")):
-            if q.get(k):
-                au[key] = float(q[k])
-        offset = float(q.get("offset") or 0.0)
         pre, post = au.get("preroll_s", 0.5), au.get("postroll_s", 0.5)
         if q.get("survey"):
             if not SAFE.match(q["survey"]):
                 raise web.HTTPNotFound()
             segs, base, st, t = survey_segments(q["survey"], int(q.get("track", -1)))
             t0, t1 = base + t["iq_t"][0] - pre, base + t["iq_t"][1] + post
-            pts = [[base + r, f] for r, f in t.get("path") or []] or [[t0, t["f"]]]
-            mode = t.get("mode", 0)
         else:
             meta = await loop.run_in_executor(None, eng.detail, q.get("key", ""))
             if meta is None:
                 raise web.HTTPNotFound()
-            if meta.get("composed"):                 # a composed-voice piece: every component, re-mixed
-                pcm = await loop.run_in_executor(None, render_mix, meta, eng.ring_segments, au)
-                if pcm is None:
-                    raise web.HTTPNotFound(text="this mix's IQ is no longer in the IQ ring (or IQ recording is off)")
-                return pcm
+            if meta.get("composed"):                 # a composed-voice piece (from before): no single range to take
+                raise web.HTTPNotFound(text="a composed-voice piece can't be taken again from the IQ")
             t0, t1 = meta["stream_t0"] - pre, meta["stream_t1"] + post
             segs = await loop.run_in_executor(None, eng.ring_segments, meta["epoch"], t0, t1)
             if not segs:
                 raise web.HTTPNotFound(text="this detection's IQ is no longer in the IQ ring")
-            pts = [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]]
-            mode = meta.get("mode", 0)
-        if q.get("mode") in ("-1", "0", "1"):
-            mode = int(q["mode"])
-        pcm = await loop.run_in_executor(None, render_segments, segs, t0, t1, pts, au, mode, offset)
+        pcm = await loop.run_in_executor(None, render_segments, segs, t0, t1, au, config.get()["pipeline"])
         if pcm is None:
             raise web.HTTPNotFound(text="no IQ in that time range")
         return pcm
@@ -613,10 +475,6 @@ def make_app(args):
                 metas.append(slim_meta(p))
             except Exception:
                 continue
-        for m in state["engine"].mem_list():
-            m = {k: v for k, v in m.items() if k not in ("checks", "detect", "path", "sdr")}
-            m["confidence"] = {k: v for k, v in m["confidence"].items() if k != "history"}
-            metas.append(m)
         metas.sort(key=lambda m: m.get("utc_start", ""), reverse=True)
         phrases = config.get()["whisper"].get("filter_phrases", [])
         for m in metas:                                    # re-filter from the original text, so edits to
@@ -664,26 +522,18 @@ def make_app(args):
             raise web.HTTPNotFound(text="audio no longer available (dropped from memory and not in the IQ ring)")
         return web.Response(body=data, content_type="audio/wav")
 
-    async def save(request):
-        key = (await request.json()).get("key", "")
-        meta = await asyncio.get_running_loop().run_in_executor(None, state["engine"].save, key)
-        if meta is None:
-            return web.json_response({"error": "not available"}, status=404)
-        return web.json_response(meta, dumps=lambda o: json.dumps(o, default=float))
-
     async def tune_start(request):
         b = await request.json()
         if state["survey"].running:
             return web.json_response({"error": "A survey is running; calibrate when it finishes."}, status=409)
-        at = config.get()["autotune"]
-        ok = state["tune"].start(b.get("minutes", at["minutes"]), b.get("per_min", at["per_min"]))
+        ok = state["tune"].start(b.get("minutes", config.get()["autotune"]["minutes"]))
         return web.json_response({"ok": ok, **state["tune"].state})
 
     async def tune_get(request):
         return web.json_response(state["tune"].state, dumps=lambda o: json.dumps(o, default=float))
 
     async def tune_ready(request):
-        """How much continuous raw IQ exists for the current band (the same rule auto-tune uses)."""
+        """How much continuous raw IQ exists for the current band."""
         minutes = float(request.query.get("minutes", 2))
         c = config.get()
         need = minutes * 60
@@ -693,13 +543,7 @@ def make_app(args):
             None, pick_segments, ROOT, c, minutes, state["engine"].session())
         reason = None if have >= need * 0.95 else ("off" if not c["iq_ring"]["enabled"] else "recording")
         return web.json_response({"ready": reason is None, "reason": reason, "have_s": round(have, 1), "need_s": need,
-                                  "segment_s": c["iq_ring"]["segment_s"], "auto": c["autotune"]["auto"],
-                                  "tuned": state["tune"].auto_band == rx_signature(c),
-                                  "recal_in_s": max(0, round(c["autotune"]["minutes"] * 60 - (time.time() - max(
-                                      state["engine"].last_hit, state["tune"].last_end))))})
-
-    async def tune_revert(request):
-        return web.json_response({"ok": state["tune"].revert()})
+                                  "segment_s": c["iq_ring"]["segment_s"]})
 
     async def rec_file(request):
         name = request.match_info["name"]
@@ -736,10 +580,8 @@ def make_app(args):
     app.router.add_get("/api/history", history)
     app.router.add_get("/api/detections", recordings)
     app.router.add_get("/api/clip", clip)
-    app.router.add_post("/api/save", save)
     app.router.add_post("/api/autotune", tune_start)
     app.router.add_get("/api/autotune", tune_get)
-    app.router.add_post("/api/autotune/revert", tune_revert)
     app.router.add_get("/api/autotune/ready", tune_ready)
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", post_config)
@@ -758,8 +600,6 @@ def make_app(args):
     app.router.add_post("/api/sdr/test", sdr_test)
     app.router.add_get("/api/iq", get_iq)
     app.router.add_get("/api/render", render)
-    app.router.add_get("/api/afilter", afilter)
-    app.router.add_post("/api/tune_audio", tune_audio)
     app.router.add_get("/api/presets", get_presets)
     app.router.add_post("/api/presets", save_preset)
     app.router.add_delete("/api/presets/{file}", delete_preset)

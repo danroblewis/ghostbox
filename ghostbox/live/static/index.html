@@ -149,15 +149,41 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .chk.off>label,.chk.off output{color:var(--text-3)}
 .chk .ib{background:none;border:0;color:var(--text-3);cursor:pointer;font:inherit;padding:4px 0;min-height:28px}
 .chk .ib:hover,.chk .ib:focus-visible{color:var(--text)}
+/* layout: detections sidebar (collapsible), the pipeline readout, the settings dialog */
+#pipeInfo{flex:1;min-width:0;font-size:12.5px;overflow:hidden;text-overflow:ellipsis}
+body.nodets main{grid-template-columns:minmax(0,1fr) 0}
+body.nodets #side{display:none}
+#detsBtn.on{border-color:var(--accent);color:var(--accent)}
+.pane{display:flex;flex-direction:column;overflow-y:auto;flex:1;min-height:0}
+#detMin{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line)}
+#detMin input[type=range]{width:110px}
+#cfg{position:fixed;inset:0;z-index:50;display:none;pointer-events:none}
+#cfg.front{z-index:51}
+body.cfgopen #cfg{display:block}
+.cfgbox{position:absolute;left:50%;top:5vh;transform:translateX(-50%);pointer-events:auto;background:var(--panel);border:1px solid var(--line-strong);border-radius:10px;width:min(560px,calc(100vw - 32px));max-height:90vh;min-width:300px;min-height:160px;display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.45);resize:both;overflow:hidden}
+.cfghead{cursor:move;user-select:none;touch-action:none}
+.cfghead button,.cfghead select{cursor:pointer}
+.xbtn{background:none;border:0;color:var(--text-3);font-size:18px;line-height:1;cursor:pointer;padding:4px 6px;border-radius:6px}
+.xbtn:hover{color:var(--text);background:var(--field)}
+.cfghead{display:flex;align-items:center;gap:8px;padding:0 10px 0 0;border-bottom:1px solid var(--line);flex:none}
+.cfghead .tabs{border-bottom:0}
+#cfg .tab{flex:1;min-height:0}
+@media (max-width:760px){.cfgbox{left:0!important;top:0!important;transform:none!important;width:100vw!important;max-height:100vh;height:100vh!important;border-radius:0;resize:none}.cfghead{cursor:default}}
+.frow{display:grid;grid-template-columns:auto minmax(0,1fr) 22px 22px 24px 20px 20px 20px;align-items:center;gap:4px;min-height:30px}
+.frow>label{white-space:nowrap;overflow:hidden;min-width:0;display:flex;align-items:center;gap:6px}
+.frow>label .nm{overflow:hidden;text-overflow:ellipsis;min-width:0;font-weight:500}
+.frow .tag{font-size:11px;color:var(--text-3);flex-shrink:0}
+.frow .tag.rm{color:var(--warn, #d9822b)}
+.frow .ib{background:none;border:0;color:var(--text-3);cursor:pointer;font:inherit;padding:4px 0;min-height:28px}
+.frow .ib:hover,.frow .ib:focus-visible,.frow .ib.on{color:var(--text)}
+.frow .ib.on{color:var(--accent, #6cf)}
+.frow .ib:disabled{opacity:.3;cursor:default}
 .chk .wt{position:relative;display:block}
 .chk .wt input{width:100%;display:block}
 .chk .calmark{position:absolute;bottom:-5px;width:0;height:0;margin-left:-4px;border:4px solid transparent;border-bottom:5px solid var(--accent);border-top:0;pointer-events:none}
 .chkbox .desc{color:var(--text-2);font-size:12px;margin:0 0 6px}
 .chkparams{padding:0 0 6px 12px}
 .note{color:var(--text-3);font-size:12px;margin:8px 0}
-#layerLegend{position:absolute;right:12px;top:24px;padding:6px 9px;border-radius:var(--radius);background:var(--panel);color:var(--text-2);font-size:11.5px;opacity:.92;pointer-events:none;max-width:260px}
-#layerLegend .lgrow{display:flex;align-items:center;gap:6px;margin:2px 0}
-#layerLegend i,.lsw{display:inline-block;width:10px;height:10px;border-radius:2px;flex:none}
 .lrow label{display:flex;align-items:center;gap:6px}
 .lrow .ib,.blrow .ib{background:none;border:0;color:var(--text-3);cursor:pointer;font:inherit;padding:4px 2px;min-height:28px}
 .lrow .ib:hover,.blrow .ib:hover{color:var(--text)}
@@ -165,8 +191,6 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .row.blrow{grid-template-columns:auto minmax(0,1fr) 18px;gap:8px}
 h3.sub{font-size:11.5px;font-weight:600;color:var(--text-2);margin:12px 0 4px}
 #blockBtn.on{border-color:var(--accent);color:var(--accent)}
-#composeLine.muted{opacity:.6}
-#composeLine{position:absolute;left:60px;bottom:10px;max-width:calc(100% - 80px);padding:4px 8px;border-radius:var(--radius);background:var(--panel);color:var(--text-2);font-size:12px;opacity:.92;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:auto}
 #survey{position:absolute;inset:0;z-index:5;background:var(--bg);display:flex;flex-direction:column;padding:10px 14px;gap:6px;overflow:auto}
 .svhead{display:flex;align-items:center;gap:12px;height:30px;flex-wrap:nowrap}
 .svhead>*{flex-shrink:0}
@@ -251,11 +275,7 @@ body.field #side{border:0;min-height:0}
 body.field #side .tabs{display:none}
 body.field #side .tab{overflow:visible}
 #fieldNow{flex-direction:column;gap:8px;padding:12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--panel)}
-#leds{display:grid;grid-template-columns:repeat(12,1fr);gap:4px;height:18px}
-#leds i{border-radius:2px;opacity:.13;transition:opacity .12s}
-#leds i.on{opacity:1}
 #nowLine{display:flex;justify-content:space-between;align-items:baseline;font-size:15px}
-#nowConf{color:var(--mark);font-size:15px}
 #nowText{min-height:2.6em;font-size:19px;line-height:1.3;overflow-wrap:anywhere}
 #nowText .prev{display:block;font-size:13px;color:var(--text-3);line-height:1.35}
 #nowText .doubt{color:var(--text-3)}
@@ -263,7 +283,6 @@ body.field #side .tab{overflow:visible}
 .btn.big{height:44px;padding:0 18px;font-size:15px}
 #fieldCtl input{flex:1;min-width:60px}
 #fMinOut{min-width:36px;text-align:right}
-#fRecal{height:36px}
 body.field .det{height:44px}
 /* sheets: the Detector / Settings tab full-screen */
 .sheethead{display:none}
@@ -330,12 +349,14 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
   <div class="grp" id="grpGain">
     <label for="gain">Gain</label><input id="gain" type="range" min="0" max="102" step="2" style="width:100px"><span id="gainVal" class="gainval"></span>
     <button id="amp" class="btn" title="HackRF RF amplifier (+14 dB)">Amp</button>
-    <button id="mapBtn" class="btn" title="Survey map: the ranges you surveyed and what the detector found there">Map</button>
+    <button id="mapBtn" class="btn" title="Survey map: the ranges you surveyed and their power">Map</button>
   </div>
   <span id="status">Connecting…</span>
   <div class="grp">
     <button id="pp" class="btn icon" title="Pause playback (Space)"><svg viewBox="0 0 8 8"><path d="M1.2 1h2v6h-2zM4.8 1h2v6h-2z"/></svg></button>
     <input id="vol" type="range" min="0" max="1.5" step="0.05" value="0.9" style="width:72px" title="Volume">
+    <button id="detsBtn" class="btn" title="Show or hide the saved recordings">Detections</button>
+    <button id="cfgBtn" class="btn icon" title="Settings"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M9.4 1l.4 2.1c.5.2.9.4 1.3.8l2-.8 1.4 2.4-1.6 1.4c.1.5.1 1 0 1.5l1.6 1.4-1.4 2.4-2-.8c-.4.3-.8.6-1.3.8L9.4 15H6.6l-.4-2.1c-.5-.2-.9-.4-1.3-.8l-2 .8-1.4-2.4 1.6-1.4c-.1-.5-.1-1 0-1.5L1.5 6.2l1.4-2.4 2 .8c.4-.3.8-.6 1.3-.8L6.6 1zM8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5z"/></svg></button>
     <button id="helpBtn" class="btn icon" title="How to use this">?</button>
     <button id="menuBtn" class="btn icon fieldonly" title="Menu"><svg viewBox="0 0 10 10"><path d="M1 2h8M1 5h8M1 8h8" stroke="currentColor" stroke-width="1.2" fill="none"/></svg></button>
   </div>
@@ -343,29 +364,21 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
 <main>
   <section id="left">
     <div id="wfbar">
-      <select id="view" class="sel" title="What the waterfall shows"></select>
-      <select id="cmap" class="sel" title="Colour map"><option value="rainbow">Rainbow (SDR#)</option><option value="turbo">Turbo</option><option value="inferno">Inferno</option><option value="magma">Magma</option><option value="viridis">Viridis</option><option value="gray">Greyscale</option><option value="amber">Amber phosphor</option><option value="green">Green phosphor</option><option value="red">Red (night)</option></select>
-      <span class="lbl" style="margin-left:6px">Min confidence</span><input id="minConf" type="range" min="0" max="100" step="1" style="width:120px"><span id="minConfOut" class="num t2" style="min-width:34px"></span>
-      <label class="lbl" style="display:flex;align-items:center;gap:6px"><span class="switch"><input id="caps" type="checkbox" checked><span></span></span>Captions</label>
-      <div class="seg" id="modeSeg" style="margin-left:6px"><button data-m="0" title="Play each signal that sounds like a voice on its own">Individual voices</button><button data-m="1" title="Always play several signals at once, chosen so that together they sound like a voice">Composed voice</button></div>
-      <button id="blockBtn" class="btn" title="Block a frequency range (known station, carrier): drag across the waterfall. Shift-drag works too.">Block</button>
+      <div id="pipeInfo" title="The pipeline: the IQ steps, in order, then the sum of everything as sound"><span class="t2">Pipeline:</span> <span class="t3">no steps</span> <span class="t2">› sum of everything › audio</span></div>
+      <button id="blockBtn" class="btn" title="Block a frequency range (known station, steady line): drag across the waterfall. Shift-drag works too.">Block</button>
     </div>
     <div id="wfwrap">
       <canvas id="wf"></canvas><div id="tip"></div>
-      <div id="composeLine" class="num" style="display:none"></div>
-      <div id="layerLegend" style="display:none"></div>
       <div id="nav" style="position:absolute;right:12px;bottom:12px;display:flex;gap:6px">
         <button id="followBtn" class="btn" style="display:none">Follow playhead</button>
         <button id="liveBtn" class="btn primary" style="display:none">Return to live</button>
       </div>
     </div>
     <div id="fieldNow" class="fieldonly">
-      <div id="leds" title="Confidence of what's being heard"></div>
-      <div id="nowLine"><span id="nowFreq" class="num">Listening…</span><span id="nowConf" class="num"></span></div>
+      <div id="nowLine"><span id="nowFreq" class="num">Listening…</span></div>
       <div id="nowText"></div>
       <div id="fieldCtl">
         <span class="lbl">Min confidence</span><input id="fMin" type="range" min="0" max="100" step="1"><span id="fMinOut" class="num t2"></span>
-        <button id="fRecal" class="btn" title="Re-learn this band from the last few minutes of IQ">Recalibrate</button>
       </div>
     </div>
     <div id="scopeWrap">
@@ -374,21 +387,33 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
     </div>
   </section>
   <aside id="side">
-    <div class="sheethead"><strong id="sheetTitle"></strong><span style="flex:1"></span><button class="btn" id="sheetClose">Done</button></div>
-    <div class="tabs">
-      <button data-tab="dets" class="active">Detections</button>
-      <button data-tab="detector">Detector</button>
-      <button data-tab="sdr">Settings</button>
-    </div>
-    <div id="dets" class="tab active">
+    <div id="dets" class="pane">
       <div id="detHead"><span class="t2" id="detCount"></span><input id="search" class="search" type="search" placeholder="Search" title="Search transcripts and frequencies" autocomplete="off"></div>
+      <div id="detMin"><span class="lbl" title="Recordings below this confidence are hidden">Min confidence</span><input id="minConf" type="range" min="0" max="100" step="1"><span id="minConfOut" class="num t2" style="min-width:34px"></span></div>
       <div class="dethead"><span></span><span>Frequency</span><span>Time</span><span>Transcript</span><span>Conf.</span><span></span></div>
-      <div id="liveList"></div><div id="savedList"></div><div id="listMore" class="note" style="text-align:center"></div>
+      <div id="savedList"></div><div id="listMore" class="note" style="text-align:center"></div>
     </div>
-    <div id="detector" class="tab pad"></div>
-    <div id="sdr" class="tab pad"></div>
   </aside>
 </main>
+<div id="cfg" role="dialog" aria-label="Settings">
+  <div class="cfgbox">
+    <div class="cfghead">
+      <div class="tabs">
+        <button data-tab="general" class="active">General</button>
+        <button data-tab="sdr">Receiver &amp; storage</button>
+        <button data-tab="display">Display</button>
+      </div>
+      <span style="flex:1"></span><button class="xbtn" id="cfgClose" title="Close (Esc)" aria-label="Close">×</button>
+    </div>
+    <div id="general" class="tab pad active"></div>
+    <div id="sdr" class="tab pad"></div>
+    <div id="display" class="tab pad">
+      <h2>Waterfall</h2>
+      <div class="row wide"><label>Shows</label><select id="view" class="sel" title="What the waterfall shows"></select></div>
+      <div class="row wide"><label>Colour map</label><select id="cmap" class="sel" title="Colour map"><option value="rainbow">Rainbow (SDR#)</option><option value="turbo">Turbo</option><option value="inferno">Inferno</option><option value="magma">Magma</option><option value="viridis">Viridis</option><option value="gray">Greyscale</option><option value="amber">Amber phosphor</option><option value="green">Green phosphor</option><option value="red">Red (night)</option></select></div>
+    </div>
+  </div>
+</div>
 <script src="/static/app.js"></script>
 </body>
 </html>

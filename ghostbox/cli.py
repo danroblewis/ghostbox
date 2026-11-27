@@ -39,15 +39,15 @@ def default_data_dir():
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ghostbox",
-        description="SDR-native spirit box: detect voice-like AM/SSB signals across a whole band of IQ "
-                    "and browse them in a live web UI.",
+        description="SDR-native spirit box: the raw spectrum of a whole band of IQ as a live waterfall "
+                    "you can listen into, in a web UI.",
         epilog="Receiver options (--device, --serial/--device-index, --file, --freq, --rate, --gain, --amp) "
                "are saved to the config in the data directory, as if changed in the web page.")
     ap.add_argument("--host", default="127.0.0.1",
                     help="address to listen on (default 127.0.0.1; 0.0.0.0 = every interface)")
     ap.add_argument("--port", type=int, default=8765, help="web port (default 8765)")
     ap.add_argument("--data-dir", type=Path, default=None,
-                    help="folder for config, recordings, IQ ring, surveys, presets and band profiles "
+                    help="folder for config, recordings, IQ ring, surveys and presets "
                          "(default: the source checkout when run from one, else the current directory)")
     ap.add_argument("--open", action="store_true", help="open the web page in the default browser")
     ap.add_argument("--list-devices", action="store_true",

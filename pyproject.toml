@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "ghostbox"
 version = "0.1.0"
-description = "SDR-native spirit box: finds human-voice-like AM/SSB signals across a whole band of IQ from a HackRF or RTL-SDR, with a live web UI."
+description = "SDR-native spirit box: the raw spectrum of a whole band of IQ from a HackRF or RTL-SDR, as a live waterfall you can listen into, in a web UI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["sdr", "hackrf", "rtl-sdr", "spirit box", "iq", "voice detection", "am", "ssb"]
+keywords = ["sdr", "hackrf", "rtl-sdr", "spirit box", "iq", "waterfall"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: MacOS",
@@ -18,15 +18,12 @@ classifiers = [
     "Topic :: Communications :: Ham Radio",
     "Topic :: Multimedia :: Sound/Audio :: Analysis",
 ]
-# Everything the default settings use: the detector and web server (numpy, scipy, aiohttp), the
-# ML voice detector (torch + silero-vad: the voice check, calibration, "Tune to this detection")
-# and Whisper transcription (faster-whisper). Other speech engines are extras.
+# Everything the default settings use: the engine and web server (numpy, scipy, aiohttp) and
+# Whisper transcription (faster-whisper). Other speech engines are extras.
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "aiohttp>=3.9",
-    "torch>=2.1",
-    "silero-vad>=5.1",
     "faster-whisper>=1.0",
 ]
 
@@ -35,13 +32,11 @@ dependencies = [
 transformers = ["torch>=2.1", "transformers>=4.48"]
 # Vosk speech recognition.
 vosk = ["vosk>=0.3.44,!=0.3.45"]   # 0.3.45 has no macOS wheels
-# Plots for the offline analysis script (ghostbox.analyze).
-plots = ["matplotlib>=3.7"]
 # Kept so older install commands still work (these are now standard dependencies).
 vad = []
 whisper = []
 recommended = []
-all = ["ghostbox[transformers,vosk,plots]"]
+all = ["ghostbox[transformers,vosk]"]
 
 [project.scripts]
 ghostbox = "ghostbox.cli:main"

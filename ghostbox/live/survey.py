@@ -1,18 +1,12 @@
-"""Band survey: step the receiver across a wide range, calibrate on each step, map what it finds.
+"""Band survey: step the receiver across a wide range and map its power.
 
 Recording and processing overlap. The receiver records `dwell_s` of raw IQ at each step (the IQ
-ring) and moves on; a worker processes each finished step once:
-
-1. replay the step's IQ through the detector with permissive candidate finding, keeping every
-   candidate with all of its check scores and audio, and the maps (power, novelty, every check);
-2. calibrate on those candidates (the same weight search as Calibration, judged by the ML voice
-   detector) and re-evaluate them with the calibrated settings: confidence is a function of the
-   check scores, so this is a recomputation, not a second replay. The combined-score map is
-   rebuilt from the check maps with the calibrated weights;
-3. keep the clips of what the calibrated detector shows and transcribe them with Whisper tiny.
+ring) and moves on; a worker replays each finished step once and adds its power to the map. (The
+detector and the per-step calibration and transcription were removed with the filters; older
+surveys that have them can still be opened.)
 
 The receiver goes back to where it was. Surveys are saved to live_data/surveys/<name>.json (+ .npz
-maps, + <name>/ clips) after every step, and can be reopened.
+maps) after every step, and can be reopened.
 """
 import copy
 import json
@@ -23,18 +17,12 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from scipy.io import wavfile
 
-from . import stage1
-from .autotune import (ENOUGH, LADDER, SKIP, TUNE_DETECT, analyse_iq, analysis_config, calibrate_boxes,
-                       finding_checks, live_patch, pick_segments, rescore)
-from .config import CHECKS
+from .autotune import pick_segments, replay
 
 ROWS = 60                      # time rows per step (the map is wide and short)
 MAX_COLS = 4000                # columns per step
 USABLE = 0.8                   # fraction of the sample rate used per step (edges roll off)
-MAX_CLIPS = 25                 # clips kept (and transcribed) per step
-STAGE1_IDS = {c["id"] for c in CHECKS if c["stage"] == 1}
 
 
 class Survey:
@@ -47,7 +35,6 @@ class Survey:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._step = None
-        self._asr = None
         self.previews = {}                   # step index -> power preview while recorded / queued
         self._preview_live = None
 
@@ -93,26 +80,6 @@ class Survey:
     def _rows(self, st, ts):
         return np.clip(((ts - st["t_a"]) / (st["t_b"] - st["t_a"]) * ROWS).astype(int), 0, ROWS - 1)
 
-    def _on_maps(self, eng, ts, maps):
-        st = self._step
-        if st is None:
-            return
-        try:
-            t_a, t_b = self._window(eng, st)
-            sel = (ts >= t_a) & (ts < t_b)
-            if not sel.any():
-                return
-            rows = self._rows(st, ts[sel])
-            for name, a in maps.items():
-                _, ok, starts, ucol = self._layout(eng, st, a.shape[1])
-                q = (np.clip(a[sel][:, ok], 0, 1) * 255).astype(np.uint8)
-                red = np.maximum.reduceat(q, starts, axis=1)
-                img = st["maps"].setdefault(name, np.zeros((ROWS, st["ncols"]), np.uint8))
-                for r in np.unique(rows):
-                    img[r, ucol] = np.maximum(img[r, ucol], red[rows == r].max(axis=0))
-        except Exception:
-            traceback.print_exc()
-
     def _on_live_hop(self, eng, cfg, tb):
         """Live receiver hook while recording: paint the step being recorded (power preview)."""
         st = self._preview_live
@@ -145,11 +112,6 @@ class Survey:
         except Exception:
             traceback.print_exc()
 
-    def _on_clip(self, tr, meta, pcm16):
-        st = self._step
-        if st is not None:
-            st["clips"].setdefault(tr.id, []).append(pcm16)
-
     # ---------------- the run: record each step, process it in the background ----------------
     def _run(self, lo, hi, dwell):
         cfg0 = self.config.get()
@@ -163,8 +125,7 @@ class Survey:
         per = int(min(MAX_COLS, width / eng.df))
         name = f"{time.strftime('%Y-%m-%d_%H%M')}_{cfg0['sdr']['source']}_{lo / 1e6:.3f}-{hi / 1e6:.3f}MHz"
         res = {"lo": lo, "hi": hi, "dwell_s": dwell, "rows": ROWS, "step_hz": width, "cols_per_step": per,
-               "source": cfg0["sdr"]["source"], "sample_rate": fs, "n_steps": n, "calibrated": True,
-               "floor": float(cfg0["autotune"].get("floor", 0.3)), "file": name + ".json",
+               "source": cfg0["sdr"]["source"], "sample_rate": fs, "n_steps": n, "file": name + ".json",
                "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "steps": []}
         self.result = res
         jobs, prog = queue.Queue(), {"rec": 0, "done": 0}
@@ -264,71 +225,20 @@ class Survey:
             prog["done"] += 1
         self.state.pop("worker", None)
 
-    # ---------------- one step: replay once, calibrate, re-evaluate, transcribe ----------------
+    # ---------------- one step: replay it, map its power ----------------
     def _process(self, job, res, cfg0, name):
         i, n = job["i"], res["n_steps"]
-        tcfg, score_all = analysis_config(cfg0)
+        tcfg = copy.deepcopy(cfg0)
         tcfg["sdr"].update(center_hz=job["fc"], sample_rate=job["fs"], fmin_hz=job["lo"], fmax_hz=job["hi"])  # this step's band
-        score_all |= STAGE1_IDS - SKIP
-        boxes = []
-        for ladder in (0, 2):                              # loosen once if the step is very quiet
-            st = {"lo": job["lo"], "col_hz": (job["hi"] - job["lo"]) / job["per"], "ncols": job["per"],
-                  "dur": job["dur"], "t_a": None, "t_b": None,
-                  "lag": float(cfg0["analysis"]["settle_s"] + cfg0["analysis"]["hop_s"]), "pow": np.zeros((ROWS, job["per"])),
-                  "pow_n": np.zeros((ROWS, job["per"])), "maps": {}, "clips": {}, "last_t": -1e18, "bins": None}
-            self._step = st
-            self.state["worker"] = f"processing step {i + 1} of {n}"
-            try:
-                boxes = analyse_iq(self.root, tcfg, score_all, job["paths"], job["fs"], job["fc"], job["dur"], ladder,
-                                   hooks={"on_hop": self._on_hop, "on_maps": self._on_maps, "on_clip": self._on_clip})
-            finally:
-                self._step = None
-            if len(boxes) >= ENOUGH:
-                break
-        # calibrate on this step's candidates, then re-evaluate them with the calibrated settings
-        cal = None
-        checks = finding_checks(cfg0["checks"])            # what found the candidates
-        show = float(cfg0["detect"]["threshold"])
-        if len(boxes) >= 5:
-            self.state["worker"] = f"calibrating step {i + 1} of {n}"
-            cal = calibrate_boxes(boxes, cfg0, job["dur"] / 60, cfg0["autotune"]["per_min"], score_all - SKIP)
-            for k, w in cal["weights"].items():
-                checks[k] = {**checks[k], "enabled": w > 0, "weight": w}
-            checks["vad"] = {**checks["vad"], "enabled": True, "weight": cal["vad_weight"]}
-            show = cal["show_threshold"]
-        t_a = st["t_a"] or 0.0
-        sess0 = t_a - 1.0                                  # the replay's timeline starts with the first file
-        tracks = []
-        for b in boxes:
-            conf = rescore(b, checks) if cal else float(b.get("conf_max", b.get("conf", 0)))
-            if b["t1"] - b["t0"] < 0.3:
-                continue
-            tracks.append({"id": b["id"], "f": float(np.mean([p[1] for p in b["path"]])) if b.get("path") else (b["fmin"] + b["fmax"]) / 2,
-                           "fmin": b["fmin"], "fmax": b["fmax"],
-                           "t0": round(max(0.0, b["t0"] - t_a), 2), "t1": round(max(0.0, b["t1"] - t_a), 2),
-                           "conf": round(conf, 3), "vad": b["scores"].get("vad"), "clips": [], "text": None,
-                           "iq_t": [round(b["t0"] - sess0, 3), round(b["t1"] - sess0, 3)],
-                           "scores": {k: round(float(v), 3) for k, v in b["scores"].items()},
-                           "info": b.get("info", {}), "dur": round(b["t1"] - b["t0"], 2),
-                           "mode": {"usb": 1, "lsb": -1}.get(b.get("mode"), 0),
-                           "path": [[round(t - sess0, 3), f] for t, f in (b.get("path") or [])][-200:]})
-        # keep (and transcribe) the clips of what the calibrated detector shows
-        shown = sorted([t for t in tracks if t["conf"] >= show and st["clips"].get(t["id"])], key=lambda t: -t["conf"])[:MAX_CLIPS]
-        cdir = self.dir / name
-        cdir.mkdir(parents=True, exist_ok=True)
-        audio = []
-        for t in shown:
-            pcm = np.concatenate(st["clips"][t["id"]])
-            fn = f"s{i + 1}_{t['id']}.wav"
-            wavfile.write(cdir / fn, 16000, pcm)
-            t["clips"] = [f"/api/survey/clip?file={name}.json&clip={fn}"]
-            audio.append(pcm.astype(np.float32) / 32768)
-        if audio:
-            self.state["worker"] = f"transcribing step {i + 1} of {n}"
-            texts = self._transcribe(audio)
-            for t, tx in zip(shown, texts):
-                t["text"] = tx
-        # maps: power, and the combined score rebuilt with the calibrated weights
+        st = {"lo": job["lo"], "col_hz": (job["hi"] - job["lo"]) / job["per"], "ncols": job["per"],
+              "dur": job["dur"], "t_a": None, "t_b": None, "lag": 0.0, "pow": np.zeros((ROWS, job["per"])),
+              "pow_n": np.zeros((ROWS, job["per"])), "last_t": -1e18, "bins": None}
+        self._step = st
+        self.state["worker"] = f"processing step {i + 1} of {n}"
+        try:
+            replay(self.root, tcfg, job["paths"], job["fs"], job["fc"], job["dur"], hooks={"on_hop": self._on_hop})
+        finally:
+            self._step = None
         with np.errstate(invalid="ignore", divide="ignore"):
             pw = st["pow"] / st["pow_n"]
         filled = st["pow_n"] > 0
@@ -338,38 +248,10 @@ class Survey:
             pw = np.where(filled, pw, np.nan_to_num(colmean, nan=floor))
         else:
             pw = np.full_like(pw, floor)
-        maps = st["maps"]
-        if cal:
-            parts = {k: maps[k].astype(np.float32) / 255 for k in maps if k in STAGE1_IDS}
-            g = stage1.combine(parts, checks)
-            if g is not None:
-                maps["score"] = (np.clip(g, 0, 1) * 255).astype(np.uint8)
-        summary = None
-        if cal:
-            # everything needed to put this step's calibration live again (Tune here)
-            lp = live_patch(cal, {**TUNE_DETECT, **LADDER[ladder]})
-            summary = {"candidates": len(boxes), "voice_like": cal["voice_like"], "kept_checks": bool(cal.get("kept_checks")),
-                       "show_threshold": show, "capture_threshold": cal["capture_threshold"],
-                       "weights": {k: v["weight"] for k, v in lp["checks"].items()}, "detect": lp["detect"], "full": True}
         return {"lo": job["lo"], "hi": job["hi"], "cols": job["per"], "fc": job["fc"], "fs": job["fs"],
                 "iq_files": [Path(p).name for p in job["paths"]], "floor_db": floor, "pow": pw.astype(np.float32),
-                "maps": maps, "tracks": sorted(tracks, key=lambda t: t["t0"]), "calibration": summary,
+                "maps": {}, "tracks": [], "calibration": None,
                 "dwell_s": round((st["t_b"] or 0) - (st["t_a"] or 0), 2)}
-
-    def _transcribe(self, audio):
-        try:
-            from .asr import load
-            from .transcribe import strip_stock
-            if self._asr is None:
-                self._asr = load("tiny", cpu_threads=4, workers=1)
-            phrases = self.config.get()["whisper"].get("filter_phrases", [])
-            out = []
-            for k in range(0, len(audio), 8):
-                out += [strip_stock(tx, phrases) or None for tx, _ in self._asr.transcribe(audio[k:k + 8], "en")]
-            return out
-        except Exception:
-            traceback.print_exc()
-            return [None] * len(audio)
 
     # ---------------- results ----------------
     def meta(self, res=None):

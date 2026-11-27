@@ -1,84 +1,41 @@
-"""Live detection engine.
+"""Live engine, stripped to the base the filters will be rebuilt on.
 
-  source -> raw IQ ring -> power spectrogram (frames) -> waterfall rows to clients
-                         -> every hop: stage 1 over the last window, on the newest
-                            *settled* frames (settle_s behind live, so zero-phase
-                            filters and windows have future context)
-                         -> novelty / prominence -> per-frame candidates -> tracker
-                         -> per track: AM demod of exactly that path from raw IQ
-                            -> stage 2 checks -> confidence
-                         -> detections: events + audio chunks (stream timestamps)
-                            + recordings (WAV + JSON metadata + narrowband IQ)
+  source -> raw IQ (kept in memory for a few seconds, and optionally the IQ ring on disk)
+         -> power spectrogram (frames) -> the power waterfall, rows to clients
+         -> the pipeline (pipeline.py): IQ steps (none yet), then the sum of everything, as audio
 
-Times are "stream seconds" (samples / fs since the source started). Clients play
-audio at stream time + delay, which keeps every sound locked to its place on the
-waterfall.
+There are no filters and no detections: nothing is chosen automatically. Saved recordings from
+before can still be browsed (detail, clip).
+
+Times are "stream seconds" (samples / fs since the engine started). Clients play audio at stream
+time + delay, which keeps every sound locked to its place on the waterfall.
 """
 import base64
 import collections
-import io
+import json
 import os
 import shutil
-from concurrent.futures import ThreadPoolExecutor
-import json
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 from scipy.io import wavfile
-from scipy.ndimage import maximum_filter1d, uniform_filter1d
-from scipy.signal import butter, firwin, resample_poly, sosfilt, sosfilt_zi, sosfiltfilt
 
 from ..maps import power_frames
-from . import compose, stage1, stage2, voicefx
-from .config import CHECKS
+from .audio import fade
+from .pipeline import AUDIO_FS, Pipeline
 from .sources import _to_complex, make_source
-from .audio import FS as _AFS, SmoothGain, StreamingDenoiser, VoiceBand, channel_hz, detector_for, fade, render_clip
-from .profile import BandProfile
-from .vad_batch import vad_probs_batch
 from .transcribe import Transcriber
 
-AUDIO_FS = 16000
-_LP = {}
 
 
 def _b64(a):
     return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
-
-
-def _oscillator(f_offset, n, fs, L=4096):
-    """exp(-j 2 pi integral f dt) for a piecewise-constant frequency, without n trig calls:
-    each constant run is built as (block steps) x (one block), i.e. ~n/L + L exps per run."""
-    f = np.full(n, float(f_offset)) if np.ndim(f_offset) == 0 else np.asarray(f_offset, np.float64)
-    starts = np.concatenate([[0], np.flatnonzero(np.diff(f)) + 1, [n]])
-    out = np.empty(n, np.complex64)
-    phase = 0.0
-    for a, b in zip(starts[:-1], starts[1:]):
-        m = b - a
-        w = -2 * np.pi * f[a] / fs
-        base = np.exp(1j * w * np.arange(L))
-        steps = np.exp(1j * (phase + w * L * np.arange(-(-m // L))))
-        out[a:b] = (steps[:, None] * base[None, :]).ravel()[:m]
-        phase += w * m
-    return out
-
-
-_SSB = {}
-
-
-def _ssb_taps(bw_hz, side):
-    """Complex band-pass keeping one side of the carrier: 150 Hz .. bw on the upper (+1) or lower (-1) side."""
-    key = (round(bw_hz), side)
-    if key not in _SSB:
-        half = (bw_hz - 150) / 2
-        n = np.arange(129) - 64
-        h = firwin(129, half, fs=AUDIO_FS) * np.exp(side * 2j * np.pi * (150 + half) * n / AUDIO_FS)
-        _SSB[key] = h.astype(np.complex64)
-    return _SSB[key]
 
 
 def iq_cut_wav(segs, t0, t1, f_center, rate=48000):
@@ -127,251 +84,39 @@ def load_iq(segs, t0, t1):
     return _to_complex(np.concatenate(parts), True), start, fs, fc
 
 
-def span(chunks, t0, n):
-    """n samples at AUDIO_FS from stream time t0 out of [(t_start, array)] chunks, zeros where there
-    are none. Returns (samples, share of them covered)."""
-    out = np.zeros(n, np.float32)
-    got = 0
-    for t, a in chunks:
-        i = int(round((t - t0) * AUDIO_FS))
-        lo, hi = max(0, i), min(n, i + len(a))
-        if hi > lo:
-            out[lo:hi] = a[lo - i: hi - i]
-            got += hi - lo
-    return out, min(1.0, got / max(1, n))
-
-
-def detect_clip(iq, au, mode=0):
-    """Demodulated audio (before playback processing) from 16 kHz baseband IQ."""
-    if mode != 0:
-        s = np.convolve(iq, _ssb_taps(channel_hz(au), int(np.sign(mode))), mode="same")
-        env = (2 * s.real).astype(np.float32)
-    else:
-        det = detector_for(au, 0)
-        env = det.process(iq) if det is not None else np.abs(iq).astype(np.float32)
-    hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
-    return sosfilt(hp, env - env[:200].mean()).astype(np.float32)
-
-
-def baseband(loaded, pts, au, offset_hz=0.0):
-    """16 kHz complex baseband following the detection's frequency path (+ a fine offset)."""
-    x, start, fs, fc = loaded
-    pts = np.array(pts, float)
-    ts = start + np.arange(len(x)) / fs
-    f_off = pts[np.clip(np.searchsorted(pts[:, 0], ts, side="right") - 1, 0, len(pts) - 1), 1] - fc + offset_hz
-    iq, _ = demod(x, fs, f_off, channel_hz(au), 0)
-    return iq
-
-
-def render_segments(segs, t0, t1, pts, au, mode=0, offset_hz=0.0):
-    """Playback audio (int16, 16 kHz) of [t0, t1] from IQ-ring segments, demodulated and processed
-    exactly like live playback with audio settings `au`. pts: [[time, absolute frequency], ...]."""
+def render_segments(segs, t0, t1, au, steps=()):
+    """Audio (int16, 16 kHz) of [t0, t1] from IQ-ring segments: that IQ through the pipeline (its
+    steps, then the sum of everything), faded in and out."""
     loaded = load_iq(segs, t0, t1)
     if loaded is None:
         return None
-    audio = detect_clip(baseband(loaded, pts, au, offset_hz), au, mode)
-    audio = np.clip(render_clip(audio, au), -1, 1)
-    return (audio * 32767).astype(np.int16)
-
-
-def render_mix(meta, ring_segments, au):
-    """A composed-voice piece re-rendered from the IQ ring with audio settings `au`: every component
-    demodulated for the time it played and mixed back in place (equal power where several overlap).
-    ring_segments(epoch, t0, t1) finds the IQ. Returns int16 PCM at 16 kHz or None if no IQ is left."""
-    t0, t1 = float(meta["stream_t0"]), float(meta["stream_t1"])
-    n = int(round((t1 - t0) * AUDIO_FS))
-    mix, cover = np.zeros(n, np.float32), np.zeros(n, np.float32)
-    got = False
-    for c in meta.get("components") or []:
-        a, b = max(t0, float(c["t0"])), min(t1, float(c["t1"]))
-        if b - a < 0.1:
-            continue
-        loaded = load_iq(ring_segments(meta["epoch"], a, b), a, b)
-        if loaded is None:
-            continue
-        if "lo" in c:                                   # a key: the channel's sound in one band, at its level
-            au_k = dict(au, voice_band=False)
-            y = detect_clip(baseband(loaded, [[a, float(c["f"])]], au_k), au_k, 0)
-            y = sosfiltfilt(butter(4, (c["lo"], c["hi"]), btype="bandpass", fs=AUDIO_FS, output="sos"), y)
-            if au.get("denoise", True):
-                y = StreamingDenoiser(au.get("denoise_strength", 1.0), au.get("denoise_floor_db", -18)).process(y.astype(np.float32))
-            y = SmoothGain(0.18 * 10 ** (float(c.get("lvl", 0)) / 20)).process(y)
-            y = fade(y, AUDIO_FS, 0.05, 0.05)
-        else:
-            y = render_clip(detect_clip(baseband(loaded, [[a, float(c["f"])]], au), au, 0), au)
-        i = int(round((loaded[1] - t0) * AUDIO_FS))
-        lo, hi = max(0, i), min(n, i + len(y))
-        if hi > lo:
-            mix[lo:hi] += y[lo - i: hi - i]
-            cover[lo:hi] += 1
-            got = True
-    if not got:
-        return None
-    if any("lo" in c for c in meta.get("components") or []):
-        mix = voicefx.shape(mix, meta.get("compose") or {})
-    y = SmoothGain().process(mix if any("lo" in c for c in meta.get("components") or []) else mix / np.sqrt(np.maximum(cover, 1)))
+    x, start, fs, fc = loaded
+    _, y = Pipeline(fs, int(round(start * fs)), steps).process(x)
+    y = fade(y, AUDIO_FS, au.get("fade_s", 0.15), au.get("fade_s", 0.15))
     return (np.clip(y, -1, 1) * 32767).astype(np.int16)
 
 
-def carrier_line(iq, bw_hz, min_n=4096):
-    """(offset Hz, share) of the strongest line in a 16 kHz narrowband channel: its offset from the
-    centre and its share of the channel's power (within +-3 bins). (None, None) if too short."""
-    n = min(len(iq), 32768)
-    if n < min_n:
-        return None, None
-    S = np.abs(np.fft.fft(iq[-n:] * np.hanning(n))) ** 2
-    f = np.fft.fftfreq(n, 1 / AUDIO_FS)
-    ch = np.abs(f) < bw_hz
-    k = int(np.argmax(np.where(ch, S, 0)))
-    tot = S[ch].sum()
-    if tot <= 0:
-        return None, None
-    idx = np.arange(k - 3, k + 4) % n
-    return float(f[k]), float(S[idx].sum() / tot)
-
-
-def demod(x, fs, f_offset, bw_hz, mode=0):
-    """Mix x (complex, at fs) down by f_offset (scalar or per-sample Hz), decimate to 16 kHz.
-    mode 0: AM (envelope). +1/-1: upper/lower single sideband (product detector: keep one side,
-    take the real part). Returns (narrowband complex IQ at 16 kHz, audio at 16 kHz)."""
-    y = x * _oscillator(f_offset, len(x), fs)
-    d1 = max(1, int(fs // 160000))
-    n = len(y) // d1 * d1
-    y = y[:n].reshape(-1, d1).mean(axis=1)                      # CIC-like first stage
-    r1 = fs / d1
-    fr = Fraction(AUDIO_FS / r1).limit_denominator(1000)
-    y = resample_poly(y, fr.numerator, fr.denominator).astype(np.complex64)
-    key = round(bw_hz)
-    if key not in _LP:
-        _LP[key] = firwin(129, bw_hz, fs=AUDIO_FS).astype(np.float32)
-    y = np.convolve(y, _LP[key], mode="same").astype(np.complex64)
-    if mode:
-        s = np.convolve(y, _ssb_taps(bw_hz, int(np.sign(mode))), mode="same")
-        return y, (2 * s.real).astype(np.float32)
-    return y, np.abs(y).astype(np.float32)
-
-
-class Track:
-    _next = 1
-
-    def __init__(self, t, f, score, chain):
-        self.id = Track._next
-        Track._next += 1
-        self.chain = chain or self.id
-        self.t0 = t
-        self.t_last = t
-        self.path = [(t, f)]
-        self.frames = []                 # (t, f, combined, {check: score})
-        self.add(t, f, score, {})
-        self.audio_until = None          # stream time up to which audio has been demodulated
-        self.audio, self.iq = [], []     # [(t_start, array)]
-        self.emitted_until = None
-        self.detected = False
-        self.conf = 0.0
-        self.conf_hist = []
-        self.scores, self.info = {}, {}
-        self.hp_zi = None
-        self.out = []                    # processed playback audio [(t_start, float32)]: denoise + gain + fades
-        self.den, self.gain = None, SmoothGain()
-        self.band = None                 # hard voice band-pass (playback)
-        self.det, self.det_kind = None, None   # synchronous detector (state across chunks)
-        self.audio_t0 = None             # stream time where this track's audio (incl. pre-roll) starts
-        self.vad_p, self.vad_t = np.zeros(0, np.float32), -1e18   # incremental ML voice scores
-        self.agc = None
-        self.seg_start = t               # recording segment start
-        self.seg_index = 0
-        self.wavs = []                   # recording files for click-to-play
-        self.clips = []                  # playable URLs (saved WAV or in-memory clip)
-        self.modes = []                  # per frame: 0 AM, +1 USB, -1 LSB (from stage 1)
-        self.car_off = 0.0               # Hz from the track's frequency to its carrier (when it has one)
-        self.has_carrier = False         # a steady carrier dominates the channel: AM on that carrier
-        self.pitch = []                  # per frame: (t, f0_hz, comb strength) at this track's frequency
-        self.hop_ref = None              # pitch where the previous hop of this chain ended
-
-    def mode(self):
-        if self.has_carrier:             # a carrier says AM, whatever stage 1 guessed
-            return 0
-        recent = self.modes[-25:]
-        if not recent:
-            return 0
-        s = sum(recent)
-        return int(np.sign(s)) if abs(s) > len(recent) / 2 else 0
-
-    def f0_over(self, t_from, t_to, min_c=0.15):
-        v = [f for t, f, c in self.pitch if t_from <= t <= t_to and c >= min_c and f > 0]
-        return float(np.median(v)) if len(v) >= 3 else None
-
-    def add(self, t, f, score, checks):
-        self.t_last = t
-        if not self.path or abs(self.path[-1][1] - f) > 1 or t - self.path[-1][0] > 0.2:
-            self.path.append((t, f))
-        self.frames.append((t, f, score, checks))
-        if len(self.frames) > 2000:
-            self.frames = self.frames[-2000:]
-
-    def freq_at(self, t):
-        ts = np.array([p[0] for p in self.frames])
-        fs = np.array([p[1] for p in self.frames])
-        idx = np.clip(np.searchsorted(ts, t, side="right") - 1, 0, len(ts) - 1)
-        return fs[idx]
-
-    def box(self, fc):
-        fr = [p[1] for p in self.path]
-        return {"id": self.id, "chain": self.chain, "t0": self.t0, "t1": self.t_last,
-                "fmin": fc + min(fr), "fmax": fc + max(fr),
-                "path": [[round(t, 3), fc + f] for t, f in self.path[-200:]],
-                "conf": round(self.conf, 3),
-                "conf_max": round(max([c for _, c in self.conf_hist] or [self.conf]), 3),
-                "scores": {k: round(v, 3) for k, v in self.scores.items()},
-                "info": self.info, "wavs": list(self.wavs), "clips": list(self.clips), "detected": self.detected,
-                "mode": {0: "am", 1: "usb", -1: "lsb"}[self.mode()],
-                "audio_t0": self.audio_t0 if self.audio_t0 is not None else self.t0}
-
-
 class Engine:
-    def __init__(self, config, emit, root, source=None, oneshot=False, transcribe=True, score_all=()):
-        """source/oneshot: run once over a given source (auto-tune) without housekeeping or disk writes.
-        score_all: check ids to compute for every track even when disabled (auto-tune needs every
-        column); they don't affect which candidates are found or their confidence."""
-        self.score_all = set(score_all)
-        self.on_hop = None                       # (engine, cfg, tb) after each hop's tracking (band survey)
-        self.on_maps = None                      # (engine, ts, {view: [frames, bins] in 0..1}) each hop
-        self.on_clip = None                      # (track, meta, pcm16) for every finished segment
-        self.show_conf = 0.0                     # what counts as "caught something" for auto-recalibration
-        self.last_hit = time.time()
+    def __init__(self, config, emit, root, source=None, oneshot=False, transcribe=True):
+        """source/oneshot: run once over a given source (a replay) without housekeeping or disk writes."""
+        self.on_hop = None                       # (engine, cfg, t) after each hop (band survey)
         self.config = config
         self.emit = emit
         self.root = Path(root)
         self.source_override, self.oneshot = source, oneshot
         self.done = threading.Event()
-        self.mem = collections.OrderedDict()        # key -> {"meta", "pcm"}: detections kept in memory, not on disk
-        self.mem_bytes = 0
         self._restart = threading.Event()
         self._stop = threading.Event()
         self.status = {"state": "starting"}
-        self.tracks, self.ended = [], []
         self.t_origin = time.time()                 # timeline zero: all times are seconds since this
         self.hist = collections.defaultdict(collections.deque)   # view -> waterfall chunks (history)
-        self.box_hist = []                          # finished detections still inside the history window
         self.iq_file, self.iq_seg_t0 = None, None
         self._last_prune = 0.0
         self.storage = {"paused": False, "free_gb": None}   # disk guard state
-        self.chains = {}                            # hop chain id -> finished member clips
-        self.comod = None                           # latest co-modulation candidates / pairs
-        self.composer = compose.Composer()          # composed-voice mode: which candidates play together
-        self.cmix = None                            # the composed mix's current piece (a virtual detection)
-        self.cgain, self.cmix_until = {}, None      # component gains last hop; mix audio emitted up to
-        self.clevel = SmoothGain()
-        self.c_conf = collections.deque()           # composing: (t, layered confidence row [bins]) per frame
-        self.c_fine = collections.deque()           # composing: (frame times, fine power [frames, fine bins]) per hop
-        self.channels = {}                          # composing: channel id -> demodulator state of a playing frequency
-        self.ckeys, self.kstate = {}, {}            # composing: key id -> key (channel, band); key -> band filter / level
-        self.cshape, self.cvoice = None, {}
-        self.cgate, self.cvad = 0.0, []             # composing: mix heard (Min confidence) last hop; recent ML voice
-        self.compose_offline = False                # compose in a one-shot replay too (tests / replays)
-        self.transcriber = Transcriber(config, emit, on_result=self._on_transcript) if transcribe else None
+        self.pipe, self.pipe_key = None, None       # the pipeline (pipeline.py) and the steps it was built from
+        self.transcriber = Transcriber(config, emit) if transcribe else None
         self.pool = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4))
-        self.lock = threading.RLock()                # re-entrant: _finish runs inside locked analysis
+        self.lock = threading.RLock()
         threading.Thread(target=self._run, daemon=True).start()
 
     # ---------------- control ----------------
@@ -385,22 +130,11 @@ class Engine:
         """(epoch, stream time) of the last receiver (re)start: IQ before it was recorded differently."""
         return (self.t_origin, getattr(self, "session_t0", 0.0))
 
-    def snapshot(self):
-        """Live detections (history comes from history())."""
-        with self.lock:
-            fc = getattr(self, "fc", 0)
-            return [t.box(fc) for t in self.tracks if t.detected] + ([self._cmix_box()] if self.cmix else [])
-
     def history(self, view, t0, t1, max_chunks=1500):
-        """Waterfall chunks of one view and detection boxes overlapping [t0, t1]."""
+        """Waterfall chunks of one view overlapping [t0, t1]."""
         with self.lock:
             chunks = [c for c in list(self.hist.get(view, ())) if c["t0"] + c["n"] * c["dt"] >= t0 and c["t0"] <= t1]
-            fc = getattr(self, "fc", 0)
-            boxes = [b for b in self.box_hist if b["t1"] >= t0 and b["t0"] <= t1]
-            boxes += [t.box(fc) for t in self.tracks if t.detected]
-            if self.cmix:
-                boxes.append(self._cmix_box())
-        return chunks[-max_chunks:], boxes
+        return chunks[-max_chunks:]
 
     # ---------------- main loop ----------------
     def _reset(self, cfg):
@@ -423,68 +157,14 @@ class Engine:
         # continuous timeline across receiver restarts: start this session at "now"
         self.n_samples = int(round((time.time() - self.t_origin) * self.fs))
         self.session_t0 = self.n_samples / self.fs              # when the current receiver settings began
-        self.last_hit = time.time()                              # last detection at/above show_conf (wall clock)
-        self.raw_keep = int(self.fs * (an["window_s"] + 4))
+        self.raw_keep = int(self.fs * 8)                         # a few seconds of raw IQ in memory
         self.raw = np.zeros(self.raw_keep, np.complex64)
-        self.spec, self.spec_t = [], []
-        self.pitch_spec = []                        # per hop: (C, F0) [frames, kept bins] or None
-        self._fine_setup()
-        self.comod_view = None
-        if getattr(self, "profile", None):
-            self.profile.maybe_save(force=True)
-        pkey = BandProfile.key(self.fc, self.fs, an["bin_hz"], self.f_lo, self.f_hi)
-        self.profile = BandProfile(self.root / "live_data" / "profiles" / pkey, len(self.f))
-        self.baseline = None
+        self.spec, self.spec_t = [], []                          # the last few hops' power frames (survey)
         self.wf_lo = None
-        self.wf_base, self.wf_base_n = None, 0           # power-change view: per-column running average (dB)
-        self.analyzed_until = self.n_samples / self.fs
-        self.utc0 = self.t_origin
         self._close_iq()
-        with self.lock:
-            for t in self.tracks:
-                if t.detected:
-                    self._finish(t, cfg, final=True)
-            self.tracks, self.ended = [], []
-            self._cmix_close(cfg)
-            self._compose_reset()
-        self.chains = {}
+        self.pipe = None                                         # rebuilt for the new rate at the next hop
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
                    "frame_rate": self.fr, "t": self.n_samples / self.fs})
-
-    def _fine_setup(self):
-        """Fine (25 Hz) spectrum layout for the pitch comb: which fine bins feed each kept coarse bin."""
-        self.fine_n = self.frame_len                         # one 40 ms segment per 25 fps frame
-        self.fine_df = self.fs / self.fine_n
-        ff = np.fft.fftshift(np.fft.fftfreq(self.fine_n, 1 / self.fs))
-        margin = 3400 + 100
-        lo, hi = float(self.f[0]) - self.df / 2, float(self.f[-1]) + self.df / 2
-        self.fine_sel = np.flatnonzero((ff >= lo - margin) & (ff <= hi + margin))
-        fsel = ff[self.fine_sel]
-        self.fine_f = fsel.astype(np.float32)               # fine bin frequencies (Hz from the centre)
-        # for each kept coarse bin, the fine bins within it (contiguous): reduceat start indices
-        starts = np.searchsorted(fsel, self.f - self.df / 2)
-        self.fine_starts = np.clip(starts, 0, len(fsel) - 1)
-
-    def _pitch_maps(self, x, cfg, keep_power=False):
-        """Comb strength and pitch per kept coarse bin, for each 40 ms frame of x (and the fine power
-        spectrum itself if keep_power)."""
-        ch = cfg["checks"]
-        n = len(x) // self.fine_n
-        frames = x[: n * self.fine_n].reshape(n, self.fine_n)
-        win = np.hanning(self.fine_n).astype(np.float32)
-
-        def job(rows):
-            X = np.fft.fftshift(np.fft.fft(frames[rows] * win, axis=1), axes=1)[:, self.fine_sel]
-            Pf = (X.real ** 2 + X.imag ** 2).astype(np.float32)
-            C, F0 = stage1.pitch_frames(Pf, ch["comb"]["f0_min"], ch["comb"]["f0_max"], df=self.fine_df)
-            Cc = np.maximum.reduceat(C, self.fine_starts, axis=1)
-            w = np.maximum(C, 1e-6)                                # pitch: comb-weighted within each coarse bin
-            Fc = np.add.reduceat(w * F0, self.fine_starts, axis=1) / np.add.reduceat(w, self.fine_starts, axis=1)
-            return Cc.astype(np.float32), Fc.astype(np.float32), (Pf if keep_power else None)
-
-        parts = list(self.pool.map(job, [slice(i, min(n, i + 5)) for i in range(0, n, 5)]))
-        return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
-                np.concatenate([p[2] for p in parts]) if keep_power else None)
 
     def _run(self):
         src = None
@@ -508,12 +188,9 @@ class Engine:
                     misses = 0
                 cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = self.fc, self.fs
                 n = int(self.fs * cfg["analysis"]["hop_s"]) // self.frame_len * self.frame_len
-                t_wait = time.time()
                 x = src.read(n, timeout=3.0)
                 t_got = time.time()
-                if x is None and self.oneshot:                 # end of the recording: finish every track
-                    with self.lock:
-                        self._tracks_audio_and_stage2(cfg, self.analyzed_until, self.analyzed_until + 1e6)
+                if x is None and self.oneshot:                 # end of the recording
                     break
                 if x is None:
                     misses += 1
@@ -531,7 +208,11 @@ class Engine:
                 t_a = time.time()
                 self._ingest(x, cfg)
                 self.timing["ingest"] = time.time() - t_a
-                self._analyze(cfg)
+                t_p = time.time()
+                self._audio(x, cfg)
+                self.timing["pipeline"] = time.time() - t_p
+                if self.on_hop is not None:
+                    self.on_hop(self, cfg, self.n_samples / self.fs)
                 # load = all work for this second of signal (conversion + processing) / its duration.
                 # Time spent blocked waiting for samples isn't work; conversion happens inside read().
                 busy = time.time() - t_got + getattr(src, "convert_s", 0.0)
@@ -540,9 +221,7 @@ class Engine:
                                "epoch": self.t_origin, "fmin": self.f_lo, "fmax": self.f_hi,
                                "fc": self.fc, "t": self.n_samples / self.fs, "load": round(load, 2),
                                "dropped": getattr(src, "dropped", 0), "error": getattr(src, "error", ""),
-                               "tracks": len(self.tracks), "vad": stage2.vad_available(),
                                "storage": self.storage,
-                               "profile": {"learned_min": round(self.profile.learned_s / 60, 1)} if getattr(self, "profile", None) else None,
                                "timing": {k: round(v, 3) for k, v in getattr(self, "timing", {}).items()},
                                "progress": (src.sent / src.total) if getattr(src, "total", None) else None,
                                "whisper": {"model": self.transcriber.model_name, "error": self.transcriber.error,
@@ -556,13 +235,12 @@ class Engine:
                 time.sleep(1)
         if src:
             src.stop()
-        if getattr(self, "profile", None) and not self.oneshot:
-            self.profile.maybe_save(force=True)
         self.done.set()
 
-    # ---------------- ingest: raw ring + spectrogram + waterfall ----------------
+    # ---------------- ingest: raw IQ + spectrogram + waterfall ----------------
     def _ingest(self, x, cfg):
         n = len(x)
+        self._x0 = self.n_samples                            # where this block starts (for the pipeline)
         i0 = self.n_samples % self.raw_keep
         first = min(n, self.raw_keep - i0)
         self.raw[i0:i0 + first] = x[:first]
@@ -581,25 +259,9 @@ class Engine:
         ts = t_start + (np.arange(len(P)) + 0.5) / self.fr
         self.spec.append(P)
         self.spec_t.append(ts)
-        ch = cfg["checks"]
-        composing = self.composing(cfg) and self.fine_n * self.fr == int(self.fs)
-        if (any(ch[k]["enabled"] or k in self.score_all or k in self._layer_ids(cfg) for k in stage1.PITCH) or composing) \
-                and self.fine_n * self.fr == int(self.fs):
-            t_p = time.time()
-            C, F0, Pf = self._pitch_maps(x, cfg, keep_power=composing)
-            self.pitch_spec.append((C, F0))
-            if composing:                                # the candidates' sidebands come from these
-                self.c_fine.append((ts[: len(Pf)], Pf))
-                while self.c_fine and self.c_fine[0][0][-1] < ts[-1] - cfg["compose"]["window_s"] - cfg["analysis"]["settle_s"] - 2:
-                    self.c_fine.popleft()
-            self.timing["pitch"] = time.time() - t_p
-        else:
-            self.pitch_spec.append(None)
-        nkeep = int(cfg["analysis"]["window_s"] * self.fr)
-        while sum(len(p) for p in self.spec) - len(self.spec[0]) >= nkeep:
+        while len(self.spec) > 4:
             self.spec.pop(0)
             self.spec_t.pop(0)
-            self.pitch_spec.pop(0)
         self._waterfall(P, ts, cfg)
 
     def _waterfall(self, P, ts, cfg):
@@ -613,27 +275,14 @@ class Engine:
         self.wf_lo = lo if self.wf_lo is None else 0.9 * self.wf_lo + 0.1 * lo
         q = np.clip((db - self.wf_lo) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
         self._chunk("power", ts, q, cfg)
-        self._chunk("power_change", ts, self._power_change(db, cfg["display"]), cfg)
 
-    def _power_change(self, db, disp):
-        """Power change view: how far each column rises above its own running average, so steady
-        carriers cancel and only what's new shows. The average starts as a plain mean (so it's useful
-        within seconds of a retune) and becomes an exponential average with memory change_tau_s."""
-        if self.wf_base is None or self.wf_base.shape != db.shape[1:]:
-            self.wf_base, self.wf_base_n = db[0].astype(np.float64), 0
-        k_min = 1.0 / max(1.0, float(disp.get("change_tau_s", 30.0)) * self.fr)
-        out = np.empty(db.shape, np.float32)
-        for i in range(len(db)):
-            out[i] = db[i] - self.wf_base
-            self.wf_base_n += 1
-            self.wf_base += max(k_min, 1.0 / self.wf_base_n) * (db[i] - self.wf_base)
-        lo, rng = float(disp.get("change_floor_db", 6.0)), max(1.0, float(disp.get("change_range_db", 24.0)))
-        return np.clip((out - lo) / rng * 255, 0, 255).astype(np.uint8)
-
-    def _chunk(self, mode, ts, q, cfg):
-        """One waterfall chunk (n rows): sent to clients watching `mode` and kept as history."""
+    def _chunk(self, mode, ts, q, cfg, keep=True):
+        """One waterfall chunk (n rows): sent to clients watching `mode` and (keep) kept as history."""
         msg = {"type": "wf", "mode": mode, "t0": float(ts[0] - 0.5 / self.fr), "dt": 1.0 / self.fr,
                "n": int(q.shape[0]), "w": int(q.shape[1]), "fmin": self.f_lo, "fmax": self.f_hi, "rows": _b64(q)}
+        if not keep:
+            self.emit(msg)
+            return
         with self.lock:
             h = self.hist[mode]
             h.append(msg)
@@ -641,22 +290,6 @@ class Engine:
             while h and h[0]["t0"] < keep_from:
                 h.popleft()
         self.emit(msg)
-
-    def _view_rows(self, scores, comb, ev, ts, cfg, extra_views=()):
-        """Waterfall rows for the detector's maps (values 0..1 -> 0..255): the combined score, novelty,
-        and every check that was computed (only enabled checks are), so each view has history."""
-        if not len(ts):
-            return
-        width = int(cfg["display"]["width"])
-        if self.on_maps is not None:
-            self.on_maps(self, ts, dict([("score", comb), ("novelty", ev)] + list(scores.items()) + list(extra_views)))
-        for mode, a in [("score", comb), ("novelty", ev)] + list(scores.items()) + list(extra_views):
-            K = a.shape[1]
-            pool = max(1, -(-K // width))
-            pad = (-K) % pool
-            ap = np.pad(a, ((0, 0), (0, pad))).reshape(len(a), -1, pool).max(axis=2)
-            q = (np.clip(ap, 0, 1) * 255).astype(np.uint8)
-            self._chunk(mode, ts, q, cfg)
 
     def _raw_span(self, s0, s1):
         """Absolute sample range [s0, s1) from the ring (must still be held)."""
@@ -669,943 +302,33 @@ class Engine:
             return self.raw[a:b], s0
         return np.concatenate([self.raw[a:], self.raw[:b]]), s0
 
-    # ---------------- analysis ----------------
-    def composing(self, cfg):
-        return bool(cfg.get("compose", {}).get("enabled")) and (not self.oneshot or self.compose_offline)
-
-    def _analyze(self, cfg):
-        composing = self.composing(cfg)
-        an, det = cfg["analysis"], cfg["detect"]
-        P = np.concatenate(self.spec)
-        T = np.concatenate(self.spec_t)
-        settle = int(an["settle_s"] * self.fr)
-        need = int(an["window_s"] * self.fr)
-        if len(P) < max(need // 2, settle + 10):
+    # ---------------- the pipeline: IQ steps, then the sum of everything as audio ----------------
+    def _audio(self, x, cfg):
+        """This hop's IQ through the pipeline; the audio goes to clients with its stream time."""
+        steps = cfg.get("pipeline") or []
+        key = json.dumps(steps, sort_keys=True)
+        if self.pipe is None or key != self.pipe_key:            # (re)built: from this block on
+            self.pipe, self.pipe_key = Pipeline(self.fs, self._x0, steps), key
+        k0, y = self.pipe.process(x)
+        if self.oneshot or not len(y):
             return
-        new = T > self.analyzed_until
-        idx = np.flatnonzero(new[: len(T) - settle])
-        if len(idx) == 0:
-            return
-        sl = slice(idx[0], idx[-1] + 1)
-        self.analyzed_until = float(T[idx[-1]])
-        t_s1 = time.time()
-        ch = cfg["checks"]
-        pitch = None
-        if all(p is not None for p in self.pitch_spec) and self.pitch_spec:
-            pitch = (np.concatenate([p[0] for p in self.pitch_spec]), np.concatenate([p[1] for p in self.pitch_spec]))
-        force = (self.score_all | (set(self._layer_ids(cfg)) if composing else set())) & set(stage1.STAGE1)
-        scores, comb, extra = stage1.run_blocks(P, self.df, self.fr, cfg, sl, force=tuple(force),
-                                                pool=self.pool, pitch=pitch)
-        self.timing["stage1"] = time.time() - t_s1
-        ts = T[sl]
-
-        # learned band profile: how unusual is this evidence for these frequencies?
-        prof = ch["profile"]
-        prof_map = self.profile.score(comb, prof["full_z"]) if prof["enabled"] else None
-        if prof["enabled"]:
-            if not self.oneshot:
-                self.profile.update(comb, self.fr, prof["tau_h"])
-                self.profile.maybe_save()
-            if self.profile.learned_s >= prof["warmup_min"] * 60:
-                scores["profile"] = prof_map
-                comb = stage1.combine(scores, ch).astype(np.float32)
-
-        # cross-channel co-modulation among the strongest candidates
-        comod_map = None
-        self.comod = None
-        if ch["comod"]["enabled"] or "comod" in self.score_all:
-            t_c = time.time()
-            comod_map = self._comodulation(extra["env"], comb, sl, cfg)
-            self.timing["comod"] = time.time() - t_c
-
-        # novelty: subtract a slow per-bin baseline (always-on emitters cancel)
-        alpha = float(det["novelty"])
-        if self.baseline is None or self.baseline.shape != comb.shape[1:]:
-            self.baseline = comb[0].copy()
-        k = 1.0 / max(1.0, det["novelty_tau_s"] * self.fr)
-        ev = np.empty_like(comb)
-        for i in range(len(comb)):
-            ev[i] = comb[i] - alpha * self.baseline
-            self.baseline += k * (comb[i] - self.baseline)
-        beta = float(det["prominence"])
-        if beta > 0:
-            w = int(2 * det["prominence_hz"] / self.df) | 1
-            ev -= beta * uniform_filter1d(ev, size=w, axis=1, mode="nearest")
-        ev = np.clip(ev, 0, None)
-        blocked = self._blocked(cfg)
-        if blocked.any():
-            ev[:, blocked] = 0                              # never a candidate here, in either mode
-        if composing:
-            ev[:] = 0                                       # composing: no tracks; the layers pick
-        t_v = time.time()
-        views = []
-        if comod_map is not None:
-            views.append(("comod", comod_map))
-        if prof_map is not None and "profile" not in scores:
-            views.append(("profile", prof_map))
-        if composing:
-            views += self._layer_views(scores, ts, blocked, cfg)
-        self._view_rows(scores, comb, ev, ts, cfg, views)
-        self.timing["views"] = time.time() - t_v
-
-        mode, f0r, cr = extra["mode"], extra.get("f0"), extra.get("c")
-        with self.lock:
-            for i, t in enumerate(ts):
-                cands = self._candidates(ev[i], det)
-                self._track_step(t, cands, ev[i], comb[i], {c: s[i] for c, s in scores.items()}, det,
-                                 mode[i], None if f0r is None else f0r[i], None if cr is None else cr[i])
-            t_t = time.time()
-            self._tracks_audio_and_stage2(cfg, float(ts[0]) - 0.5 / self.fr, float(ts[-1]) + 0.5 / self.fr)
-            self.timing["tracks"] = time.time() - t_t
-            if composing:
-                self._compose_step(cfg, float(ts[-1]))
-            elif self.cmix is not None or self.channels:
-                self._cmix_close(cfg)
-                self._compose_reset()
-
-    def _comodulation(self, env, comb, sl, cfg):
-        """Pairs of candidate frequencies whose syllable-band loudness moves together (at once or
-        up to max_lag later). The band-wide common movement is removed first, so broadband
-        pulsing doesn't count. Returns a sparse [frames, bins] map; keeps pairs for chain merging."""
-        prm = cfg["checks"]["comod"]
-        T, K = env.shape
-        win = min(T, int(2.5 * self.fr))
-        e = env[sl.stop - win: sl.stop] if sl.stop >= win else env[:win]
-        e = e - np.median(e, axis=1, keepdims=True)              # remove the common (broadband) movement
-        strength = comb.max(axis=0)
-        order = np.argsort(strength)[::-1]
-        sep = max(1, int(cfg["detect"]["min_sep_hz"] / self.df))
-        cands = []
-        for k in order[:400]:
-            if strength[k] < cfg["detect"]["candidate_threshold"] or len(cands) >= 40:
-                break
-            if all(abs(int(k) - j) >= sep for j in cands):
-                cands.append(int(k))
-        out = np.zeros_like(comb)
-        if len(cands) < 2:
-            return out
-        X = e[:, cands]
-        X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
-        nfft = 1 << int(np.ceil(np.log2(2 * win)))
-        F = np.fft.rfft(X, nfft, axis=0)
-        L = int(prm["max_lag_s"] * self.fr)
-        best = np.zeros((len(cands), len(cands)), np.float32)
-        lag_at = np.zeros_like(best)
-        for i in range(len(cands)):
-            xc = np.fft.irfft(F[:, i:i + 1] * np.conj(F), nfft, axis=0) / win   # corr of i with every j
-            lags = np.r_[np.arange(0, L + 1), np.arange(-L, 0)]
-            seg = xc[lags]                                         # [lags, cands]
-            j = np.argmax(seg, axis=0)
-            best[i] = seg[j, np.arange(len(cands))]
-            lag_at[i] = lags[j] / self.fr
-        far = np.abs(self.f[cands][:, None] - self.f[cands][None, :]) >= prm["min_khz"] * 1e3
-        best = np.where(far, best, 0)
-        score = np.clip((best.max(axis=1) - 0.3) / 0.5, 0, 1)
-        for k, s in zip(cands, score):
-            out[:, max(0, k - 1): k + 2] = s
-        pairs = [(self.f[cands[i]], self.f[cands[j]], float(best[i, j]), float(lag_at[i, j]))
-                 for i in range(len(cands)) for j in range(i + 1, len(cands)) if best[i, j] >= 0.6]
-        self.comod = {"f": self.f[cands].copy(), "score": score, "pairs": pairs}
-        return out
-
-    def _candidates(self, row, det):
-        thr = det["candidate_threshold"]
-        top = np.argpartition(row, -64)[-64:] if len(row) > 64 else np.arange(len(row))
-        top = top[np.argsort(row[top])[::-1]]
-        picks = []
-        sep = det["min_sep_hz"]
-        for k in top:
-            if row[k] < thr or len(picks) >= det["max_candidates"]:
-                break
-            if all(abs(self.f[k] - self.f[j]) >= sep for j in picks):
-                picks.append(int(k))
-        return picks
-
-    def _track_step(self, t, cands, ev_row, comb_row, check_rows, det, mode_row=None, f0_row=None, c_row=None):
-        tol = det["max_slide_hz_s"] / self.fr + 4 * self.df
-        used = set()
-        for tr in sorted(self.tracks, key=lambda x: -x.conf):
-            if t - tr.t_last > det["track_gap_s"]:
-                continue
-            last_f = tr.frames[-1][1]
-            best, bd = None, None
-            for k in cands:
-                if k in used:
-                    continue
-                d = abs(self.f[k] - last_f)
-                if d <= tol and (bd is None or d < bd):
-                    best, bd = k, d
-            if best is not None:
-                used.add(best)
-                tr.add(t, float(self.f[best]), float(ev_row[best]),
-                       {c: float(r[best]) for c, r in check_rows.items()})
-                self._track_extras(tr, t, best, mode_row, f0_row, c_row)
-        for k in cands:
-            if k in used or len(self.tracks) >= det["max_tracks"]:
-                continue
-            if any(abs(self.f[k] - tr.frames[-1][1]) < det["min_sep_hz"] for tr in self.tracks):
-                continue
-            chain, ref = None, None
-            for (t_end, ch, f0_end) in self.ended:
-                if 0 <= t - t_end <= det["link_hops_s"]:
-                    chain, ref = ch, f0_end
-            tr = Track(t, float(self.f[k]), float(ev_row[k]), chain)
-            tr.hop_ref = ref
-            tr.frames[-1] = (t, float(self.f[k]), float(ev_row[k]),
-                             {c: float(r[k]) for c, r in check_rows.items()})
-            self._track_extras(tr, t, k, mode_row, f0_row, c_row)
-            self.tracks.append(tr)
-
-    @staticmethod
-    def _track_extras(tr, t, k, mode_row, f0_row, c_row):
-        if mode_row is not None:
-            tr.modes.append(int(mode_row[k]))
-            tr.modes = tr.modes[-200:]
-        if f0_row is not None:
-            tr.pitch.append((t, float(f0_row[k]), float(c_row[k])))
-            tr.pitch = tr.pitch[-500:]
-
-    # ---------------- per track: audio, stage 2, confidence, events ----------------
-    def _tracks_audio_and_stage2(self, cfg, ta, tb):
-        det, checks = cfg["detect"], cfg["checks"]
-        enabled = {c["id"]: (checks[c["id"]]["enabled"] and checks[c["id"]]["weight"] > 0) or c["id"] in self.score_all
-                   for c in CHECKS if c["stage"] == 2}
-        alive = []
-        # demodulate every track's new audio in parallel (the heavy, full-rate part)
-        jobs = []
-        au = cfg["audio"]
-        post = min(au.get("postroll_s", 0.5), max(0.0, cfg["analysis"]["settle_s"] - 0.3))
-        for tr in self.tracks:
-            ending = tb - tr.t_last > det["track_gap_s"]
-            t_from = tr.audio_until if tr.audio_until is not None else tr.t0 - au.get("preroll_s", 0.5)
-            t_to = tr.t_last + post if ending else min(tb, tr.t_last + 0.5 / self.fr)
-            if t_to - t_from > 0.02:
-                jobs.append((tr, t_from, t_to, ending))
-        self.timing["tracks_n"] = len(self.tracks)
-        list(self.pool.map(lambda j: self._demod_track(j[0], j[1], j[2], cfg, j[3]), jobs))
-        # ML voice scores: only audio not seen before, all tracks in one batched call
-        if enabled.get("vad") and stage2.vad_available():
-            new = [(tr, t, a) for tr in self.tracks for t, a in tr.audio if t > tr.vad_t + 1e-6]
-            if new:
-                for (tr, t, _), p in zip(new, vad_probs_batch([a for _, _, a in new])):
-                    tr.vad_p = np.concatenate([tr.vad_p, p])[-int(3.0 * AUDIO_FS / 512):]
-                    tr.vad_t = max(tr.vad_t, t)
-
-        def s2job(tr):
-            audio, iq = self._recent(tr.audio, 3.0), self._recent(tr.iq, 3.0)
-            if not len(audio):
-                return {}, {}
-            return stage2.run(audio, iq, checks, {**enabled, "am_phase": enabled.get("am_phase") and tr.mode() == 0},
-                              vad=tr.vad_p if enabled.get("vad") else None)
-        s2_results = dict(zip([id(t) for t in self.tracks], self.pool.map(s2job, self.tracks)))
-        for tr in self.tracks:
-            ended = tb - tr.t_last > det["track_gap_s"]
-            # stage 2 on the last 3 s, stage 1 averaged over the last 1 s of the track
-            recent = [fr for fr in tr.frames if fr[0] >= tr.t_last - 1.0]
-            s1 = {}
-            for fr in recent:
-                for c, v in fr[3].items():
-                    s1.setdefault(c, []).append(v)
-            s1 = {c: float(np.mean(v)) for c, v in s1.items()}
-            s2, info = s2_results[id(tr)]
-            s2 = dict(s2)
-            if enabled.get("comod") and self.comod is not None:  # nearest co-modulation candidate
-                d = np.abs(self.comod["f"] - tr.frames[-1][1])
-                if len(d) and d.min() <= 2 * self.df:
-                    s2["comod"] = float(self.comod["score"][int(d.argmin())])
-            if enabled.get("hop") and tr.hop_ref:                  # pitch continues across the hop
-                f0_new = tr.f0_over(tr.t0, tr.t0 + 0.6)
-                if f0_new:
-                    dst = abs(12 * np.log2(f0_new / tr.hop_ref))
-                    dst = min(dst, abs(dst - 12))                  # octave errors happen; don't count them
-                    s2["hop"] = float(np.exp(-(dst / 3.0) ** 2))
-            tr.scores = {**s1, **s2}
-            f0_now = tr.f0_over(tr.t_last - 1.0, tr.t_last)
-            tr.info = {**info, "evidence": round(float(np.mean([fr[2] for fr in recent])) if recent else 0, 3),
-                       **({"f0_median_hz": f0_now} if f0_now else {})}
-            g = stage1.combine({k: np.array(v) for k, v in tr.scores.items()}, checks)
-            tr.conf = float(g) if g is not None else 0.0
-            tr.conf_hist.append((round(tb, 2), round(tr.conf, 3)))
-            dur = tr.t_last - tr.t0
-            if not tr.detected and dur >= det["min_duration_s"] and tr.conf >= det["threshold"]:
-                tr.detected = True
-                self.emit({"type": "det", "box": tr.box(self.fc)})
-            if tr.detected:
-                if tr.conf >= self.show_conf:
-                    self.last_hit = time.time()
-                self._emit_audio(tr)
-                self.emit({"type": "det_update", "box": tr.box(self.fc)})
-                if tr.t_last - tr.seg_start >= cfg["record"]["max_s"]:
-                    self._finish(tr, cfg, final=False)
-            if ended:
-                self.ended.append((tr.t_last, tr.chain, tr.f0_over(tr.t_last - 0.6, tr.t_last)))
-                if tr.detected:
-                    self._finish(tr, cfg, final=True)
-                    box = tr.box(self.fc)
-                    hist_s = 60 * cfg["display"]["history_min"]
-                    self.box_hist = [b for b in self.box_hist if tb - b["t1"] < hist_s] + [box]
-                    self.emit({"type": "det_end", "box": box})
-            else:
-                alive.append(tr)
-                if not tr.detected:              # nothing will be recorded: keep only what the checks / mix read
-                    keep_from = tb - 8.0
-                    if tr.out and tr.out[0][0] < keep_from - 2.0:
-                        tr.audio = [(t, a) for t, a in tr.audio if t >= keep_from]
-                        tr.out = [(t, a) for t, a in tr.out if t >= keep_from]
-                        tr.iq = [(t, a) for t, a in tr.iq if t >= keep_from]
-                        tr.seg_start = max(tr.seg_start, keep_from)
-        if tb - ta > 30 and self.cmix is not None:   # end of the stream
-            self._cmix_close(cfg)
-        if self.on_hop is not None:              # before ended tracks are dropped
-            self.on_hop(self, cfg, tb)
-        self.tracks = alive
-        self.ended = [e for e in self.ended if tb - e[0] < 5]
-        self._merge_comod_chains()
-        self._flush_chains(cfg, tb)
-
-    def _merge_comod_chains(self):
-        """Live tracks on strongly co-modulated frequencies are one voice: join their chains."""
-        if not self.comod or not self.comod["pairs"]:
-            return
-        for fa, fb, c, lag in self.comod["pairs"]:
-            ta = [t for t in self.tracks if abs(t.frames[-1][1] - fa) <= 2 * self.df]
-            tb_ = [t for t in self.tracks if abs(t.frames[-1][1] - fb) <= 2 * self.df]
-            for a in ta:
-                for b in tb_:
-                    c0 = min(a.chain, b.chain)
-                    a.chain = b.chain = c0
-
-    def _flush_chains(self, cfg, tb):
-        """A hop chain is finished when none of its tracks is alive and no new hop can link to it.
-        Then the members' audio is stitched in time order and transcribed as one utterance."""
-        w = cfg["whisper"]
-        live = {t.chain for t in self.tracks}
-        for cid in list(self.chains):
-            ch = self.chains[cid]
-            if cid in live or tb - ch["last_end"] < cfg["detect"]["link_hops_s"] + 0.5:
-                continue
-            del self.chains[cid]
-            if len(ch["members"]) < 2 or not (w["enabled"] and w["chains"]) or not self.transcriber:
-                continue
-            parts = []
-            for m in sorted(ch["members"], key=lambda m: m[0]):    # (t0, audio, track id, meta path, key)
-                parts += [m[1], np.zeros(int(0.12 * AUDIO_FS), np.float32)]
-            self.transcriber.submit({"kind": "chain", "id": cid, "chain": cid, "audio": np.concatenate(parts),
-                                     "members": [m[2] for m in ch["members"]],
-                                     "keys": [m[4] for m in ch["members"]],
-                                     "meta_paths": [m[3] for m in ch["members"] if m[3]]},
-                                    priority=ch.get("conf", 0.5))
-
-    @staticmethod
-    def _recent(chunks, secs):
-        if not chunks:
-            return np.zeros(0, np.float32)
-        a = np.concatenate([c for _, c in chunks])
-        return a[-int(secs * AUDIO_FS):]
-
-    def _demod_track(self, tr, t_from, t_to, cfg, ending=False):
-        pad = int(0.02 * self.fs)
-        s0, s1 = int(t_from * self.fs), int(t_to * self.fs)
-        x, s0r = self._raw_span(s0 - pad, s1 + pad)
-        if len(x) < 2 * pad + 100:
-            return
-        t_samp = (s0r + np.arange(len(x))) / self.fs
-        f = tr.freq_at(t_samp) + tr.car_off
-        au = cfg["audio"]
-        iq, env = demod(x, self.fs, f, channel_hz(au), tr.mode())
-        cut = int(round((s0 - s0r) / self.fs * AUDIO_FS))
-        n = int(round((s1 - s0) / self.fs * AUDIO_FS))
-        iq, env = iq[cut:cut + n], env[cut:cut + n]
-        # Carrier: the track's frequency is only known to an analysis bin, and stage 1 sometimes takes
-        # an AM signal for SSB. Either way the carrier lands in the audio as a steady whistle. When a
-        # steady line holds a large share of the channel, demodulate AM centred on it instead.
-        off, share = carrier_line(iq, channel_hz(au))
-        was = tr.has_carrier
-        if share is not None:
-            tr.has_carrier = share >= 0.3 or (was and share >= 0.1)
-        if tr.has_carrier:
-            if off:
-                iq = (iq * np.exp(-2j * np.pi * off * np.arange(len(iq)) / AUDIO_FS)).astype(np.complex64)
-                tr.car_off += off                            # later chunks are mixed down onto it directly
-                if abs(tr.car_off) > channel_hz(au):          # wandered out of the channel: start over
-                    tr.car_off, tr.has_carrier = 0.0, False
-            env = np.abs(iq).astype(np.float32)
-        elif was:
-            tr.car_off = 0.0
-        mode = tr.mode()
-        kind = (au.get("demod", "auto"), mode)
-        if tr.det_kind != kind:                              # (re)create the detector: setting or AM/SSB changed
-            tr.det_kind, tr.det = kind, detector_for(au, mode)
-        if tr.det is not None:
-            env = tr.det.process(iq)                         # synchronous AM / sideband
-        if tr.hp_zi is None:
-            self._hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
-            tr.hp_zi = sosfilt_zi(self._hp) * float(env[0] if len(env) else 0)
-        audio, tr.hp_zi = sosfilt(self._hp, env, zi=tr.hp_zi)
-        audio = audio.astype(np.float32)
-        tr.audio.append((t_from, audio))                     # raw: what the checks judge
-        tr.iq.append((t_from, iq.astype(np.complex64)))
-        tr.audio_until = t_to
-        # playback chain: voice band -> noise reduction -> gliding level -> fades at the very start / end
-        first = tr.audio_t0 is None
-        if first:
-            tr.audio_t0 = t_from
-            tr.seg_start = t_from
-            if au.get("denoise", True):
-                tr.den = StreamingDenoiser(au.get("denoise_strength", 1.0), au.get("denoise_floor_db", -18.0))
-            if au.get("voice_band", True):
-                tr.band = VoiceBand(au.get("voice_lo_hz", 300), au.get("voice_hi_hz", 3000))
-        y = tr.band.process(audio) if tr.band else audio
-        y = tr.den.process(y) if tr.den else y
-        y = tr.gain.process(y)
-        y = fade(y, AUDIO_FS, au.get("fade_s", 0.15) if first else 0.0, au.get("fade_s", 0.15) if ending else 0.0)
-        lag = 512 / _AFS if tr.den else 0.0                 # the denoiser delays its output by 32 ms
-        tr.out.append((t_from - lag, y))
-
-    def _emit_audio(self, tr):
-        for t, a in tr.out:
-            if tr.emitted_until is not None and t < tr.emitted_until - 1e-6:
-                continue
-            pcm = np.clip(a, -1, 1)
-            self.emit({"type": "audio", "id": tr.id, "t": round(t, 4), "rate": AUDIO_FS,
-                       "pcm": _b64((pcm * 32767).astype(np.int16))})
-            tr.emitted_until = t + len(a) / AUDIO_FS
-
-    # ---------------- composed voice ----------------
-    @staticmethod
-    def _layer_ids(cfg):
-        return [l["id"] for l in cfg.get("compose", {}).get("layers", []) if float(l.get("weight", 0)) > 0]
-
-    def _blocked(self, cfg):
-        """Kept bins inside a blocked frequency range."""
-        m = np.zeros(len(self.f), bool)
-        for r in cfg.get("blocked") or []:
-            try:
-                m |= (self.fc + self.f >= float(r["lo"])) & (self.fc + self.f <= float(r["hi"]))
-            except (KeyError, TypeError, ValueError):
-                pass
-        return m
-
-    def _layer_views(self, scores, ts, blocked, cfg):
-        """Composing: each layer's weighted map, their union (the confidence every frequency gets), and
-        "why" (which layer gives the most, packed with the confidence). Keeps the confidence rows."""
-        layers = [l for l in cfg["compose"]["layers"] if float(l.get("weight", 0)) > 0 and l["id"] in scores][:8]
-        n, K = len(ts), len(self.f)
-        conf, miss = np.zeros((n, K), np.float32), np.ones((n, K), np.float32)
-        best, arg = np.zeros((n, K), np.float32), np.zeros((n, K), np.uint8)
-        views = []
-        for i, l in enumerate(layers):
-            v = np.clip(float(l["weight"]) * scores[l["id"]], 0, 1).astype(np.float32)
-            v[:, blocked] = 0
-            miss *= 1 - v
-            m = v > best
-            best[m], arg[m] = v[m], i
-            views.append(("layer:" + l["id"], v))
-        conf = 1 - miss
-        for t, row in zip(ts, conf):
-            self.c_conf.append((float(t), row))
-        W = float(cfg["compose"]["window_s"])
-        while self.c_conf and self.c_conf[0][0] < ts[-1] - W - 1:
-            self.c_conf.popleft()
-        # "why": confidence in the top 5 bits (so max-pooling keeps the most confident pixel), layer below
-        why = ((np.round(conf * 31).astype(np.uint8) << 3) | arg).astype(np.float32) / 255.0
-        return [("layered", conf), ("why", why)] + views
-
-    def _compose_reset(self):
-        self.composer, self.cgain, self.cmix_until, self.channels = compose.Composer(), {}, None, {}
-        self.ckeys, self.kstate, self.cgate, self.cvad = {}, {}, 0.0, []
-        self.cshape, self.cvoice = None, {}
-        self.c_conf.clear()
-        self.c_fine.clear()
-
-    def _sidebands(self, Pf, f_off, g):
-        """A candidate's sound, read off the fine power spectrum: power at 0..3.4 kHz above and below
-        f_off (Hz from the centre), added; nothing below 150 Hz (the carrier, hum)."""
-        c = int(np.searchsorted(self.fine_f, f_off))
-        k = np.arange(g.top)
-        up, dn = c + k, c - k
-        ok = (up < Pf.shape[1]) & (dn >= 0)
-        A = np.zeros((len(Pf), g.top), np.float32)
-        A[:, ok] = Pf[:, up[ok]] + Pf[:, dn[ok]]
-        A[:, : int(150 / g.df)] = 0
-        return compose.normalise(A, g)
-
-    def _compose_step(self, cfg, tb):
-        """Composing, each hop: candidate channels = peaks of the layered confidence over the last window_s
-        (above the candidate floor); each split into low / mid / high keys; the composer picks the keys
-        that together make the most voice, from at least min_channels channels; those channels are
-        demodulated from the raw IQ, each key band-passed and levelled, and the keys mixed. The set's
-        confidence (structure blended with the ML voice detector on the actual mix) must reach min_conf
-        (the Min confidence slider) for it to be heard."""
-        cc = cfg["compose"]
-        W, hop = float(cc["window_s"]), float(cfg["analysis"]["hop_s"])
-        rows = [r for t, r in self.c_conf if t > tb - W]
-        fine = [(t, P) for t, P in self.c_fine]
-        if not rows or not fine:
-            return
-        if not hasattr(self, "c_grid") or self.c_grid.df != self.fine_df:
-            self.c_grid = compose.iq_grid(self.fine_df, 1.0 / self.fr)
-        g = self.c_grid
-        T = np.concatenate([t for t, _ in fine])
-        sel = (T > tb - W) & (T <= tb)
-        if sel.sum() < 10:
-            return
-        Pf = np.concatenate([P for _, P in fine])[sel]
-        cmean = np.mean(rows, axis=0)
-        floor = float(cc.get("candidate_floor", 0.15))
-        sep_hz = float(cc["min_sep_hz"])              # one channel apart: inside a station's sidebands is the same station
-        sep = max(1, int(sep_hz / self.df))
-        mx = maximum_filter1d(cmean, 2 * sep + 1)
-        peaks = np.flatnonzero((cmean >= mx - 1e-9) & (cmean >= floor))
-        peaks = peaks[np.argsort(cmean[peaks])[::-1][: int(cc["candidates"])]]
-        # channels keep their identity while they stay put: a peak near a playing channel is that one
-        playing = {self.ckeys[k]["ch"] for k in self.composer.members if k in self.ckeys}
-        cands = {}
-        for ch_id, ch in self.channels.items():
-            k = int(np.argmin(np.abs(self.f - ch["f"])))
-            if ch_id in playing and cmean[k] >= 0.5 * floor:
-                cands[ch_id] = ch["f"]
-        Pm = Pf.mean(axis=0)
-        reach = int(max(3500.0, sep_hz) / self.fine_df)       # (one candidate per separation window anyway)
-        for k in peaks:
-            f = float(self.f[k])
-            # an AM station's evidence often peaks on a sideband: centre on its carrier when one stands
-            # out nearby (10 dB over the neighbourhood), so it is heard as AM rather than off-tune
-            c = int(np.searchsorted(self.fine_f, f))
-            lo, hi = max(0, c - reach), min(len(Pm), c + reach + 1)
-            if hi - lo > 10:
-                j = lo + int(np.argmax(Pm[lo:hi]))
-                if Pm[j] > 10 * np.median(Pm[lo:hi]):
-                    f = float(self.fine_f[j])
-            if any(abs(f - fo) < sep_hz for fo in cands.values()):
-                continue
-            cands[int(round(f / self.fine_df))] = f
-        keys = {}
-        for ch_id, f in cands.items():
-            A = self._sidebands(Pf, f, g)
-            if A is not None:
-                for bi, key in compose.keys_of(A, g, ch_id).items():
-                    keys[f"{ch_id}:{bi}"] = dict(key, f=f, voiced=self.cvoice.get(ch_id, 0.0))
-        t_c = time.time()
-        roles, parts, tot, info = self.composer.choose(keys, tb, cc, g)
-        self.timing["compose"] = time.time() - t_c
-        self.ckeys = {**{k: v for k, v in self.ckeys.items() if k in self.cgain}, **keys}
-        # play: demodulate the channels of the chosen keys (and of keys fading out) for [a, b)
-        b = tb
-        a = self.cmix_until if self.cmix_until is not None and 0 <= b - self.cmix_until < 3 * hop else b - hop
-        n = int(round((b - a) * AUDIO_FS))
-        if n < 160:
-            return
-        new = {k: 1.0 for k in roles}
-        sounding = [k for k in set(new) | {k for k, v in self.cgain.items() if v > 0} if k in self.ckeys]
-        for k in sounding:
-            ch_id = self.ckeys[k]["ch"]
-            if ch_id not in self.channels:
-                self.channels[ch_id] = {"f": self.ckeys[k]["f"], "car_off": 0.0, "has_carrier": False, "det": None,
-                                        "hp_zi": None, "gain": SmoothGain(), "den": None, "band": None}
-        # listen to the strongest candidates too (not heard): whether their audio has a pitch feeds "voiced"
-        probe = int(cc.get("probe", 8))
-        by_conf = sorted(cands, key=lambda c_: -cmean[int(np.argmin(np.abs(self.f - cands[c_])))])[:probe]
-        for ch_id in by_conf:
-            if ch_id not in self.channels:
-                self.channels[ch_id] = {"f": cands[ch_id], "car_off": 0.0, "has_carrier": False, "det": None,
-                                        "hp_zi": None, "gain": SmoothGain(), "den": None, "band": None}
-        chans = sorted({self.ckeys[k]["ch"] for k in sounding} | set(by_conf))
-        outs = dict(zip(chans, self.pool.map(lambda c_: self._channel_audio(self.channels[c_], a, n, cfg, band=False), chans)))
-        for c_ in chans:
-            ch = self.channels[c_]
-            ch.setdefault("vo", voicefx.Voicing())
-            ch.setdefault("vh", collections.deque())
-            ch["vh"].append((b, voicefx.voiced_score(ch["vo"].process(outs[c_]))))
-            while ch["vh"] and ch["vh"][0][0] <= b - W:
-                ch["vh"].popleft()
-            self.cvoice[c_] = float(np.mean([v for _, v in ch["vh"]]))
-        mix = np.zeros(n, np.float32)
-        for k in sounding:                               # crossfade: joining keys rise, leaving ones fall
-            key = self.ckeys[k]
-            name, lo, hi, lvl = compose.BANDS[key["band"]]
-            st = self.kstate.get(k)
-            if st is None:
-                sos = butter(4, (lo, hi), btype="bandpass", fs=AUDIO_FS, output="sos")
-                st = self.kstate[k] = {"sos": sos, "zi": np.zeros((sos.shape[0], 2)), "gain": SmoothGain(0.18 * 10 ** (lvl / 20))}
-            yk, st["zi"] = sosfilt(st["sos"], outs[key["ch"]], zi=st["zi"])
-            yk = st["gain"].process(yk.astype(np.float32))
-            mix += np.linspace(self.cgain.get(k, 0.0), new.get(k, 0.0), n, dtype=np.float32) * yk
-        self.cgain = new
-        live_ch = {self.ckeys[k]["ch"] for k in new}
-        self.channels = {c_: v for c_, v in self.channels.items() if c_ in live_ch or c_ in by_conf}
-        self.cvoice = {c_: v for c_, v in self.cvoice.items() if c_ in self.channels}
-        self.kstate = {k: v for k, v in self.kstate.items() if k in new}
-        # voice shaping (from the mix's own pitch and envelope): harmonics and formants already there
-        # brought out, the hiss between voiced stretches turned down
-        voiced = None
-        if sounding:
-            if self.cshape is None:
-                self.cshape = voicefx.VoiceShaper(cc.get("shape_pitch", 0.6), cc.get("shape_formant", 0.6),
-                                                  cc.get("shape_duck_db", 12.0))
-            else:
-                self.cshape.set(cc.get("shape_pitch", 0.6), cc.get("shape_formant", 0.6), cc.get("shape_duck_db", 12.0))
-            k0 = len(self.cshape.voicing)
-            mix = self.cshape.process(mix)
-            vs = self.cshape.voicing[k0:]
-            self.cshape.voicing = self.cshape.voicing[-50:]
-            voiced = float(np.mean(np.array(vs) > 0.45)) if vs else None
-        y = self.clevel.process(mix) if sounding else mix
-        self.cmix_until = a + n / AUDIO_FS
-        # the set's confidence: structure, blended with what the ML voice detector hears in the actual mix
-        vad = None
-        if roles and stage2.vad_available():
-            p = vad_probs_batch([mix])[0]
-            vad = float(np.mean(np.sort(p)[len(p) // 2:])) if len(p) else None
-        self.cvad = ([v for v in self.cvad[-1:]] + [vad]) if vad is not None else []
-        vw = float(cc.get("vad_weight", 0.5)) if self.cvad else 0.0
-        conf = (1 - vw) * tot + vw * (float(np.mean(self.cvad)) if self.cvad else 0.0) if roles else 0.0
-        gate = 1.0 if roles and conf >= float(cc.get("min_conf", 0.3)) else 0.0
-        y = y * np.linspace(self.cgate, gate, n, dtype=np.float32)       # below Min confidence: silent
-        heard = self.cgate > 0 or gate > 0
-        self.cgate = gate
-        members = [{"id": k, "f": self.fc + self.ckeys[k]["f"], "band": compose.BANDS[self.ckeys[k]["band"]][0], "role": r}
-                   for k, r in roles.items()]
-        status = {"type": "compose", "t": round(b, 2), "conf": round(conf, 3), "structure": round(tot, 3),
-                  "vad": None if vad is None else round(vad, 3), "heard": bool(gate),
-                  "voiced": None if voiced is None else round(voiced, 2),
-                  "parts": {p_: round(v, 3) for p_, v in parts.items()}, "members": members,
-                  "channels": len(live_ch), "candidates": len(cands), "keys": len(keys)}
-        if roles:
-            self.last_hit = time.time()                  # always choosing something: not "nothing caught"
-        if not heard:                                    # nothing audible: the piece (if any) ends here
-            if self.cmix is not None:
-                self._cmix_close(cfg)
-            self.emit(status)
-            return
-        self._cmix_add(cfg, cc, a, b, y, conf, parts, vad, info, roles)
-        self.emit(status)
-
-    def _cmix_add(self, cfg, cc, a, b, y, conf, parts, vad, info, roles):
-        """Add a hop of audible mix to the current piece (a virtual detection the client shows and plays)."""
-        # Long runs are cut into pieces of at most segment_s; each new piece starts with the last
-        # overlap_s of the one before (audio and the signals playing then), so no word is lost at a cut.
-        c = self.cmix
-        if c is None or self.cmix_until - c["t0"] > float(cc["segment_s"]) + 1e-6:
-            prev = c
-            if prev is not None:
-                self._cmix_close(cfg)
-            c = self.cmix = {"id": Track._next, "t0": a, "t1": a, "chunks": [], "comps": [], "open": {},
-                             "conf": 0.0, "conf_hist": [], "parts": collections.defaultdict(list), "info": {},
-                             "clips": [], "wavs": []}
-            Track._next += 1
-            ov = int(round(float(cc.get("overlap_s", 0.5)) * AUDIO_FS))
-            if prev is not None and ov > 0 and prev["chunks"] and abs(prev["t1"] - a) < 0.05:
-                tail = np.concatenate([y_ for _, y_ in prev["chunks"]])[-ov:]
-                c["t0"] = a - len(tail) / AUDIO_FS
-                c["chunks"].append((c["t0"], tail))
-                for k, iv in prev["open"].items():
-                    c["open"][k] = dict(iv, t0=c["t0"], t1=a)
-                    c["comps"].append(c["open"][k])
-            first = True
-        else:
-            first = False
-        c["chunks"].append((a, y))
-        c["t1"] = self.cmix_until
-        c["conf"] = conf
-        c["conf_hist"].append((round(b, 2), round(conf, 3)))
-        for p, v in parts.items():
-            c["parts"][p].append(v)
-        if vad is not None:
-            c["parts"]["vad"].append(vad)
-        c["info"] = {**{k: round(v, 1) for k, v in info.items()}, "components": len(roles)}
-        for k, role in roles.items():
-            key = self.ckeys[k]
-            name, lo, hi, lvl = compose.BANDS[key["band"]]
-            f = self.fc + key["f"]
-            iv = c["open"].get(k)
-            if iv is None:
-                iv = c["open"][k] = {"id": k, "ch": key["ch"], "f": f, "band": name, "lo": lo, "hi": hi, "lvl": lvl,
-                                     "role": role, "t0": a, "t1": c["t1"]}
-                c["comps"].append(iv)
-            iv.update(role=role, t1=c["t1"])
-        for k in [k for k in c["open"] if k not in roles]:
-            del c["open"][k]
-        if len(c["comps"]) > 400:
-            c["comps"] = c["comps"][-400:]
-        box = self._cmix_box()
-        self.emit({"type": "det" if first else "det_update", "box": box})
-        self.emit({"type": "audio", "id": c["id"], "t": round(a, 4), "rate": AUDIO_FS,
+        self.emit({"type": "audio", "id": "out", "t": round(k0 / AUDIO_FS, 5), "rate": AUDIO_FS,
                    "pcm": _b64((np.clip(y, -1, 1) * 32767).astype(np.int16))})
 
-    def _channel_audio(self, ch, a, n, cfg, band=True):
-        """n samples of a playing frequency's audio from stream time a: demodulated from the raw IQ like a
-        track (carrier found and centred, synchronous AM or the suppressed-carrier loop), then the
-        playback chain (high-pass, voice band, noise reduction, level)."""
-        au = cfg["audio"]
-        out = np.zeros(n, np.float32)
-        pad = int(0.02 * self.fs)
-        s0 = int(round(a * self.fs))
-        s1 = s0 + int(round(n / AUDIO_FS * self.fs))
-        x, s0r = self._raw_span(s0 - pad, s1 + pad)
-        if len(x) < 2 * pad + 100:
-            return out
-        bw = channel_hz(au)
-        iq, env = demod(x, self.fs, ch["f"] + ch["car_off"], bw, 0)
-        cut = int(round((s0 - s0r) / self.fs * AUDIO_FS))
-        iq, env = iq[cut:cut + n], env[cut:cut + n]
-        off, share = carrier_line(iq, bw)
-        was = ch["has_carrier"]
-        if share is not None:
-            ch["has_carrier"] = share >= 0.3 or (was and share >= 0.1)
-        if ch["has_carrier"] and off:
-            iq = (iq * np.exp(-2j * np.pi * off * np.arange(len(iq)) / AUDIO_FS)).astype(np.complex64)
-            ch["car_off"] += off
-            if abs(ch["car_off"]) > bw:
-                ch["car_off"], ch["has_carrier"] = 0.0, False
-        if ch["det"] is None:
-            ch["det"] = detector_for(au, 0)
-        if ch["det"] is not None:
-            env = ch["det"].process(iq)
-        if ch["hp_zi"] is None:
-            self._hp = butter(2, 150, btype="highpass", fs=AUDIO_FS, output="sos")
-            ch["hp_zi"] = sosfilt_zi(self._hp) * float(env[0] if len(env) else 0)
-            if au.get("denoise", True):
-                ch["den"] = StreamingDenoiser(au.get("denoise_strength", 1.0), au.get("denoise_floor_db", -18.0))
-            if band and au.get("voice_band", True):
-                ch["band"] = VoiceBand(au.get("voice_lo_hz", 300), au.get("voice_hi_hz", 3000))
-        y, ch["hp_zi"] = sosfilt(self._hp, env, zi=ch["hp_zi"])
-        y = y.astype(np.float32)
-        y = ch["band"].process(y) if ch["band"] else y
-        y = ch["den"].process(y) if ch["den"] else y
-        y = ch["gain"].process(y)
-        out[: min(n, len(y))] = y[:n]
-        return out
-
-    def _cmix_box(self):
-        c = self.cmix
-        fr = [iv["f"] for iv in c["comps"]] or [self.fc]
-        hist = [v for _, v in c["conf_hist"]] or [0.0]
-        return {"id": c["id"], "chain": c["id"], "t0": c["t0"], "t1": c["t1"], "fmin": min(fr), "fmax": max(fr),
-                "path": [], "conf": round(c["conf"], 3), "conf_max": round(max(hist), 3),
-                "scores": {p: round(float(np.mean(v)), 3) for p, v in c["parts"].items() if v},
-                "info": c["info"], "wavs": list(c["wavs"]), "clips": list(c["clips"]), "detected": True,
-                "mode": "mix", "audio_t0": c["t0"], "composed": True,
-                "components": [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in iv.items()} for iv in c["comps"]]}
-
-    def _cmix_close(self, cfg):
-        """End the current piece of the mix: keep it (memory or disk) and transcribe it, like a detection."""
-        c = self.cmix
-        if c is None:
-            return
-        self.cmix = None
-        box = self._cmix_box_of(c)
-        self.box_hist.append(box)
-        try:
-            self._cmix_keep(c, box, cfg)
-        finally:
-            self.emit({"type": "det_end", "box": box})
-
-    def _cmix_keep(self, c, box, cfg):
-        if not c["chunks"]:
-            return
-        a = np.concatenate([y for _, y in c["chunks"]])
-        if len(a) < AUDIO_FS // 2:
-            return
-        rec = cfg["record"]
-        utc = datetime.fromtimestamp(self.utc0 + c["t0"], timezone.utc)
-        fr = [iv["f"] for iv in c["comps"]] or [self.fc]
-        conf_max = box["conf_max"]
-        meta = {
-            "id": c["id"], "chain": c["id"], "segment": 0, "epoch": self.t_origin, "composed": True,
-            "utc_start": utc.isoformat(), "stream_t0": c["t0"], "stream_t1": c["t1"],
-            "duration_s": round(len(a) / AUDIO_FS, 2),
-            "freq_hz": {"mean": float(np.mean(fr)), "min": min(fr), "max": max(fr)},
-            "path": [], "components": box["components"],
-            "confidence": {"final": c["conf"], "max": conf_max, "history": c["conf_hist"][-600:]},
-            "scores": box["scores"], "info": c["info"], "fc": self.fc, "fs": self.fs, "mode": "mix",
-            "sdr": cfg["sdr"], "compose": cfg["compose"],
-        }
-        pcm16 = (np.clip(a, -1, 1) * 32767).astype(np.int16)
-        save = rec["enabled"] and not self.oneshot and not self.storage["paused"] and conf_max >= float(cfg["compose"].get("save_score", 0.5))
-        meta_path = None
-        if save:
-            meta_path = self._write_recording(meta, pcm16, None, f"{utc:%Y%m%d-%H%M%S}_mix{c['id']}", cfg)
-        else:
-            meta.update(saved=False, key=f"mem:{int(self.t_origin)}:{c['id']}:0", files={})
-            meta["clip"] = "/api/clip?key=" + meta["key"]
-            if not self.oneshot:
-                self._mem_put(meta, pcm16, cfg)
-        box["clips"] = [meta["clip"]]
-        self.emit({"type": "recording", "meta": {k: v for k, v in meta.items() if k not in ("compose", "sdr")}})
-        if self.transcriber and cfg["whisper"]["enabled"]:
-            self.transcriber.submit({"kind": "track", "id": c["id"], "chain": c["id"], "audio": a.astype(np.float32),
-                                     "wav": meta["files"].get("wav"), "keys": [meta["key"]],
-                                     "meta_paths": [meta_path] if meta_path else []}, priority=conf_max)
-
-    def _cmix_box_of(self, c):
-        keep, self.cmix = self.cmix, c
-        try:
-            return self._cmix_box()
-        finally:
-            self.cmix = keep
-
-    # ---------------- recordings ----------------
-    def _finish(self, tr, cfg, final):
-        rec = cfg["record"]
-        if self.storage["paused"]:
-            rec = dict(rec, enabled=False)           # disk guard: keep detecting, stop writing
-        seg_t0 = tr.seg_start
-        audio = [(t, a) for t, a in tr.out if t >= seg_t0 - 0.05]
-        iq = [(t, a) for t, a in tr.iq if t >= seg_t0 - 1e-6]
-        if not final:
-            tr.seg_start = tr.audio_until or tr.t_last
-            tr.seg_index += 1
-            keep_from = tr.seg_start - 3.0                  # stage 2 still needs recent audio
-            tr.audio = [(t, a) for t, a in tr.audio if t >= keep_from]
-            tr.out = [(t, a) for t, a in tr.out if t >= keep_from]
-            tr.iq = [(t, a) for t, a in tr.iq if t >= keep_from]
-        if not audio:
-            return
-        a = np.concatenate([x for _, x in audio])
-        if len(a) < AUDIO_FS // 4:
-            return
-        utc = datetime.fromtimestamp(self.utc0 + seg_t0, timezone.utc)
-        fr = [p[1] for p in tr.path]
-        f_mean = self.fc + float(np.mean([fr_[1] for fr_ in tr.frames if fr_[0] >= seg_t0] or fr))
-        pcm = np.clip(a, -1, 1)                               # already level-controlled and faded
-        conf_max = max([c for _, c in tr.conf_hist] or [0])
-        meta = {
-            "id": tr.id, "chain": tr.chain, "segment": tr.seg_index, "epoch": self.t_origin,
-            "utc_start": utc.isoformat(), "stream_t0": seg_t0, "stream_t1": tr.t_last,
-            "duration_s": round(len(a) / AUDIO_FS, 2),
-            "freq_hz": {"mean": f_mean, "min": self.fc + min(fr), "max": self.fc + max(fr)},
-            "path": [[round(t - seg_t0, 3), self.fc + f] for t, f in tr.path if t >= seg_t0 - 0.5],
-            "confidence": {"final": tr.conf, "max": conf_max, "history": tr.conf_hist[-600:]},
-            "scores": tr.scores, "info": tr.info, "fc": self.fc, "fs": self.fs, "mode": tr.mode(),
-            "sdr": cfg["sdr"], "checks": cfg["checks"], "detect": cfg["detect"],
-        }
-        if cfg["sdr"]["source"] == "file":
-            meta["demo"] = f"Replay of {Path(cfg['sdr']['file']['path']).name} (not a live detection)"
-        # Everything detected is kept in memory; only detections above the save threshold go to disk.
-        save = (rec["enabled"] and not self.oneshot and conf_max >= rec.get("min_save_conf", 0.7))
-        pcm16 = (pcm * 32767).astype(np.int16)
-        meta_path = None
-        if save:
-            meta_path = self._write_recording(meta, pcm16, np.concatenate([x for _, x in iq]) if iq and rec.get("save_iq") else None,
-                                              f"{utc:%Y%m%d-%H%M%S}_det{tr.id}{'_' + str(tr.seg_index) if tr.seg_index or not final else ''}_{f_mean / 1e3:.1f}kHz", cfg)
-            tr.wavs.append(meta["files"]["wav"])
-        else:
-            meta.update(saved=False, key=f"mem:{int(self.t_origin)}:{tr.id}:{tr.seg_index}", files={})
-            meta["clip"] = "/api/clip?key=" + meta["key"]
-            if not self.oneshot:
-                self._mem_put(meta, pcm16, cfg)
-        tr.clips.append(meta["clip"])
-        if self.on_clip is not None:
-            self.on_clip(tr, meta, pcm16)
-        self.emit({"type": "recording", "meta": {k: v for k, v in meta.items() if k not in ("checks", "detect", "sdr")}})
-        w = cfg["whisper"]
-        if self.transcriber and w["enabled"] and conf_max >= w["min_confidence"]:
-            self.transcriber.submit({"kind": "track", "id": tr.id, "chain": tr.chain, "audio": pcm.astype(np.float32),
-                                     "wav": meta["files"].get("wav"), "keys": [meta["key"]],
-                                     "meta_paths": [meta_path] if meta_path else []}, priority=conf_max)
-        if final:
-            ch = self.chains.setdefault(tr.chain, {"members": [], "last_end": tr.t_last})
-            ch["members"].append((seg_t0, pcm.astype(np.float32), tr.id, meta_path, meta["key"]))
-            ch["last_end"] = max(ch["last_end"], tr.t_last)
-            ch["conf"] = max(ch.get("conf", 0.0), conf_max)
-
-    def _write_recording(self, meta, pcm16, iq, stem, cfg):
-        out = self.root / cfg["record"]["dir"]
-        out.mkdir(parents=True, exist_ok=True)
-        self._no_index(out)
-        wavfile.write(out / f"{stem}.wav", AUDIO_FS, pcm16)
-        files = {"wav": f"{stem}.wav"}
-        if iq is not None:
-            np.save(out / f"{stem}_iq16k.npy", iq)
-            files["iq"] = f"{stem}_iq16k.npy"
-        meta.update(files=files, saved=True, key="wav:" + files["wav"], clip="/rec/" + files["wav"])
-        path = out / f"{stem}.json"
-        path.write_text(json.dumps(meta, indent=1, default=float))
-        return path
-
-    # ---------------- in-memory detections ----------------
-    def _mem_put(self, meta, pcm16, cfg):
-        with self.lock:
-            self.mem[meta["key"]] = {"meta": meta, "pcm": pcm16}
-            self.mem_bytes += pcm16.nbytes
-            cap = cfg["record"].get("memory_mb", 300) * 1e6
-            for v in self.mem.values():                 # over budget: drop the oldest audio, keep the listing
-                if self.mem_bytes <= cap:
-                    break
-                if v["pcm"] is not None:
-                    self.mem_bytes -= v["pcm"].nbytes
-                    v["pcm"] = None
-            while len(self.mem) > 50000:
-                _, v = self.mem.popitem(last=False)
-                if v["pcm"] is not None:
-                    self.mem_bytes -= v["pcm"].nbytes
-
-    def mem_list(self):
-        with self.lock:
-            return [dict(v["meta"], in_memory=v["pcm"] is not None) for v in self.mem.values()]
-
-    def _on_transcript(self, keys, field, res):
-        with self.lock:
-            for k in keys:
-                if k in self.mem:
-                    self.mem[k]["meta"][field] = res
+    # ---------------- saved recordings (from before the filters were removed) ----------------
+    def detail(self, key):
+        """Full metadata of one saved recording, for the detail dialog."""
+        if not key.startswith("wav:"):
+            return None
+        p = (self.root / self.config.get()["record"]["dir"] / key[4:]).with_suffix(".json")
+        return json.loads(p.read_text()) if p.is_file() else None
 
     def clip(self, key):
-        """WAV bytes for a detection: from memory, from disk, or rebuilt from the IQ ring."""
-        cfg = self.config.get()
-        if key.startswith("wav:"):
-            p = self.root / cfg["record"]["dir"] / key[4:]
-            return p.read_bytes() if p.is_file() else None
-        with self.lock:
-            v = self.mem.get(key)
-            pcm, meta = (v["pcm"], v["meta"]) if v else (None, None)
-        if meta is None:
+        """WAV bytes of a saved recording."""
+        if not key.startswith("wav:"):
             return None
-        if pcm is None:
-            pcm = self._clip_from_iq(meta, cfg)
-        if pcm is None:
-            return None
-        buf = io.BytesIO()
-        wavfile.write(buf, AUDIO_FS, pcm)
-        return buf.getvalue()
-
-    def save(self, key):
-        """Write an in-memory detection to disk (audio from memory or the IQ ring)."""
-        cfg = self.config.get()
-        with self.lock:
-            v = self.mem.get(key)
-        if not v:
-            return None
-        pcm = v["pcm"] if v["pcm"] is not None else self._clip_from_iq(v["meta"], cfg)
-        if pcm is None:
-            return None
-        meta = dict(v["meta"])
-        utc = datetime.fromisoformat(meta["utc_start"])
-        self._write_recording(meta, pcm, None, f"{utc:%Y%m%d-%H%M%S}_det{meta['id']}_{meta['freq_hz']['mean'] / 1e3:.1f}kHz", cfg)
-        with self.lock:
-            old = self.mem.pop(key, None)
-            if old and old["pcm"] is not None:
-                self.mem_bytes -= old["pcm"].nbytes
-        self.emit({"type": "saved", "old_key": key, "meta": {k: x for k, x in meta.items() if k not in ("checks", "detect", "sdr")}})
-        return meta
-
-    def _clip_from_iq(self, meta, cfg):
-        """Re-demodulate a detection from the continuous IQ ring (if those segments still exist)."""
-        t0, t1 = meta["stream_t0"] - 0.05, meta["stream_t1"] + cfg["audio"].get("postroll_s", 0.5)
-        segs = self.ring_segments(meta["epoch"], t0, t1)
-        pts = [[meta["stream_t0"] + r, f] for r, f in meta["path"]] or [[t0, meta["freq_hz"]["mean"]]]
-        return render_segments(segs, t0, t1, pts, cfg["audio"], meta.get("mode", 0))
-
-    def detail(self, key):
-        """Full metadata of one detection (in memory or saved), for the detail dialog."""
-        cfg = self.config.get()
-        if key.startswith("wav:"):
-            p = (self.root / cfg["record"]["dir"] / key[4:]).with_suffix(".json")
-            return json.loads(p.read_text()) if p.is_file() else None
-        with self.lock:
-            v = self.mem.get(key)
-        return dict(v["meta"]) if v else None
+        p = self.root / self.config.get()["record"]["dir"] / key[4:]
+        return p.read_bytes() if p.is_file() else None
 
     def ring_segments(self, epoch, t0, t1):
         """IQ-ring segments [(segment json, path)] of one session overlapping stream times [t0, t1]."""

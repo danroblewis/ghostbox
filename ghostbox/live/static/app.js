@@ -28,12 +28,11 @@ const clockTime = t => S.epoch ? hms(new Date((S.epoch + t) * 1000)) : "";
 // ---------------- state ----------------
 var SV = { state: { state: "idle" }, meta: null, file: null, imgs: {}, saved: [], open: false };
 const S = {
-  cfg: null, checks: [], presets: {}, sens: {}, views: [], status: {},
+  cfg: null, presets: {}, views: [], status: {},
   epoch: 0, fmin: 0, fmax: 1, fr: 25, hop: 1, lag: 2.75,
   offsets: [], offset: null,
   view: lsGet("gb_view", "power"), chunks: new Map(),   // t0 key -> chunk (current view)
-  dets: new Map(),                                      // id -> {box, ended, playing:[[a,b]], pcm:[]}
-  recs: [], tx: new Map(), chainTx: new Map(),
+  recs: [],
   delay: +lsGet("gb_delay", 4), pps: +lsGet("gb_pps", 25),
   follow: true, viewTop: 0,
   smin: 0, smax: 255, cmap: lsGet("gb_cmap", "magma"),
@@ -96,30 +95,9 @@ if (!CMAPS[S.cmap]) S.cmap = "magma";                   // e.g. a map from an ol
 let LUT = makeLUT();
 
 // ---------------- waterfall chunks ----------------
-const isConfView = v => v === "layered" || v === "why" || (v || "").startsWith("layer:");
-// colours of the layers in the "why" view (by position in the layer list)
-const LAYER_COLORS = [[255, 196, 64], [64, 200, 255], [255, 96, 160], [120, 230, 120], [190, 140, 255], [255, 140, 80], [80, 230, 210], [230, 230, 230]];
 function hexRGB(h) { const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(h || ""); return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [12, 13, 14]; }
-const confCut = () => composing() ? ((S.cfg.compose || {}).candidate_floor ?? 0.15) : S.minConf;
-function paintConf(c, img) {                      // below Min confidence: background; above: colour by confidence
-  const cut = Math.round(confCut() * 255), why = c.view === "why", bg = hexRGB(TH.bg);
-  for (let r = 0; r < c.n; r++) {
-    const src = (c.n - 1 - r) * c.w, dst = r * c.w * 4;
-    for (let x = 0; x < c.w; x++) {
-      const v = c.vals[src + x], o = dst + x * 4;
-      const conf = why ? (v >> 3) / 31 * 255 : v;
-      if (conf < cut || conf === 0) { img.data[o] = bg[0]; img.data[o + 1] = bg[1]; img.data[o + 2] = bg[2]; }
-      else if (why) {
-        const col = LAYER_COLORS[v & 7], k = 0.35 + 0.65 * conf / 255;
-        img.data[o] = col[0] * k; img.data[o + 1] = col[1] * k; img.data[o + 2] = col[2] * k;
-      } else { const i = conf * 4; img.data[o] = LUT[i]; img.data[o + 1] = LUT[i + 1]; img.data[o + 2] = LUT[i + 2]; }
-      img.data[o + 3] = 255;
-    }
-  }
-}
 function paintChunk(c) {
   const img = c.ctx.createImageData(c.w, c.n);
-  if (isConfView(c.view)) { paintConf(c, img); c.ctx.putImageData(img, 0, 0); return; }
   for (let r = 0; r < c.n; r++) {                 // newest row at the top of the chunk canvas
     const src = (c.n - 1 - r) * c.w, dst = r * c.w * 4;
     for (let x = 0; x < c.w; x++) { const v = c.vals[src + x] * 4, o = dst + x * 4; img.data[o] = LUT[v]; img.data[o + 1] = LUT[v + 1]; img.data[o + 2] = LUT[v + 2]; img.data[o + 3] = 255; }
@@ -135,12 +113,12 @@ function addChunk(m) {
   if (S.chunks.has(key)) return;
   const c = { t0: m.t0, dt: m.dt, n: m.n, w: m.w, fmin: m.fmin, fmax: m.fmax, vals: b64bytes(m.rows), view: m.mode || "power" };
   c.cv = document.createElement("canvas"); c.cv.width = c.w; c.cv.height = c.n; c.ctx = c.cv.getContext("2d");
-  paintChunk(c); c.ver = S.lutVer;
+  paintChunk(c); c.ver = S.lutVer; c.fresh = nowS();
   S.chunks.set(key, c);
 }
 function repaintAll() { LUT = makeLUT(); S.lutVer++; }
 function autoScale() {                                     // follow what's on screen: noise floor (20th pct) .. peaks (99.8th)
-  if (!S.autoScale || !S.visible.length || isConfView(S.view)) return;
+  if (!S.autoScale || !S.visible.length) return;
   const v = [];
   for (const c of S.visible) for (let i = 0; i < c.vals.length; i += 23) v.push(c.vals[i]);
   if (v.length < 200) return;
@@ -158,10 +136,9 @@ let histBusy = false, histTimer = null;
 async function fetchHistory(t0, t1) {
   if (histBusy) return; histBusy = true;
   try {
-    const r = await (await fetch(`/api/history?view=${S.view}&t0=${t0}&t1=${t1}`)).json();
+    const r = await (await fetch(`/api/history?view=${encodeURIComponent(S.view)}&t0=${t0}&t1=${t1}`)).json();
     for (const c of r.chunks) addChunk(c);
-    for (const b of r.boxes) if (!S.dets.has(b.id)) S.dets.set(b.id, { box: b, ended: true, playing: [], pcm: [] });
-  } catch (e) {} finally { histBusy = false; }
+  } catch (e) {} finally { histBusy = false; if (S.fadeFrom && S.fadeStart == null) S.fadeStart = performance.now(); }
 }
 function ensureHistory(top, H) {
   clearTimeout(histTimer);
@@ -207,6 +184,19 @@ function draw() {
   const pps = S.pps * dpr, span = H / pps;
   ctx.imageSmoothingEnabled = false;
   S.visible = []; let repaints = 0;
+  // a change of view or filters: the old picture, with the new one fading in over it (350 ms)
+  let k = 1;
+  if (S.fadeFrom) {
+    k = S.fadeStart == null ? 0 : Math.min(1, (performance.now() - S.fadeStart) / 350);
+    if (S.fadeStart == null && performance.now() - (S.fadeWait || (S.fadeWait = performance.now())) > 4000) k = 1;   // never wait forever
+    for (const c of S.fadeFrom.values()) {
+      const tEnd = c.t0 + c.n * c.dt; if (tEnd < top - span || c.t0 > top) continue;
+      const x0 = xOf(c.fmin), x1 = xOf(c.fmax);
+      ctx.drawImage(c.cv, x0, (top - tEnd) * pps, x1 - x0, c.n * c.dt * pps + 0.6);
+    }
+    if (k >= 1) { S.fadeFrom = null; S.fadeStart = null; S.fadeWait = null; }
+    else { ctx.globalAlpha = k; ctx.fillStyle = TH.bg; }
+  }
   for (const c of S.chunks.values()) {
     const tEnd = c.t0 + c.n * c.dt;
     if (tEnd < top - span || c.t0 > top) continue;
@@ -215,6 +205,7 @@ function draw() {
     const x0 = xOf(c.fmin), x1 = xOf(c.fmax);
     ctx.drawImage(c.cv, x0, (top - tEnd) * pps, x1 - x0, c.n * c.dt * pps + 0.6);
   }
+  ctx.globalAlpha = 1;
   drawBlocked(H, dpr);
   // grid: clock times on the left, frequency across the top
   ctx.font = `${11 * dpr}px ${TH.mono}`;
@@ -237,52 +228,6 @@ function draw() {
     ctx.fillText("Mark " + clockTime(m.t), W - 110 * dpr, y - 4 * dpr);
   }
   ctx.restore();
-  // detections
-  const now = nowS(), chains = new Map();
-  for (const d of S.dets.values()) {
-    if (!audible(d)) { d.box._rect = null; continue; }      // below the filter: not drawn, not heard
-    const b = d.box; const y0 = (top - b.t1) * pps, y1 = (top - b.t0) * pps;
-    if (y1 < -20 || y0 > H + 20) { d.box._rect = null; continue; }
-    if (b.composed) { drawComposed(d, top, pps, dpr, now); continue; }
-    const pad = Math.max(5 * dpr, xOf(b.fmin + 3400) - xOf(b.fmin));
-    const x0 = xOf(b.fmin) - pad, x1 = xOf(b.fmax) + pad;
-    const playing = d.playing.some(([a, z]) => now >= a && now <= z);
-    d.box._rect = [x0 / dpr, y0 / dpr, x1 / dpr, y1 / dpr];
-    const k = Math.min(1, Math.max(0, b.conf));
-    ctx.save();
-    ctx.strokeStyle = TH.mark;
-    if (playing) { ctx.globalAlpha = 0.16; ctx.fillStyle = TH.mark; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); }
-    ctx.globalAlpha = playing ? 1 : 0.35 + 0.65 * k;
-    ctx.lineWidth = (playing ? 2 : 1 + k * 0.6) * dpr; ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
-    ctx.restore();
-    if (b.path && b.path.length > 1 && b.fmax - b.fmin > 500) {
-      ctx.strokeStyle = TH.mark; ctx.lineWidth = 1.2 * dpr; ctx.beginPath();
-      b.path.forEach(([t, f], i) => { const x = xOf(f), y = (top - t) * pps; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-      ctx.stroke();
-    }
-    const ly = Math.max(14 * dpr, y0 + 11 * dpr);
-    ctx.fillStyle = TH.mark; ctx.globalAlpha = playing ? 1 : 0.55 + 0.45 * k;
-    ctx.fillText(`${fmtFshort((b.fmin + b.fmax) / 2)}  ${(b.conf * 100).toFixed(0)}%`, x1 + 5 * dpr, ly);
-    ctx.globalAlpha = 1;
-    const tx = S.tx.get(b.id);
-    if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, x1 + 5 * dpr, ly + 16 * dpr, tx.no_speech_prob > 0.6, playing);
-    if (!chains.has(b.chain)) chains.set(b.chain, []);
-    chains.get(b.chain).push(b);
-  }
-  ctx.save(); ctx.setLineDash([2 * dpr, 4 * dpr]); ctx.strokeStyle = TH.mark; ctx.globalAlpha = 0.6; ctx.lineWidth = dpr;
-  for (const list of chains.values()) {
-    list.sort((a, b) => a.t0 - b.t0);
-    for (let i = 1; i < list.length; i++) {
-      const a = list[i - 1], b = list[i];
-      ctx.beginPath(); ctx.moveTo(xOf(a.path[a.path.length - 1][1]), (top - a.t1) * pps); ctx.lineTo(xOf(b.path[0][1]), (top - b.t0) * pps); ctx.stroke();
-    }
-  }
-  ctx.restore();
-  if ($("#caps").checked) for (const [cid, list] of chains) {
-    const tx = S.chainTx.get(cid); if (!tx || !tx.text || list.length < 2) continue;
-    const b = list[list.length - 1];
-    caption(`Chain: “${tx.text}”`, xOf(b.fmax) + 8 * dpr, (top - b.t0) * pps + 16 * dpr, tx.no_speech_prob > 0.6, false);
-  }
   // playback line (draggable): the stream time being heard right now
   const yPlay = (top - playheadTime()) * pps;
   if (yPlay >= -2 && yPlay <= H + 2) {
@@ -303,41 +248,6 @@ function draw() {
   drawScope();
   if (Math.random() < 0.01) evictChunks(top);
   updateRowProgress();
-  updateVoiceGains();
-}
-// Composed voice: each key (one channel's low / mid / high band) a line at its channel's frequency for as
-// long as it played, labelled with its band and the voice part it gave; the piece's confidence and
-// transcript beside the rightmost one.
-const ROLE = { voiced: ["voiced", "Its audio has a pitch"], pitch: ["pitch", "Pitch comb"], formants: ["formant", "Formants (F1/F2)"], syllables: ["rhythm", "Syllable rhythm"],
-  together: ["together", "Moves with the other channels"], coverage: ["fills band", "Fills a missing band"], fill: ["fill", "Adds little on its own"],
-  texture: ["fill", "Adds little on its own"] };
-const BAND_X = { low: -1, mid: 0, high: 1 };
-function drawComposed(d, top, pps, dpr, now) {
-  const b = d.box, comps = b.components || [];
-  const playing = d.playing.some(([a, z]) => now >= a && now <= z);
-  let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
-  const labels = [];
-  ctx.save(); ctx.strokeStyle = TH.accent; ctx.fillStyle = TH.accent; ctx.lineCap = "round";
-  for (const c of comps) {
-    const x = xOf(c.f) + (BAND_X[c.band] || 0) * 4 * dpr, ya = (top - c.t1) * pps, yb = (top - c.t0) * pps;
-    if (yb < -20 || ya > cv.height + 20) continue;
-    xmin = Math.min(xmin, x); xmax = Math.max(xmax, x); ymin = Math.min(ymin, ya); ymax = Math.max(ymax, yb);
-    ctx.globalAlpha = playing ? 0.95 : 0.6; ctx.lineWidth = (playing ? 3 : 2) * dpr;
-    ctx.beginPath(); ctx.moveTo(x, ya); ctx.lineTo(x, yb); ctx.stroke();
-    const lab = (c.band ? c.band + " " : "") + (ROLE[c.role] || [c.role])[0], ly = Math.max(14 * dpr, ya + 11 * dpr), lw = ctx.measureText(lab).width;
-    if (yb - ya > 36 * dpr && !labels.some(([lx, lyy, w]) => Math.abs(lyy - ly) < 14 * dpr && x + 4 * dpr < lx + w + 6 * dpr && lx < x + 4 * dpr + lw + 6 * dpr)) {
-      labels.push([x + 4 * dpr, ly, lw]);
-      ctx.globalAlpha = c.role === "texture" || c.role === "fill" ? 0.45 : playing ? 1 : 0.75; ctx.fillText(lab, x + 4 * dpr, ly);
-    }
-  }
-  ctx.restore();
-  if (!isFinite(xmin)) { b._rect = null; return; }
-  b._rect = [(xmin - 6 * dpr) / dpr, ymin / dpr, (xmax + 6 * dpr) / dpr, ymax / dpr];
-  const ly = Math.max(28 * dpr, ymin + 11 * dpr), lx = xmax + 80 * dpr;
-  ctx.fillStyle = TH.accent; ctx.globalAlpha = playing ? 1 : 0.7;
-  ctx.fillText(`Composed  ${(b.conf_max * 100).toFixed(0)}%`, Math.min(lx, cv.width - 140 * dpr), ly); ctx.globalAlpha = 1;
-  const tx = S.tx.get(b.id);
-  if (tx && tx.text && $("#caps").checked) caption(`“${tx.text}”`, Math.min(lx, cv.width - 200 * dpr), ly + 16 * dpr, tx.no_speech_prob > 0.6, playing, TH.accent);
 }
 function drawBlocked(H, dpr) {
   BLK.rects = [];
@@ -362,28 +272,12 @@ function drawBlocked(H, dpr) {
     BLK.rects.push([(x0 + 1 * dpr) / dpr, ly, (x0 + tw + 7 * dpr) / dpr, ly + 15, r.live ? null : r]);
   }
 }
-function caption(text, x, y, doubtful, playing, color) {
-  const dpr = devicePixelRatio;
-  if (text.length > 90) text = text.slice(0, 88) + "…”";
-  ctx.save();
-  ctx.font = `${12 * dpr}px ${TH.sans}`;
-  const w = ctx.measureText(text).width;
-  if (x + w > cv.width - 6 * dpr) x = Math.max(4 * dpr, cv.width - w - 10 * dpr);
-  ctx.globalAlpha = 0.85; ctx.fillStyle = TH.bg; ctx.fillRect(x - 4 * dpr, y - 13 * dpr, w + 8 * dpr, 18 * dpr); ctx.globalAlpha = 1;
-  ctx.fillStyle = doubtful ? TH.text : (color || (playing ? TH.mark : TH.fg));
-  ctx.fillText(text, x, y);
-  ctx.restore();
-}
 function niceStep(x) { const p = Math.pow(10, Math.floor(Math.log10(x))); const m = x / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
 
 // ---------------- waterfall interaction ----------------
 let dragging = false, dragTop = 0, downAt = null;
 function canvasPos(e) { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top, r]; }
 function playLineY() { const top = topTime(); return top === null ? -1e9 : (top - playheadTime()) * S.pps; }
-function boxAt(x, y) {
-  for (const d of S.dets.values()) { const r = d.box._rect; if (r && x >= r[0] - 4 && x <= r[2] + 4 && y >= r[1] - 4 && y <= r[3] + 4) return d; }
-  return null;
-}
 function setPlayhead(t, lineY) {
   if (S.paused) { S.paused = false; $("#pp").innerHTML = ICON_PAUSE; $("#pp").classList.remove("on"); }
   const maxBack = 60 * ((S.cfg && S.cfg.display.history_min) || 20);
@@ -403,8 +297,7 @@ function updateNav() {
 const BLK = { mode: false, drag: null, rects: [] };
 function blockLabelAt(x, y) { return BLK.rects.find(([a, b, c, d, r]) => r && x >= a && x <= c && y >= b && y <= d); }
 function unblock(r) {
-  if (!confirm(`Unblock ${r.label ? r.label + " (" : ""}${fmtFshort(r.lo)} – ${fmtFshort(r.hi)}${r.label ? ")" : ""}?`)) return;
-  patch({ blocked: (S.cfg.blocked || []).filter(x => !(x.lo === r.lo && x.hi === r.hi)) }, 50); buildDetector();
+  patch({ blocked: (S.cfg.blocked || []).filter(x => !(x.lo === r.lo && x.hi === r.hi)) }, 50); buildGeneral();
 }
 const fAtX = (x, r) => S.fmin + x / r.width * (S.fmax - S.fmin);
 cv.addEventListener("mousedown", e => {
@@ -429,8 +322,6 @@ window.addEventListener("mouseup", e => {
   const [x, y] = canvasPos(e); const moved = Math.hypot(x - downAt[0], y - downAt[1]); downAt = null;
   if (moved > 4) return;
   const bl = blockLabelAt(x, y); if (bl) { unblock(bl[4]); return; }
-  const d = boxAt(x, y);
-  if (d) { togglePlay(detKey(d), d); return; }
   const top = topTime(); if (top === null) return;          // empty spot: play from here
   setPlayhead(top - y / S.pps, y / S.pps); restartPlayback();
 });
@@ -439,7 +330,7 @@ cv.addEventListener("mousemove", e => {
   if (dragging) { setPlayhead(dragTop - y / S.pps, y / S.pps); return; }
   if (BLK.drag) { BLK.drag.f1 = fAtX(x, r); }
   if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else if (blockLabelAt(x, y)) cv.style.cursor = "pointer"; else
-  cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : boxAt(x, y) ? "pointer" : "crosshair";
+  cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : "crosshair";
   const f = S.fmin + x / r.width * (S.fmax - S.fmin), tip = $("#tip");
   tip.style.display = "block"; tip.style.left = Math.min(x + 14, r.width - 170) + "px"; tip.style.top = (y + 14) + "px";
   tip.textContent = `${fmtF(f)} · ${clockTime(top - y / S.pps)}`;
@@ -482,31 +373,20 @@ function ensureAudio() {
   if (AC.state !== "running") AC.resume().then(restartPlayback);   // schedule once audio is actually running
 }
 // Audio is always on. Browsers only allow it to start from a user action, so the first click or
-// key press anywhere starts it. To stop listening, pause playback (then only clicked clips play).
+// key press anywhere starts it.
 function startAudioOnce() { ensureAudio(); if (AC && AC.state === "running") { window.removeEventListener("pointerdown", startAudioOnce, true); window.removeEventListener("keydown", startAudioOnce, true); } }
 window.addEventListener("pointerdown", startAudioOnce, true);
 window.addEventListener("keydown", startAudioOnce, true);
 $("#vol").addEventListener("input", e => { fillRange(e.target); if (master) master.gain.value = +e.target.value; });
 
-// ---------------- audio scope: a lane per voice + log-frequency spectrogram of the mix ----------------
+// ---------------- audio scope: the waveform of the pipeline's audio + its log-frequency spectrogram ----------------
 const SCOPE = { an: null, img: null, lo: -100, hi: -40, cols: [], repaint: false };
 const scv = $("#scope"), sctx = scv.getContext("2d");
-const confOf = d => Math.max(d.box.conf_max ?? 0, d.box.conf ?? 0);
-const audible = d => d.box.composed || confOf(d) >= S.minConf;
-// Each voice has its own gain node; it follows the Min confidence filter while it plays, so a
-// detection below the filter stays silent and one that rises above it partway fades in.
-function updateVoiceGains() {
-  if (!AC) return;
-  for (const d of S.dets.values()) {
-    if (!d.vnode) continue;
-    const target = audible(d) ? 1 : 0;
-    if (d.gainTarget !== target) { d.gainTarget = target; d.vnode.gain.setTargetAtTime(target, AC.currentTime, 0.03); }
-  }
-}
+// the pipeline's audio: its live chunks, what of it is playing when, and its own analyser
+const LV = { chunks: [], playing: [], sched: new Set() };
 function playingVoices() {
-  const now = nowS(), out = [];
-  for (const d of S.dets.values()) if (audible(d) && d.playing.some(([a, z]) => now >= a && now <= z)) out.push(d);
-  return out.sort((a, b) => b.box.conf - a.box.conf).slice(0, 4);
+  const now = nowS();
+  return LV.playing.some(([a, z]) => now >= a && now <= z) ? [LV] : [];
 }
 const F_LO = 80, F_HI = 4000;
 function scopeCol(img, q, H) {                              // one 2-px column of the audio spectrogram
@@ -535,11 +415,11 @@ function drawScope() {
     if (i) { sctx.strokeStyle = TH.grid; sctx.beginPath(); sctx.moveTo(0, y0); sctx.lineTo(laneW, y0); sctx.stroke(); }
     if (d.an) {
       d.an.getFloatTimeDomainData(buf);
-      sctx.save(); sctx.globalAlpha = 0.45 + 0.55 * clamp01(d.box.conf); sctx.strokeStyle = TH.mark; sctx.lineWidth = 1.1 * dpr; sctx.beginPath();
+      sctx.save(); sctx.strokeStyle = TH.mark; sctx.lineWidth = 1.1 * dpr; sctx.beginPath();
       for (let k = 0; k < buf.length; k++) { const x = k / buf.length * laneW, y = mid - buf[k] * lh * 0.42; k ? sctx.lineTo(x, y) : sctx.moveTo(x, y); }
       sctx.stroke(); sctx.restore();
     }
-    sctx.fillStyle = TH.text; sctx.fillText(`${fmtFshort((d.box.fmin + d.box.fmax) / 2)}  ${Math.round(d.box.conf * 100)}%`, 6 * dpr, y0 + 12 * dpr);
+    sctx.fillStyle = TH.text; sctx.fillText("the band, summed", 6 * dpr, y0 + 12 * dpr);
   });
   // spectrogram of the mix: log frequency axis (80 Hz-4 kHz), dB, automatic colour scaling
   if (!SCOPE.img || SCOPE.img.width !== Math.max(1, Math.round(specW)) || SCOPE.img.height !== H) {
@@ -579,9 +459,9 @@ function drawScope() {
     sctx.fillText(lab, specX + 4 * dpr, y + 4 * dpr);
   }
   // caption: only when it says something
-  const d = voices[0], cap = $("#scopeCap");
+  const cap = $("#scopeCap");
   const text = !AC || AC.state !== "running" ? (FIELD.on ? "Tap anywhere to start audio." : "Click anywhere to start audio.")
-    : d && S.tx.get(d.box.id) && S.tx.get(d.box.id).text ? `“${S.tx.get(d.box.id).text}”` : S.paused ? "Paused" : "";
+    : S.paused ? "Paused" : "";
   if (cap.textContent !== text) cap.textContent = text;
 }
 let COLLUT = null, COLLUT_KEY = "";
@@ -591,9 +471,8 @@ function makeColLUT() {                                    // the colour map at 
   return COLLUT;
 }
 
-// Playback scheduler: every detection plays when the playhead reaches it. Audio comes from the
-// chunks received live (with their stream times) or, for older detections, from their WAV files.
-// Only what the playhead reaches within the next 30 s is scheduled; moving the playhead restarts it.
+// Playback scheduler: the pipeline's audio plays when the playhead reaches it (chunks with their stream
+// times). Only what the playhead reaches within the next 30 s is scheduled; moving the playhead restarts it.
 const PB = { gen: 0, sources: [], gain: null };
 function streamOut() { if (!PB.gain) { PB.gain = AC.createGain(); PB.gain.connect(master); } return PB.gain; }
 function pcmBuffer(pcm, rate) {
@@ -617,7 +496,6 @@ function playAt(d, buf, tStart, rate) {                     // buf: AudioBuffer 
   const src = AC.createBufferSource(); src.buffer = buf.duration !== undefined ? buf : pcmBuffer(buf, rate);
   if (!d.vnode) {                                          // one analyser per voice, so each can be drawn on its own
     d.vnode = AC.createGain(); d.an = AC.createAnalyser(); d.an.fftSize = 1024;
-    d.gainTarget = audible(d) ? 1 : 0; d.vnode.gain.value = d.gainTarget;
     d.vnode.connect(d.an); d.an.connect(streamOut());
   }
   src.connect(d.vnode); src.start(AC.currentTime + Math.max(0, when - now), skip);
@@ -626,68 +504,35 @@ function playAt(d, buf, tStart, rate) {                     // buf: AudioBuffer 
 function restartPlayback() {
   PB.gen++;
   for (const s of PB.sources) { try { s.stop(); } catch (e) {} }
-  PB.sources = [];
-  for (const d of S.dets.values()) { d.playing = []; d.sched = new Set(); d.wavSched = false; }
+  PB.sources = []; LV.playing = []; LV.sched = new Set();
   schedulePlayback();
 }
 function schedulePlayback() {
   if (S.offset === null || S.paused) return;
   const ph = playheadTime(), horizon = ph + 30;
-  for (const d of S.dets.values()) {
-    if (!d.sched) d.sched = new Set();
-    const b = d.box;
-    if (b.t1 < ph - 0.5 || b.t0 > horizon) continue;
-    const a0 = b.audio_t0 ?? b.t0;                         // audio starts before the box (pre-roll)
-    const chunks = d.chunks || [], whole = chunks.length && chunks[0].t <= a0 + 0.1;
-    const wavs = b.clips && b.clips.length;
-    if (whole || (chunks.length && !wavs)) {
-      for (const c of chunks) {
-        const key = c.t.toFixed(3);
-        if (d.sched.has(key) || c.t + c.pcm.length / c.rate < ph || c.t > horizon) continue;
-        d.sched.add(key); playAt(d, c.pcm, c.t, c.rate);
-      }
-    } else if (wavs && !d.wavSched) {
-      d.wavSched = true; const gen = PB.gen;
-      if (!AC) {                                           // no audio yet: still light the box as the playhead passes
-        const when = a0 + S.offset + S.delay; d.playing.push([when, when + (b.t1 - a0)]); continue;
-      }
-      (d.wavBuf ? Promise.resolve(d.wavBuf) : (AC ? decodeClips(b.clips) : Promise.resolve(null))).then(buf => {
-        if (buf) d.wavBuf = buf;
-        if (gen === PB.gen && buf) playAt(d, buf, a0);
-      });
-    }
+  for (const c of LV.chunks) {
+    const key = c.t.toFixed(3);
+    if (LV.sched.has(key) || c.t + c.pcm.length / c.rate < ph || c.t > horizon) continue;
+    LV.sched.add(key); playAt(LV, c.pcm, c.t, c.rate);
   }
 }
 setInterval(schedulePlayback, 2000);
-
-function onAudio(m) {                                      // live chunk: keep it, and schedule if the playhead will reach it
-  const d = S.dets.get(m.id); if (!d || S.offset === null) return;
+function onAudio(m) {                                      // a chunk of the pipeline's audio: keep it, schedule it
+  if (m.id !== "out" || S.offset === null) return;
   const pcm = new Int16Array(b64bytes(m.pcm).buffer);
-  d.pcm.push(pcm); if (d.pcm.length > 120) d.pcm.shift();
-  d.chunks = d.chunks || []; d.chunks.push({ t: m.t, pcm, rate: m.rate }); if (d.chunks.length > 150) d.chunks.shift();
-  if (!d.sched) d.sched = new Set();
+  LV.chunks.push({ t: m.t, pcm, rate: m.rate }); if (LV.chunks.length > 150) LV.chunks.shift();
   const key = m.t.toFixed(3);
-  if (!S.paused && !d.sched.has(key) && m.t + pcm.length / m.rate >= playheadTime()) { d.sched.add(key); playAt(d, pcm, m.t, m.rate); }
+  if (!S.paused && !LV.sched.has(key) && m.t + pcm.length / m.rate >= playheadTime()) { LV.sched.add(key); playAt(LV, pcm, m.t, m.rate); }
 }
-
-// click-to-play: a detection (live PCM or its recording) or a saved recording
-const detKey = d => d.box.clips && d.box.clips.length ? "clip:" + d.box.clips[0] : "det:" + d.box.id;
+// click-to-play: a saved recording
 const recKey = r => "clip:" + r.clip;
-async function togglePlay(key, det, rec) {
+async function togglePlay(key, rec) {
   ensureAudio();
   if (S.playing) { const old = S.playing.key; try { S.playing.src.stop(); } catch (e) {} S.playing = null; setPlayingUI(old, false); if (PB.gain) PB.gain.gain.value = 1; if (old === key) return; }
-  let buf = null;
-  const urls = rec ? [rec.clip] : (det && det.box.clips) || [];
-  if (urls.length) buf = await decodeClips(urls);
-  if (!buf && det && det.pcm.length) {
-    const n = det.pcm.reduce((a, p) => a + p.length, 0); buf = AC.createBuffer(1, n, 16000);
-    const ch = buf.getChannelData(0); let o = 0; for (const p of det.pcm) { for (let i = 0; i < p.length; i++) ch[o + i] = p[i] / 32768; o += p.length; }
-  }
+  const buf = rec && rec.clip ? await decodeClips([rec.clip]) : null;
   if (!buf) return;
   const src = AC.createBufferSource(); src.buffer = buf; src.connect(master); src.start();
-  if (!det && rec) det = [...S.dets.values()].find(d => (d.box.clips || []).includes(rec.clip));
-  S.playing = { key, src, start: AC.currentTime, dur: buf.duration, det };
-  if (det) det.playing.push([nowS(), nowS() + buf.duration]);
+  S.playing = { key, src, start: AC.currentTime, dur: buf.duration };
   src.onended = () => { if (S.playing && S.playing.src === src) { S.playing = null; setPlayingUI(key, false); if (PB.gain) PB.gain.gain.value = 1; } };
   if (PB.gain) PB.gain.gain.value = 0;                     // a clicked clip has the floor
   setPlayingUI(key, true);
@@ -700,8 +545,8 @@ function updateRowProgress() {
 }
 
 // ---------------- detections list ----------------
-// Live detections render on their own; saved ones load in pages of PAGE as you scroll (server-side
-// search), at most MAX_ROWS kept in the page. Rows are updated in place, never re-rendered wholesale.
+// Saved recordings (from before the filters were removed) load in pages of PAGE as you scroll
+// (server-side search), at most MAX_ROWS kept in the page.
 const ICON_PLAY = '<svg viewBox="0 0 8 8"><path d="M1.5 0.8 7 4 1.5 7.2z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 8 8"><path d="M1.2 1h2v6h-2zM4.8 1h2v6h-2z"/></svg>';
 const PAGE = 100, MAX_ROWS = 1000;
@@ -714,67 +559,25 @@ function confStyle(row, conf) {
   row.style.setProperty("--cb", (1 + 12 * k * k).toFixed(1) + "%");
   row.classList.toggle("hi", k >= 0.9);
 }
-const ICON_SAVE = '<svg viewBox="0 0 10 10"><path d="M1 1h6.5L9 2.5V9H1zM2.5 1v3h4.5V1M2.5 9V6h5v3" fill="none" stroke="currentColor" stroke-width="1"/></svg>';
-const ICON_SAVED = '<svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.5 2.4" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
-function rowFor({ key, f, t, conf, tx, pending, live, onOpen, onPlay, saved, onSave, label }) {
+function rowFor({ key, f, t, conf, tx, onOpen, onPlay, label }) {
   const playing = S.playing && S.playing.key === key;
   let text = "", cls = "x none";
   if (tx) { if (tx.text && tx.no_speech_prob <= 0.6) { text = `“${tx.text}”`; cls = "x"; } else if (tx.text) { text = `“${tx.text}”`; cls = "x doubt"; } else text = "No words"; }
-  else if (pending) text = "Transcribing…";
   const btn = el("button", { class: "play" + (playing ? " on" : ""), title: playing ? "Pause" : "Play", onclick: e => { e.stopPropagation(); onPlay(); } });
   btn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
-  const row = el("div", { class: "det", "data-key": key, title: (live ? "Live — " : "") + "click for details", onclick: onOpen },
+  const row = el("div", { class: "det", "data-key": key, title: "Click for details", onclick: onOpen },
     btn, el("span", { class: "f", title: label ? "Composed voice: several signals mixed" : "" }, label || fmtFshort(f)), el("span", { class: "t" }, t), el("span", { class: cls, title: text }, text),
-    el("span", { class: "c" }, (conf * 100).toFixed(0)), saveCell(saved, onSave),
-    live ? el("i", { class: "live", title: "Live" }) : null);
+    el("span", { class: "c" }, (conf * 100).toFixed(0)), el("span"));
   confStyle(row, conf);
   return row;
 }
-function saveCell(saved, onSave) {
-  if (saved === undefined) return el("span");
-  const b = el("button", { class: "sv" + (saved ? " done" : ""), title: saved ? "Saved to disk" : "Keep: save to disk",
-    onclick: e => { e.stopPropagation(); if (!saved && onSave) { b.disabled = true; onSave(); } } });
-  b.innerHTML = saved ? ICON_SAVED : ICON_SAVE;
-  return b;
-}
-async function saveDetection(r) {
-  const res = await fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: r.key }) });
-  if (!res.ok) alert("This detection's audio is no longer available (dropped from memory and not in the IQ recording).");
-}
-function onSaved(m) {
-  const i = S.recs.findIndex(r => r.key === m.old_key); if (i < 0) return;
-  const oldKey = recKey(S.recs[i]); S.recs[i] = { ...S.recs[i], ...m.meta };
-  const row = $(`#savedList .det[data-key="${CSS.escape(oldKey)}"]`); if (row) row.replaceWith(recRow(S.recs[i]));
-  for (const d of S.dets.values()) if (d.box.clips) d.box.clips = d.box.clips.map(u => u === "/api/clip?key=" + m.old_key ? m.meta.clip : u);
-}
 function recRow(r) {
-  const sameSession = r.epoch && Math.abs(r.epoch - S.epoch) < 1e-3;
-  const minConf = S.cfg ? S.cfg.whisper.min_confidence : 1;
-  const recent = Date.now() - new Date(r.utc_start).getTime() < 180e3;
   return rowFor({ key: recKey(r), f: r.freq_hz.mean, t: hms(new Date(r.utc_start)), conf: r.confidence.max, tx: r.transcript, label: r.composed ? mixLabel(r.components) : null,
-    pending: recent && !r.transcript && r.confidence.max >= minConf && S.cfg && S.cfg.whisper.enabled,
-    onOpen: () => openDetail({ key: r.key }), onPlay: () => togglePlay(recKey(r), null, r),
-    saved: r.saved !== false, onSave: () => saveDetection(r) });
+    onOpen: () => openDetail({ key: r.key }), onPlay: () => togglePlay(recKey(r), r) });
 }
 const mixLabel = comps => `Mix ×${new Set((comps || []).map(c => Math.round(c.f / 500))).size}`;   // channels
-let liveTimer = null;
-function renderLive() {
-  if (liveTimer) return;
-  liveTimer = setTimeout(() => {
-    liveTimer = null;
-    const ds = [...S.dets.values()].filter(d => !d.ended && d.box.detected !== false && audible(d)).sort((a, b) => b.box.t0 - a.box.t0);
-    $("#liveList").replaceChildren(...ds.map(d => {
-      const b = d.box;
-      return rowFor({ key: detKey(d), f: (b.fmin + b.fmax) / 2, t: clockTime(b.t0), conf: b.composed ? b.conf_max : b.conf, tx: S.tx.get(b.id), live: true, label: b.composed ? mixLabel(b.components) : null,
-        onOpen: () => openDetail({ live: d }), onPlay: () => togglePlay(detKey(d), d) });
-    }));
-    updateCount(ds.length);
-  }, 200);
-}
-let liveCount = 0;
-function updateCount(n) {
-  if (n !== undefined) liveCount = n;
-  $("#detCount").textContent = `${liveCount ? liveCount + " live, " : ""}${L.total} ${L.q ? "found" : "saved"}`;
+function updateCount() {
+  $("#detCount").textContent = `${L.total} ${L.q ? "found" : "saved"}`;
 }
 async function loadPage(reset) {
   if (reset) { L.gen++; S.recs = []; L.done = false; L.loading = false; $("#savedList").replaceChildren(); }
@@ -794,32 +597,6 @@ async function loadPage(reset) {
 $("#dets").addEventListener("scroll", e => { const t = e.target; if (t.scrollTop + t.clientHeight > t.scrollHeight - 400) loadPage(false); });
 let searchTimer = null;
 $("#search").addEventListener("input", e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { L.q = e.target.value.trim(); loadPage(true); }, 250); });
-function matchesSearch(m) {
-  if (m.confidence.max < S.minConf) return false;
-  if (!L.q) return true;
-  const f = m.freq_hz.mean, hay = [(m.transcript || {}).text, (m.chain_transcript || {}).text, (f / 1e6).toFixed(4), (f / 1e3).toFixed(1)].join(" ").toLowerCase();
-  return hay.includes(L.q.toLowerCase());
-}
-function onRecording(meta) {
-  const d = S.dets.get(meta.id); if (d && !(d.box.clips || []).includes(meta.clip)) (d.box.clips = d.box.clips || []).push(meta.clip);
-  if (matchesSearch(meta)) {
-    S.recs.unshift(meta); L.total++; $("#savedList").prepend(recRow(meta));
-    if (S.recs.length > MAX_ROWS) { S.recs.pop(); $("#savedList").lastElementChild.remove(); }
-  }
-  updateCount(); renderLive();
-}
-function replaceRecRow(r) {
-  const old = $(`#savedList .det[data-key="${CSS.escape(recKey(r))}"]`);
-  if (old) old.replaceWith(recRow(r));
-}
-function onTranscript(m) {
-  const res = { text: m.text, no_speech_prob: m.no_speech_prob, language: m.language, model: m.model };
-  const keys = m.keys || [];
-  if (m.kind === "track" && res.text) { (S.txLog = S.txLog || []).push({ text: res.text, doubt: res.no_speech_prob > 0.6, at: Date.now() }); if (S.txLog.length > 20) S.txLog.shift(); }
-  if (m.kind === "track") { S.tx.set(m.id, res); for (const r of S.recs) if (keys.includes(r.key)) { r.transcript = res; replaceRecRow(r); } }
-  else { S.chainTx.set(m.chain, res); for (const r of S.recs) if (keys.includes(r.key)) { r.chain_transcript = res; replaceRecRow(r); } }
-  renderLive();
-}
 function setPlayingUI(key, on) {
   document.querySelectorAll(`.det[data-key="${CSS.escape(key)}"]`).forEach(row => {
     const b = row.querySelector(".play"); b.classList.toggle("on", on); b.innerHTML = on ? ICON_PAUSE : ICON_PLAY; b.title = on ? "Pause" : "Play";
@@ -828,12 +605,14 @@ function setPlayingUI(key, on) {
 }
 
 // ---------------- config helpers ----------------
-let pending = {}, pendTimer = null;
+let pending = {}, pendTimer = null, pendDue = 0;
 function merge(a, b) { for (const [k, v] of Object.entries(b)) { if (v && typeof v === "object" && !Array.isArray(v)) { a[k] = a[k] || {}; merge(a[k], v); } else a[k] = v; } return a; }
 function patch(obj, wait = 300) {
   merge(pending, obj); merge(S.cfg, JSON.parse(JSON.stringify(obj)));
-  clearTimeout(pendTimer);
-  pendTimer = setTimeout(async () => { const p = pending; pending = {}; await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) }); }, wait);
+  // throttled, not debounced: while a slider is dragged its value goes out every `wait` ms (live)
+  if (pendTimer && pendDue <= performance.now() + wait) return;
+  clearTimeout(pendTimer); pendDue = performance.now() + wait;
+  pendTimer = setTimeout(async () => { pendTimer = null; const p = pending; pending = {}; await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) }); }, wait);
 }
 const setPath = (path, v) => { const o = {}; let cur = o; path.forEach((k, i) => { if (i === path.length - 1) cur[k] = v; else cur = cur[k] = {}; }); return o; };
 const getPath = (obj, path) => path.reduce((o, k) => (o || {})[k], obj);
@@ -854,119 +633,13 @@ function selectRow(label, options, value, onchange) {
   return el("div", { class: "row wide" }, el("label", {}, label), s);
 }
 
-// ---------------- playback mode: individual voices / composed voice ----------------
-const composing = () => !!(S.cfg && S.cfg.compose && S.cfg.compose.enabled);
-function buildMode() {
-  for (const b of document.querySelectorAll("#modeSeg button")) b.classList.toggle("on", (b.dataset.m === "1") === composing());
-  $("#composeLine").style.display = composing() ? "" : "none";
-  if (!composing()) $("#composeLine").textContent = "";
-  buildLegend();
-}
-function buildLegend() {                                   // what the colours of the "why" view mean
-  const lg = $("#layerLegend"); if (!lg) return;
-  const show = composing() && (S.view === "why" || S.view === "layered");
-  lg.style.display = show ? "" : "none"; if (!show) return;
-  lg.replaceChildren(el("div", { class: "t2", style: "margin-bottom:3px" }, S.view === "why" ? "Colour: strongest layer · brightness: confidence" : "Brightness: confidence (any layer, more if several)"),
-    ...(S.view === "why" ? layersOf().map((l, i) => el("div", { class: "lgrow" }, el("i", { style: `background:rgb(${LAYER_COLORS[i].join(",")})` }), `${labelOf(l.id)} ×${l.weight}`)) : []),
-    el("div", { class: "t3", style: "margin-top:3px" }, `Hidden below ${Math.round(confCut() * 100)}% (candidate floor)`));
-}
-for (const b of document.querySelectorAll("#modeSeg button")) b.addEventListener("click", e => {
-  e.currentTarget.blur(); const on = b.dataset.m === "1"; if (on === composing()) return;
-  setComposing(on);
-  toast(on ? "Composed voice: several signals at once, picked so that together they sound like a voice." : "Individual voices: each signal that sounds like a voice on its own.");
-});
-function setComposing(on) {
-  patch(on ? { compose: { enabled: true, min_conf: S.minConf } } : { compose: { enabled: false } }, 50);
-  buildMode(); buildViewList(); buildDetector();
-  if (on && !isConfView(S.view)) setView("why");
-  if (!on && isConfView(S.view)) setView("power");
-}
-const layersOf = () => ((S.cfg && S.cfg.compose && S.cfg.compose.layers) || []).filter(l => l.weight > 0).slice(0, 8);
-function onCompose(m) {
-  if (!composing()) return;
-  const p = m.parts || {}, pc = v => Math.round((v || 0) * 100);
-  const line = $("#composeLine");
-  line.textContent = `${m.heard ? "▶" : "muted"} ${pc(m.conf)}% · ${(m.members || []).length} bands from ${m.channels} of ${m.candidates} channels`
-    + ` · voiced ${pc(p.voiced)} · pitch ${pc(p.pitch)} · formants ${pc(p.formants)} · rhythm ${pc(p.syllables)} · together ${pc(p.together)} · bands ${pc(p.coverage)}`
-    + (m.vad != null ? ` · ML voice ${pc(m.vad)}` : "")
-    + (m.voiced != null ? ` · mix voiced ${pc(m.voiced)}` : "");
-  line.classList.toggle("muted", !m.heard);
-  line.title = `The chosen set's confidence ${pc(m.conf)}% (structure ${pc(m.structure)}% blended with the ML voice detector on the mix). `
-    + (m.heard ? "At or above Min confidence: heard." : "Below Min confidence: silent.")
-    + ` Bands: ${(m.members || []).map(x => fmtFshort(x.f) + " " + x.band + " (" + (ROLE[x.role] || [x.role])[0] + ")").join(", ")}`;
-}
-
-function composeCard() {
-  const cc = S.cfg.compose || {}, on = !!cc.enabled;
-  const pct = v => Math.round(v * 100) + "%";
-  return el("div", {},
-    el("h2", {}, "Playback mode"),
-    el("div", { class: "card" + (on ? "" : " off") },
-      el("div", { class: "hd" }, toggle(on, v => setComposing(v)), "Composed voice",
-        el("span", { class: "tag" }, on ? "on" : "individual voices")),
-      el("div", { class: "note", style: "margin-top:-2px" }, "One voice, assumed split across several channels. Every frequency gets a confidence from the layers below, straight from the IQ; its peaks above the candidate floor are candidate channels. Each channel is split into low / mid / high bands, and each second the bands from at least two channels that together make the most voice (a moving pitch comb, formants, syllable rhythm, channels moving together, all bands present) are layered. Channels are only band-filtered and levelled, never shifted. Min confidence is for the whole set: below it, nothing plays."),
-      ...(on ? [layersEditor(),
-        el("h3", { class: "sub" }, "Choosing"),
-        slider("Candidate floor (also the layer views' cutoff)", ["compose", "candidate_floor"], 0, 1, 0.01, pct),
-        slider("Fewest channels at once", ["compose", "min_channels"], 1, 6, 1),
-        slider("Most bands at once", ["compose", "max_components"], 2, 15, 1),
-        slider("Keep a band at least", ["compose", "hold_s"], 0, 10, 0.5, v => v + " s"),
-        slider("Judge over the last", ["compose", "window_s"], 1.5, 6, 0.5, v => v + " s"),
-        slider("Candidates", ["compose", "candidates"], 4, 60, 1),
-        slider("Candidates at least apart", ["compose", "min_sep_hz"], 2000, 30000, 500, v => (v / 1e3) + " kHz"),
-        slider("Cost per extra band", ["compose", "cost"], 0, 0.1, 0.005, v => v.toFixed(3)),
-        el("h3", { class: "sub" }, "What a voice needs (scored on the layered bands)"),
-        slider("Heard pitch (demodulated audio repeats at a pitch period)", ["compose", "w_voiced"], 0, 3, 0.1, v => v.toFixed(1)),
-        slider("Channels listened to each hop", ["compose", "probe"], 0, 16, 1),
-        slider("Pitch comb (in the IQ spectrum)", ["compose", "w_pitch"], 0, 2, 0.1, v => v.toFixed(1)),
-        slider("Formants", ["compose", "w_formants"], 0, 2, 0.1, v => v.toFixed(1)),
-        slider("Syllable rhythm", ["compose", "w_syllables"], 0, 2, 0.1, v => v.toFixed(1)),
-        slider("Channels moving together", ["compose", "w_together"], 0, 2, 0.1, v => v.toFixed(1)),
-        slider("Low, mid and high all present", ["compose", "w_coverage"], 0, 2, 0.1, v => v.toFixed(1)),
-        slider("ML voice detector's share of confidence", ["compose", "vad_weight"], 0, 1, 0.05, pct),
-        el("h3", { class: "sub" }, "Voice shaping (from the mix's own pitch and envelope)"),
-        slider("Reinforce the pitch it has", ["compose", "shape_pitch"], 0, 1, 0.05, pct),
-        slider("Sharpen the formants it has", ["compose", "shape_formant"], 0, 1, 0.05, pct),
-        slider("Turn down hiss between voiced sounds", ["compose", "shape_duck_db"], 0, 30, 1, v => v + " dB"),
-        el("h3", { class: "sub" }, "Recording"),
-        slider("Cut pieces after", ["compose", "segment_s"], 3, 60, 1, v => v + " s"),
-        slider("Overlap with the piece before", ["compose", "overlap_s"], 0, 2, 0.1, v => v.toFixed(1) + " s"),
-        slider("Save to disk above", ["compose", "save_score"], 0, 1, 0.05, pct),
-      ] : [])),
-    blockedCard());
-}
-// Layers: whole-band filter maps, each weighted; the waterfall's "why" view colours each frequency by
-// the layer that gives it the most, and "Layered confidence" is their union.
-function layersEditor() {
-  const layers = (S.cfg.compose.layers || []).map(l => ({ ...l }));
-  const save = () => { patch({ compose: { layers } }, 50); buildViewList(); buildLegend(); buildDetector(); };
-  const stage1 = (S.checks || []).filter(c => c.stage === 1 && c.id !== "profile");
-  const rows = layers.map((l, i) => {
-    const out = el("output", {}, (+l.weight).toFixed(1));
-    const inp = el("input", { type: "range", min: 0, max: 2, step: 0.1, value: l.weight }); fillRange(inp);
-    inp.addEventListener("input", () => { fillRange(inp); out.textContent = (+inp.value).toFixed(1); l.weight = +inp.value; patch({ compose: { layers } }, 300); });
-    inp.addEventListener("change", () => { buildViewList(); buildLegend(); });
-    const sw = el("i", { class: "lsw", style: `background:rgb(${LAYER_COLORS[i % 8].join(",")})`, title: "Colour in the “why” view" });
-    const show = el("button", { class: "ib", title: "Show this layer on the waterfall", onclick: () => setView("layer:" + l.id) }, "◐");
-    const del = el("button", { class: "ib", title: "Remove this layer", onclick: () => { layers.splice(i, 1); save(); } }, "×");
-    return el("div", { class: "row lrow" }, el("label", { title: (stage1.find(c => c.id === l.id) || {}).desc || "" }, sw, labelOf(l.id)), inp, out, show, del);
-  });
-  const free = stage1.filter(c => !layers.some(l => l.id === c.id));
-  const add = el("select", { class: "sel", disabled: layers.length >= 8 || !free.length },
-    el("option", { value: "" }, layers.length >= 8 ? "8 layers at most" : "Add a layer…"), ...free.map(c => el("option", { value: c.id }, c.label)));
-  add.addEventListener("change", () => { if (!add.value) return; layers.push({ id: add.value, weight: 1.0 }); save(); });
-  return el("div", {},
-    el("h3", { class: "sub" }, "Layers"),
-    el("div", { class: "note", style: "margin-top:0" }, "Each layer is a filter run on every frequency at once. A frequency's confidence is 1 − Π(1 − weight × layer): bright when any layer sees a part of a voice, brighter when several do. ◐ shows one layer on the waterfall."),
-    ...rows, el("div", { class: "row wide" }, el("label", {}, ""), add));
-}
-// Blocked frequencies: known stations and carriers neither mode will use.
+// Blocked frequencies: known stations and steady lines, marked on the waterfall.
 function blockedCard() {
   const list = (S.cfg.blocked || []).map(r => ({ ...r }));
-  const save = () => { patch({ blocked: list }, 50); buildDetector(); };
+  const save = () => { patch({ blocked: list }, 50); buildGeneral(); };
   return el("div", {},
     el("h2", {}, "Blocked frequencies"),
-    el("div", { class: "note", style: "margin-top:-4px" }, "Ranges neither mode will use: known stations, carriers. Shift-drag across the waterfall (or use Block on the waterfall bar) to add one; click a range's ✕ label on the waterfall, or × here, to remove it."),
+    el("div", { class: "note", style: "margin-top:-4px" }, "Ranges marked on the waterfall: known stations, steady lines. Nothing uses them yet. Shift-drag across the waterfall (or use Block on the waterfall bar) to add one; click a range's ✕ label on the waterfall, or × here, to remove it."),
     ...list.map((r, i) => {
       const name = el("input", { class: "field", value: r.label || "", placeholder: "label", style: "flex:1;min-width:0" });
       name.addEventListener("change", () => { list[i].label = name.value; patch({ blocked: list }, 50); });
@@ -983,8 +656,8 @@ $("#blockBtn").addEventListener("click", e => { e.currentTarget.blur(); setBlock
 function addBlock(lo, hi) {
   if (hi - lo < 500) return;
   const list = [...(S.cfg.blocked || []), { lo: Math.round(lo), hi: Math.round(hi), label: "" }];
-  patch({ blocked: list }, 50); buildDetector();
-  toast(`Blocked ${fmtFshort(lo)} – ${fmtFshort(hi)}. Unblock or label it in Detector › Blocked frequencies.`);
+  patch({ blocked: list }, 50); buildGeneral();
+  toast(`Blocked ${fmtFshort(lo)} – ${fmtFshort(hi)}. Unblock or label it in ⚙ › General › Blocked frequencies.`);
 }
 
 // ---------------- top bar (receiver) ----------------
@@ -1043,44 +716,17 @@ $("#gain").addEventListener("change", e => patch({ sdr: { gain_db: +e.target.val
 $("#amp").addEventListener("click", () => { patch({ sdr: { amp: !S.cfg.sdr.amp } }, 50); buildTop(); });
 
 
-// ---------------- detector tab ----------------
-function buildDetector() {
-  const root = $("#detector"), c = S.cfg; root.replaceChildren();
-  const isActive = v => Object.entries(v.detect).every(([k, x]) => Math.abs(c.detect[k] - x) < 1e-9)
-    && Object.entries(v.checks).every(([id, o]) => Object.entries(o).every(([k, x]) => c.checks[id][k] === x));
-  const seg = el("div", { class: "seg" }, ...Object.entries(S.sens).map(([k, v]) => el("button", {
-    class: isActive(v) ? "on" : "",
-    onclick: async e => {
-      e.currentTarget.blur();
-      const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ detect: v.detect, checks: v.checks }) });
-      S.cfg = await r.json(); buildDetector();
-    }
-  }, v.label)));
+// ---------------- general tab: calibration, transcription, blocked frequencies ----------------
+function buildGeneral() {
+  const root = $("#general"), c = S.cfg; root.replaceChildren();
   root.append(tuneCard()); tickReady();
-  root.append(composeCard());
-  root.append(el("h2", {}, "Sensitivity"), seg);
-  root.append(el("h2", {}, "Thresholds & tracking"),
-    slider("Candidate threshold", ["detect", "candidate_threshold"], 0, 1, 0.01, v => v.toFixed(2)),
-    slider("Capture floor (kept in memory)", ["detect", "threshold"], 0, 1, 0.01, v => v.toFixed(2)),
-    slider("Novelty strength", ["detect", "novelty"], 0, 1.5, 0.05, v => v.toFixed(2)),
-    slider("Novelty memory", ["detect", "novelty_tau_s"], 2, 120, 1, v => v + " s"),
-    slider("Prominence strength", ["detect", "prominence"], 0, 1.5, 0.05, v => v.toFixed(2)),
-    slider("Prominence width", ["detect", "prominence_hz"], 5000, 200000, 5000, v => (v / 1e3) + " kHz"),
-    slider("Min duration", ["detect", "min_duration_s"], 0.1, 5, 0.05, v => v.toFixed(2) + " s"),
-    slider("Candidates per frame", ["detect", "max_candidates"], 1, 30, 1),
-    slider("Max tracks", ["detect", "max_tracks"], 1, 40, 1),
-    slider("Max slide rate", ["detect", "max_slide_hz_s"], 0, 500000, 5000, v => (v / 1e3) + " kHz/s"),
-    slider("Track gap", ["detect", "track_gap_s"], 0.05, 2, 0.05, v => v.toFixed(2) + " s"),
-    slider("Hop link window", ["detect", "link_hops_s"], 0, 2, 0.05, v => v.toFixed(2) + " s"),
-    slider("Min separation", ["detect", "min_sep_hz"], 1000, 50000, 500, v => (v / 1e3) + " kHz"));
   const w = c.whisper, ws = S.status.whisper || {};
   root.append(el("h2", {}, "Transcription"),
+    el("div", { class: "note", style: "margin-top:-4px" }, "The speech-recognition models stay installed; nothing is transcribed until something produces clips again."),
     el("div", { class: "card" + (w.enabled ? "" : " off") },
-      el("div", { class: "hd" }, toggle(w.enabled, v => { patch({ whisper: { enabled: v } }); buildDetector(); }), "Speech recognition (local)", el("span", { class: "tag" }, ws.model ? `loaded ${ws.model}` : "loads on first use")),
+      el("div", { class: "hd" }, toggle(w.enabled, v => { patch({ whisper: { enabled: v } }); buildGeneral(); }), "Speech recognition (local)", el("span", { class: "tag" }, ws.model ? `loaded ${ws.model}` : "loads on first use")),
       selectRow("Model", S.asrModels || [[w.model, w.model]], w.model, v => patch({ whisper: { model: v } })),
       ...(/^(tiny|base|small|medium|large)/.test(w.model) ? [selectRow("Language", ["auto", "en", "es", "fr", "de", "it", "pt", "ja", "zh"], w.language, v => patch({ whisper: { language: v } }))] : []),
-      slider("Only above confidence", ["whisper", "min_confidence"], 0, 1, 0.01, v => v.toFixed(2)),
-      el("div", { class: "row wide" }, el("label", {}, "Also transcribe whole hop chains"), toggle(w.chains, v => patch({ whisper: { chains: v } }))),
       slider("Workers (share one loaded model)", ["whisper", "workers"], 1, 4, 1),
       slider("Clips per batch", ["whisper", "batch_size"], 1, 32, 1),
       slider("CPU threads", ["whisper", "cpu_threads"], 2, 16, 1),
@@ -1090,46 +736,9 @@ function buildDetector() {
           ta.value = (w.filter_phrases || []).join("\n");
           ta.addEventListener("change", () => patch({ whisper: { filter_phrases: ta.value.split("\n").map(x => x.trim()).filter(Boolean) } }, 50));
           return ta; })()),
-      el("div", { class: "note" }, `Most confident clips are transcribed first. Done ${ws.done ?? 0}, skipped as stale ${ws.stale ?? 0}, dropped (queue full) ${ws.dropped ?? 0}.`),
       ws.error ? el("div", { class: "err" }, ws.error) : null));
-  root.append(el("h2", {}, "Checks"),
-    el("div", { class: "note", style: "margin-top:-4px" }, "Each check's weight sets how much it counts; 0 switches it off and it isn't computed at all. Calibration tries every check, including the ones at 0. ▲ marks the weight the last calibration chose."),
-    el("div", { style: "display:flex;gap:8px;margin:6px 0 2px" }, el("button", { class: "btn", onclick: () => {
-      if (!confirm("Put every check's weight back to its default?")) return;
-      patch({ checks: Object.fromEntries(S.checks.map(ch => [ch.id, { weight: ch.default.weight }])) }, 50); buildDetector();
-    } }, "Reset checks to defaults")));
-  for (const g of S.groups) {
-    const list = S.checks.filter(x => x.group === g.id); if (!list.length) continue;
-    root.append(el("h3", { class: "chkgroup" }, g.label, g.note ? el("span", { class: "t3" }, " · " + g.note) : ""));
-    for (const ch of list) root.append(checkRow(ch));
-  }
+  root.append(blockedCard());
   root.append(el("div", { style: "margin:14px 0 20px" }, el("button", { class: "btn", onclick: async () => { if (confirm("Reset every setting to its default?")) await fetch("/api/reset", { method: "POST" }); } }, "Reset all settings")));
-}
-
-// One row per check: name, ⓘ (tap: what it does), weight slider (0 = off), and ⋯ for its parameters.
-function checkRow(ch) {
-  const cc = S.cfg.checks[ch.id], calW = (TUNE.state.weights || {})[ch.id];
-  const fmtW = v => v > 0 ? v.toFixed(2) : "off";
-  const out = el("output", {}, fmtW(+cc.weight));
-  const inp = el("input", { type: "range", min: 0, max: 3, step: 0.05, value: cc.weight, "aria-label": ch.label + " weight" }); fillRange(inp);
-  const desc = el("div", { class: "desc", hidden: true }, ch.desc);
-  const params = ch.params.length ? el("div", { class: "chkparams", hidden: true }, ...ch.params.map(p => slider(p.label, ["checks", ch.id, p.key], p.min, p.max, p.step))) : null;
-  const tag = ch.family ? el("span", { class: "tag", title: "Alternative modulation hypothesis" }, ch.family === "dsb" ? "AM" : "SSB")
-    : ch.id === "profile" && S.status.profile ? el("span", { class: "tag" }, `${S.status.profile.learned_min} min`) : null;
-  const row = el("div", { class: "chk" + (+cc.weight > 0 ? "" : " off") },
-    el("label", { title: ch.label }, el("span", { class: "nm" }, ch.label), tag),
-    el("button", { class: "ib", title: "What it does", "aria-label": "About " + ch.label, onclick: () => { desc.hidden = !desc.hidden; } }, "ⓘ"),
-    el("span", { class: "wt" }, inp, calW != null ? el("i", { class: "calmark", title: `Calibration chose ${fmtW(calW)}`, style: `left:calc(5px + (100% - 10px) * ${Math.min(1, calW / 3)})` }) : null),
-    out,
-    params ? el("button", { class: "ib", title: "Parameters", "aria-label": ch.label + " parameters", onclick: () => { params.hidden = !params.hidden; } }, "⋯") : el("span"));
-  inp.addEventListener("input", () => {
-    fillRange(inp); const v = +inp.value; out.textContent = fmtW(v); row.classList.toggle("off", v <= 0);
-    patch(setPath(["checks", ch.id, "weight"], v));
-  });
-  const box = el("div", { class: "chkbox" }, row, desc);
-  if (params) box.append(params);
-  if (ch.id === "vad" && S.status.vad === false) box.append(el("div", { class: "err" }, "Silero VAD not available on the server."));
-  return box;
 }
 
 // ---------------- calibration (auto-tune) ----------------
@@ -1138,35 +747,18 @@ function tuneCard() {
   const st = TUNE.state, running = st.state === "running", at = S.cfg.autotune;
   const mins = el("select", { class: "sel" }, ...[1, 2, 5, 10].map(m => el("option", { value: m }, m + " min")));
   mins.value = at.minutes; mins.addEventListener("change", () => { patch({ autotune: { minutes: +mins.value } }, 50); setTimeout(pollReady, 300); });
-  const go = el("button", { id: "tuneGo", class: "btn primary", disabled: running || !(TUNE.ready && TUNE.ready.ready), onclick: async () => {
-    await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: at.minutes, per_min: at.per_min }) });
-  } }, running ? "Calibrating…" : "Recalibrate now");
+  const go = el("button", { id: "tuneGo", class: "btn", disabled: running || !(TUNE.ready && TUNE.ready.ready), onclick: async () => {
+    await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: at.minutes }) });
+  } }, running ? "Checking…" : "Calibrate now");
   const out = el("div", { class: "note", style: "margin:8px 0 0" });
-  if (running) out.textContent = st.message || "";
-  else if (st.state === "error") { out.className = "err"; out.textContent = st.message; }
-  else if (st.state === "done" && st.result) {
-    const r = st.result;
-    out.style.color = "var(--text-2)";
-    const rows = (r.decisions || []).map(d => el("div", { class: "row", style: "min-height:22px;grid-template-columns:minmax(0,1fr) 70px" },
-      el("label", { title: d.label }, d.label),
-      el("span", { class: "num", style: `text-align:right;color:${d.on ? "var(--text)" : "var(--text-3)"}` }, d.on ? "× " + d.weight : "off")));
-    out.replaceChildren(el("div", {}, `Calibrated on ${r.candidates} candidates, ${r.voice_like} speech-like.`),
-      rows.length ? el("details", { style: "margin-top:6px" }, el("summary", {}, "Check settings chosen"), ...rows) : "");
-  } else if (st.state === "quiet" || st.state === "reverted" || st.state === "survey") out.textContent = st.message;
-  if (!running && (st.changes || []).length) {
-    const f = v => v > 0 ? v.toFixed(2) : "off";
-    out.append(el("div", { class: "note", style: "margin:6px 0 0" }, "Checks changed: " + st.changes.map(c => `${c.label} ${f(c.before)} → ${f(c.after)}`).join(" · ")));
-  }
-  const undo = ["done", "quiet", "survey"].includes(st.state) ? el("button", { class: "btn", onclick: async () => { await fetch("/api/autotune/revert", { method: "POST" }); } }, "Undo calibration") : null;
+  if (st.state === "error") { out.className = "err"; out.textContent = st.message; }
+  else if (st.message && st.state !== "idle") out.textContent = st.message;
   return el("div", { class: "card", style: "border-top:0;padding-top:0" },
     el("h2", { style: "margin-top:12px" }, "Calibration"),
-    el("div", { class: "row wide" }, el("label", { title: "Calibrates after any receiver change, and recalibrates whenever nothing is caught for the time below" }, "Recalibrate automatically"),
-      toggle(!!at.auto, v => patch({ autotune: { auto: v }, ...(v ? { iq_ring: { enabled: true } } : {}) }, 50))),
-    el("div", { class: "row wide" }, el("label", {}, "Analyse the last"), mins),
-    slider("Max detections per min", ["autotune", "per_min"], 1, 30, 1, v => v + " / min"),
-    slider("Voice-likeness floor", ["autotune", "floor"], 0, 0.9, 0.05, v => Math.round(v * 100) + "%"),
+    el("div", { class: "note", style: "margin-top:-4px" }, "There are no filters yet, so there is nothing to calibrate. This only checks that enough raw IQ is recorded on this band to calibrate filters later."),
+    el("div", { class: "row wide" }, el("label", {}, "Use the last"), mins),
     readyBlock(),
-    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go, undo),
+    el("div", { style: "display:flex;gap:8px;margin-top:8px" }, go),
     out);
 }
 
@@ -1181,7 +773,7 @@ function newSurveyDialog() {
   const est = el("div", { class: "note", style: "margin:8px 0 0" }), err = el("div", { class: "err", style: "margin:6px 0 0" });
   const upd = () => {
     const n = Math.max(1, Math.ceil(((+hi.value - +lo.value) * 1e6) / step));
-    est.textContent = +hi.value > +lo.value ? `${n} step${n > 1 ? "s" : ""} of ${(step / 1e6).toFixed(2)} MHz (80% of the ${(fs / 1e6).toFixed(1)} MHz span) · about ${fmtMS(n * (+dwell.value + 6))}. Each step is calibrated on its own sample and its detections transcribed; the receiver comes back here afterwards.` : "From must be below To.";
+    est.textContent = +hi.value > +lo.value ? `${n} step${n > 1 ? "s" : ""} of ${(step / 1e6).toFixed(2)} MHz (80% of the ${(fs / 1e6).toFixed(1)} MHz span) · about ${fmtMS(n * (+dwell.value + 6))}. Each step's power is added to the map; the receiver comes back here afterwards.` : "From must be below To.";
     lsSet("gb_sv_lo", lo.value); lsSet("gb_sv_hi", hi.value); lsSet("gb_sv_dwell", dwell.value);
   };
   [lo, hi, dwell].forEach(x => x.addEventListener("input", upd)); upd();
@@ -1227,13 +819,12 @@ async function openSurvey(file) {
 function onSurvey(m) {
   const was = SV.state.state; SV.state = m;
   if (SV.open && !SV.file && (m.steps_done || (m.state !== "running" && was === "running"))) openSurvey();
-  if (m.state !== "running" && was === "running") loadSurveyList().then(() => { if ($("#detector").classList.contains("active")) buildDetector(); });
+  if (m.state !== "running" && was === "running") loadSurveyList();
   const t = $("#svStatus"); if (t) t.textContent = t.title = m.state === "running" ? m.message || "" : m.state === "error" ? m.message || "" : "";
   const nb = $("#svNew"); if (nb) nb.textContent = m.state === "running" ? "Stop survey" : "New";
-  if (!$("#detector").contains(document.activeElement) && m.state !== "running") buildDetector();
 }
 function closeSurvey() { SV.open = false; const p = $("#survey"); if (p) p.remove(); $("#mapBtn").classList.remove("on"); buildViewList(); }
-// Tune here: the server moves the receiver and puts the calibration of the survey step under f live.
+// Tune here: the server moves the receiver to f.
 async function surveyTune(f) {
   const file = SV.file || (SV.meta && SV.meta.file);
   closeSurvey();
@@ -1271,7 +862,8 @@ async function surveyImage(view) {
   }
   return (SV.imgs[key] = parts);
 }
-const svTracks = () => (SV.meta ? SV.meta.steps.flatMap((st, si) => st.tracks.map(t => ({ ...t, step: si }))) : []);
+// what an older survey found (surveys no longer detect anything)
+const svTracks = () => (SV.meta ? SV.meta.steps.flatMap((st, si) => (st.tracks || []).map(t => ({ ...t, step: si }))) : []);
 function drawSurvey() {
   if (!SV.open) return;
   let p = $("#survey");
@@ -1417,9 +1009,7 @@ function surveyInteract(c) {
     }
     const f = fAt(e), r = c.getBoundingClientRect(), B = SV.bins, b = B ? Math.floor((f - SV.v0) / B.bw) : -1;
     tip.style.display = ""; tip.style.left = Math.max(0, Math.min(r.width - 300, e.clientX - r.left + 12)) + "px";
-    const st = m.steps.find(s => f >= s.lo && f < s.hi), cal = st && st.calibration;
-    tip.textContent = fmtF(f) + (B && b >= 0 && b < B.nb ? ` · ${(B.all[b] / B.mins).toFixed(1)}/min tracked · ${(B.shown[b] / B.mins).toFixed(1)}/min ≥ ${Math.round(S.minConf * 100)}%` : "")
-      + (cal ? ` · step calibrated on ${cal.candidates} candidates, ${cal.voice_like} speech-like` : st ? " · step too quiet to calibrate" : "");
+    tip.textContent = fmtF(f) + (B && b >= 0 && b < B.nb && B.all[b] ? ` · ${(B.all[b] / B.mins).toFixed(1)}/min tracked · ${(B.shown[b] / B.mins).toFixed(1)}/min ≥ ${Math.round(S.minConf * 100)}%` : "");
   });
   c.addEventListener("pointerup", e => { const was = pinch; endPt(e); if (!was && drag && !drag.moved) { SV.sel = fAt(e); renderSurvey(); } drag = null; });
   c.addEventListener("pointerleave", () => { $("#svTip").style.display = "none"; });
@@ -1430,14 +1020,15 @@ function renderSamples() {
   const floor = SV.meta.floor ?? 0.3;
   const best = svTracks().filter(t => t.clips && t.clips.length && t.conf >= S.minConf)
     .sort((a, b) => b.conf * (0.5 + (b.vad || 0)) - a.conf * (0.5 + (a.vad || 0))).slice(0, 10);
-  if (!best.length) { box.replaceChildren(el("div", { class: "note" }, `No recorded detections at or above ${Math.round(S.minConf * 100)}% confidence.`)); return; }
+  if (!best.length) { box.replaceChildren(el("div", { class: "note" }, svTracks().length ? `No recorded detections at or above ${Math.round(S.minConf * 100)}% confidence.`
+    : "Surveys map power only now: there are no filters to find anything with.")); return; }
   box.replaceChildren(...best.map(t => {
-    const key = "sv:" + t.id, tx = S.tx.get(t.id);
+    const key = "sv:" + t.id;
     return el("div", { class: "svrow det", "data-key": key, title: "Click for details",
       onclick: () => { SV.hl = t.id; renderSurvey(); openDetail({ survey: { file: SV.file || SV.meta.file, step: SV.meta.steps[t.step], stepIndex: t.step, track: t } }); } },
-      (() => { const b = el("button", { class: "play", title: "Play", onclick: e => { e.stopPropagation(); togglePlay(key, null, { clip: t.clips[0] }); } }); b.innerHTML = ICON_PLAY; return b; })(),
+      (() => { const b = el("button", { class: "play", title: "Play", onclick: e => { e.stopPropagation(); togglePlay(key, { clip: t.clips[0] }); } }); b.innerHTML = ICON_PLAY; return b; })(),
       el("span", { class: "num" }, fmtF(t.f)),
-      el("span", { class: "t2" }, t.text ? `“${t.text}”` : tx && tx.text ? `“${tx.text}”` : `step ${t.step + 1} · ${t.t0.toFixed(1)} s`),
+      el("span", { class: "t2" }, t.text ? `“${t.text}”` : `step ${t.step + 1} · ${t.t0.toFixed(1)} s`),
       el("span", { class: "num t2", title: "ML voice score" }, t.vad != null ? `voice ${Math.round(t.vad * 100)}%` : ""),
       el("span", { class: "num", style: t.vad != null && t.vad >= floor ? "color:var(--ok)" : "" }, Math.round(t.conf * 100) + "%"));
   }));
@@ -1466,18 +1057,13 @@ function tickReady() {
     if (!act.firstChild) act.replaceChildren(el("button", { class: "btn", onclick: () => { patch({ iq_ring: { enabled: true } }, 50); r.reason = "recording"; r.at = Date.now(); } }, "Start recording IQ"));
   } else {
     const left = fmtMS(Math.max(0, r.need_s * 0.95 - have));
-    const recal = r.recal_in_s != null ? Math.max(0, r.recal_in_s - (Date.now() - r.at) / 1000) : null;
-    txt.textContent = r.auto && r.tuned
-      ? (recal > 0 ? `Calibrated. Recalibrates if nothing is caught for ${fmtMS(recal)}.` : "Nothing caught lately; recalibrating shortly.")
-      : ready ? (r.auto ? "Enough recorded; calibrating within 10 s." : "Ready.")
-      : `Recording since the last receiver change: ${fmtMS(have)} of ${fmtMS(r.need_s)} · ${r.auto ? "calibrates in" : "ready in"} ${left}`;
+    txt.textContent = ready ? "Ready." : `Recording since the last receiver change: ${fmtMS(have)} of ${fmtMS(r.need_s)} · ready in ${left}`;
     act.replaceChildren();
   }
-  if (r.auto && r.tuned) box.style.display = "";
   const go = $("#tuneGo"); if (go) go.disabled = running || !ready;
 }
 async function pollReady() {
-  if (!$("#detector").classList.contains("active")) return;
+  if (!$("#general").classList.contains("active")) return;
   try {
     const r = await (await fetch(`/api/autotune/ready?minutes=${TUNE.minutes}`)).json();
     TUNE.ready = { ...r, at: Date.now() }; tickReady();
@@ -1485,14 +1071,8 @@ async function pollReady() {
 }
 setInterval(pollReady, 5000); setInterval(tickReady, 1000);
 function onTune(m) {
-  const was = TUNE.state.state; TUNE.state = m;
-  const rb = $("#fRecal");
-  if (rb) { const run = m.state === "running"; rb.disabled = run; rb.textContent = run ? "Calibrating…" : "Recalibrate"; }
-  if (FIELD.on && was === "running" && m.state !== "running")
-    toast(m.state === "done" && m.result ? `Calibrated on ${m.result.candidates} candidates, ${m.result.voice_like} speech-like` : (m.message || "Calibration finished"));
-  if (m.state === "done" && was === "running" && m.result) setMinConf(m.result.show_threshold);
-  if (m.state === "survey" && m.show_threshold != null) setMinConf(m.show_threshold);
-  if (!$("#detector").contains(document.activeElement) || m.state !== "running") buildDetector();
+  TUNE.state = m;
+  if (!$("#general").contains(document.activeElement) || m.state !== "running") buildGeneral();
 }
 
 // ---------------- receiver tab (advanced) ----------------
@@ -1551,7 +1131,7 @@ async function buildSDR() {
     rowW("Load a preset", presetSel),
     el("div", { class: "row wide" }, el("label", {}, "Save current settings as"),
       el("div", { style: "display:flex;gap:6px" }, presetName, saveBtn)),
-    el("div", { class: "note", style: "margin:2px 0 6px" }, "Saves the receiver, detector and playback settings. Files go in live_data/presets, named with the date, device and frequency range."),
+    el("div", { class: "note", style: "margin:2px 0 6px" }, "Saves the receiver, pipeline and playback settings. Files go in live_data/presets, named with the date, device and frequency range."),
     savedList,
     el("h2", {}, "Appearance"),
     rowW("Theme (this browser)", themeSel),
@@ -1574,39 +1154,21 @@ async function buildSDR() {
     rowW("RTL-SDR ppm correction", ppm),
     rowW("Bin width", bin),
     el("div", { style: "margin:8px 0" }, el("button", { class: "btn", onclick: () => apply({ sdr: { ppm: +ppm.value }, analysis: { bin_hz: +bin.value } }) }, "Apply")),
-    el("h2", {}, "Playback audio"),
-    selectRow("Demodulator", [["auto", "Auto (follows the carrier; recovers it when there is none)"], ["sync", "Synchronous AM (needs a carrier)"], ["suppressed", "Suppressed carrier (no carrier needed)"], ["sync_sb", "Synchronous sideband (cleaner side)"], ["envelope", "Envelope"]],
-      c.audio.demod || "auto", v => patch({ audio: { demod: v } }, 50)),
-    el("div", { class: "row wide" }, el("label", { title: "Hard band-pass: flat inside, at least 50 dB down outside" }, "Voice band filter"), toggle(c.audio.voice_band !== false, v => patch({ audio: { voice_band: v } }, 50))),
-    slider("Voice band from", ["audio", "voice_lo_hz"], 100, 800, 25, v => v + " Hz"),
-    slider("Voice band to", ["audio", "voice_hi_hz"], 1800, 5000, 100, v => v + " Hz"),
-    slider("Lead-in before a detection", ["audio", "preroll_s"], 0, 1.5, 0.05, v => v.toFixed(2) + " s"),
-    slider("Tail after a detection", ["audio", "postroll_s"], 0, 1.2, 0.05, v => v.toFixed(2) + " s"),
-    slider("Fade in / out", ["audio", "fade_s"], 0, 0.5, 0.01, v => Math.round(v * 1000) + " ms"),
-    el("div", { class: "row wide" }, el("label", {}, "Noise reduction"), toggle(c.audio.denoise !== false, v => patch({ audio: { denoise: v } }))),
-    slider("Noise reduction strength", ["audio", "denoise_strength"], 0, 2, 0.05, v => v.toFixed(2)),
-    slider("Keep noise at", ["audio", "denoise_floor_db"], -30, -3, 1, v => v + " dB"),
-    el("div", { class: "note" }, "Applies to new detections: what you hear, saved recordings and transcripts. The detector always judges the unprocessed audio. Strength 1 lowers background noise by about 10 dB; the floor keeps some atmosphere."),
+    el("h2", {}, "What you hear"),
+    el("div", { class: "note" }, "The pipeline: the IQ goes through its steps (none yet), then the power of everything left in the band is added up 16,000 times a second, and that is the sound. Its steady part (below 20 Hz) is taken out and its level evened out; nothing else is done to it."),
     el("h2", {}, "Storage"),
     usage,
     el("div", { class: "row wide" }, el("label", {}, "Record raw IQ continuously"), toggle(c.iq_ring.enabled, v => patch({ iq_ring: { enabled: v } }))),
     slider("IQ ring size", ["iq_ring", "max_gb"], 0.5, 100, 0.5, v => v + " GB"),
-    el("div", { class: "row wide" }, el("label", {}, "Keep a small IQ clip with each recording"), toggle(c.record.save_iq, v => patch({ record: { save_iq: v } }))),
-    slider("Save to disk at confidence ≥", ["record", "min_save_conf"], 0, 1, 0.01, v => Math.round(v * 100) + "%"),
-    slider("Detection audio kept in memory", ["record", "memory_mb"], 50, 4000, 50, v => (v >= 1000 ? (v / 1000).toFixed(1) + " GB" : v + " MB")),
     slider("Recordings size", ["record", "max_mb"], 100, 20000, 100, v => (v >= 1000 ? (v / 1000).toFixed(1) + " GB" : v + " MB")),
     slider("Always keep free on disk", ["storage", "min_free_gb"], 1, 100, 1, v => v + " GB"),
     slider("Waterfall history (memory)", ["display", "history_min"], 2, 60, 1, v => v + " min"),
-    el("div", { class: "note" }, "Power change view: each frequency compared with its own recent average, so steady carriers disappear and only what rises above usual shows."),
-    slider("Power change: compare with the last", ["display", "change_tau_s"], 2, 600, 1, v => v >= 60 ? (v / 60).toFixed(1) + " min" : v + " s"),
-    slider("Power change: ignore rises below", ["display", "change_floor_db"], 0, 20, 0.5, v => v + " dB"),
-    slider("Power change: colour range", ["display", "change_range_db"], 5, 60, 1, v => v + " dB"),
-    el("div", { class: "note" }, `Rings delete their oldest files when full. Raw IQ is 2 bytes per sample: ${(2 * sdr.sample_rate / 1e6).toFixed(0)} MB/s at the current rate, so ${c.iq_ring.max_gb} GB holds about ${Math.round(c.iq_ring.max_gb * 1e9 / (2 * sdr.sample_rate))} s. If free disk space drops below the limit, the IQ ring is trimmed further and then all writing pauses (detection keeps running).`));
+    el("div", { class: "note" }, `Rings delete their oldest files when full. Raw IQ is 2 bytes per sample: ${(2 * sdr.sample_rate / 1e6).toFixed(0)} MB/s at the current rate, so ${c.iq_ring.max_gb} GB holds about ${Math.round(c.iq_ring.max_gb * 1e9 / (2 * sdr.sample_rate))} s. If free disk space drops below the limit, the IQ ring is trimmed further and then all writing pauses (the waterfall keeps running).`));
 }
 
 // ---------------- waterfall toolbar ----------------
 function loadScale() {
-  const sc = isConfView(S.view) ? { min: 0, max: 255 } : JSON.parse(lsGet("gb_scale_" + S.view, "null") || "null") || { min: 0, max: 255 };
+  const sc = JSON.parse(lsGet("gb_scale_" + S.view, "null") || "null") || { min: 0, max: 255 };
   S.smin = sc.min; S.smax = sc.max;
 }
 const saveScale = () => lsSet("gb_scale_" + S.view, JSON.stringify({ min: S.smin, max: S.smax }));
@@ -1617,57 +1179,75 @@ let confTimer = null;
 function setMinConf(v) {
   S.minConf = v; lsSet("gb_minconf", v);
   $("#minConf").value = Math.round(v * 100); fillRange($("#minConf")); $("#minConfOut").textContent = Math.round(v * 100) + "%";
-  renderLive(); clearTimeout(confTimer); confTimer = setTimeout(() => loadPage(true), 250);
-  if (isConfView(S.view)) repaintAll();                    // the cutoff is part of the picture
-  buildLegend();
-  if (composing()) patch({ compose: { min_conf: v } }, 400);   // ... and of what can play
+  clearTimeout(confTimer); confTimer = setTimeout(() => loadPage(true), 250);
   if (SV.open) { renderSurvey(); renderSamples(); }
   if ($("#fMin")) syncFieldMin();
 }
 $("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
-$("#caps").checked = lsGet("gb_caps", "1") === "1";
-
-$("#caps").addEventListener("change", e => lsSet("gb_caps", e.target.checked ? "1" : "0"));
 let WS = null;
 function setView(mode) {
-  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode; buildLegend();
-  S.chunks.clear(); loadScale(); LUT = makeLUT();
+  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode;
+  // the old picture stays up until the new one's history arrives, then fades over
+  if (!S.fadeFrom) S.fadeFrom = S.chunks;
+  S.fadeStart = null; S.chunks = new Map(); loadScale(); LUT = makeLUT();
   if (SV.open) drawSurvey();
   if (WS && WS.readyState === 1) WS.send(JSON.stringify({ type: "view", mode }));
   const top = topTime(); if (top !== null) fetchHistory(top - cv.clientHeight / S.pps - 30, top + 5);
 }
 $("#view").addEventListener("change", e => setView(e.target.value));
 
-// Waterfall views: checks at weight 0 are not computed, so only those are listed.
-function availableViews() {
-  if (composing() && !SV.open) {
-    const base = (S.views || []).filter(v => v.id === "power" || v.id === "power_change");
-    return [...base, { id: "why", label: "Why it plays (strongest layer)" }, { id: "layered", label: "Layered confidence" },
-      ...layersOf().map(l => ({ id: "layer:" + l.id, label: "Layer: " + labelOf(l.id), layer: true }))];
-  }
-  const sv = SV.open && SV.meta ? new Set(SV.meta.views) : null;
-  return (S.views || []).filter(v => !v.check || (S.cfg && S.cfg.checks[v.id] && S.cfg.checks[v.id].weight > 0) || (sv && sv.has(v.id)));
-}
+// Waterfall views: power only (older surveys' filter maps aren't shown).
+function availableViews() { return S.views || []; }
 function buildViewList() {
   const vs = availableViews(), sel = $("#view");
-  const opts = [...vs.filter(v => !v.check).map(v => el("option", { value: v.id }, v.label))];
-  const layers = vs.filter(v => v.layer);
-  if (layers.length) { opts.length = 0; opts.push(...vs.filter(v => !v.layer).map(v => el("option", { value: v.id }, v.label)),
-    el("optgroup", { label: "Layers (weighted)" }, ...layers.map(v => el("option", { value: v.id }, v.label)))); }
-  const checks = vs.filter(v => v.check);
-  if (checks.length) opts.push(el("optgroup", { label: "Detector maps (checks above 0)" }, ...checks.map(v => el("option", { value: v.id }, v.label))));
-  sel.replaceChildren(...opts);
+  sel.replaceChildren(...vs.map(v => el("option", { value: v.id }, v.label)));
   if (!vs.some(v => v.id === S.view)) { if (S.view !== "power") setView("power"); }
   else sel.value = S.view;
 }
 
 function switchTab(name) {
-  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === name));
+  document.querySelectorAll("#cfg .tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll("#cfg .tab").forEach(t => t.classList.toggle("active", t.id === name));
   if (name === "sdr") buildSDR();
-  if (name === "detector") pollReady();
+  if (name === "general") { buildGeneral(); pollReady(); }
 }
-document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+document.querySelectorAll("#cfg .tabs button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+// the settings dialog (⚙) and the detections sidebar
+function openCfg(tab) { closeFieldMenu(); document.body.classList.add("cfgopen"); toFront("cfg"); switchTab(tab || $("#cfg .tabs button.active").dataset.tab); }
+function closeCfg() { document.body.classList.remove("cfgopen"); }
+$("#cfgBtn").addEventListener("click", () => openCfg());
+$("#cfgClose").addEventListener("click", closeCfg);
+// both dialogs float over the waterfall (no backdrop): drag by the header, resize from the corner;
+// where each was left is remembered. The one last touched is in front.
+const toFront = id => { for (const w of document.querySelectorAll("#cfg")) w.classList.toggle("front", w.id === id); };
+function floating(wrap) {
+  const box = wrap.firstElementChild, key = "gb_dlg_" + wrap.id;
+  const place = (x, y) => {
+    const r = box.getBoundingClientRect();
+    x = Math.max(80 - r.width, Math.min(innerWidth - 80, x)); y = Math.max(0, Math.min(innerHeight - 40, y));
+    Object.assign(box.style, { left: x + "px", top: y + "px", transform: "none", maxHeight: Math.max(160, innerHeight - y - 8) + "px" });
+  };
+  try { const p = JSON.parse(lsGet(key, "null")); if (p) { Object.assign(box.style, { width: p.w ? p.w + "px" : "", height: p.h ? p.h + "px" : "", left: p.x + "px", top: p.y + "px", transform: "none", maxHeight: Math.max(160, innerHeight - p.y - 8) + "px" }); } } catch (e) {}
+  const save = () => { const r = box.getBoundingClientRect(); if (!r.width) return; lsSet(key, JSON.stringify({ x: r.left, y: r.top, w: box.style.width ? r.width : 0, h: box.style.height ? r.height : 0 })); };
+  box.addEventListener("pointerdown", e => {
+    toFront(wrap.id);
+    if (innerWidth <= 760 || !e.target.closest(".cfghead") || e.target.closest("button,select,input,a")) return;
+    const r = box.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+    const mv = ev => place(ev.clientX - dx, ev.clientY - dy);
+    const up = () => { removeEventListener("pointermove", mv); removeEventListener("pointerup", up); save(); };
+    addEventListener("pointermove", mv); addEventListener("pointerup", up); e.preventDefault();
+  });
+  box.addEventListener("pointerup", () => { if (box.style.width || box.style.height) save(); });     // after a corner resize
+  addEventListener("resize", () => { if (box.style.transform === "none" && box.offsetWidth) { const r = box.getBoundingClientRect(); place(r.left, r.top); } });
+}
+floating($("#cfg"));
+function setDets(on) { document.body.classList.toggle("nodets", !on); $("#detsBtn").classList.toggle("on", on); lsSet("gb_dets", on ? "1" : "0"); }
+$("#detsBtn").addEventListener("click", () => setDets(document.body.classList.contains("nodets")));
+setDets(lsGet("gb_dets", "1") === "1");
+addEventListener("keydown", e => {                       // Escape closes the dialog in front
+  if (e.key !== "Escape") return;
+  if (document.body.classList.contains("cfgopen")) closeCfg();
+});
 
 // ---------------- status ----------------
 function setStatus(s) {
@@ -1682,7 +1262,7 @@ function setStatus(s) {
   st.className = ok && !behind ? "" : "bad";
   const paused = ok && s.storage && s.storage.paused;
   if (paused) st.className = "bad";
-  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: choose a smaller span (top bar), narrow the analysis range (Settings), or raise the detector thresholds" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue || w.busy ? ` · transcribing ${w.queue} queued${w.rate ? `, ${w.rate}/s` : ""}` : ""}${s.error ? " · " + s.error : ""}`
+  st.textContent = ok ? `${paused ? `DISK LOW (${s.storage.free_gb} GB free) — recording paused · ` : ""}CPU ${(s.load * 100).toFixed(0)}%${behind ? " — can't keep up: choose a smaller span (top bar) or narrow the analysis range (Settings)" : ""}${s.dropped ? ` · dropped ${s.dropped}` : ""}${w.queue || w.busy ? ` · transcribing ${w.queue} queued${w.rate ? `, ${w.rate}/s` : ""}` : ""}${s.error ? " · " + s.error : ""}`
     : `${s.state}${s.error ? ": " + s.error : ""}`;
   st.title = st.textContent;
 }
@@ -1696,7 +1276,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello": {
-        S.cfg = m.config; S.checks = m.checks; S.groups = m.check_groups || []; S.presets = m.presets; S.sens = m.sensitivity; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root; S.afilters = m.audio_filters || [];
+        S.cfg = m.config; S.presets = m.presets; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
         fetch("/api/marks").then(r => r.json()).then(x => { S.marks = x; }).catch(() => {});
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
@@ -1706,32 +1286,23 @@ function connect() {
         $("#view").value = S.view; loadScale(); LUT = makeLUT();
 
         setStatus(m.status || {});
-        for (const b of m.detections) S.dets.set(b.id, { box: b, ended: false, playing: [], pcm: [] });
-        buildTop(); buildMode(); buildDetector(); loadPage(true);
-        if (composing() && Math.abs((m.config.compose.min_conf ?? 0) - S.minConf) > 1e-3) patch({ compose: { min_conf: S.minConf } }, 50);
-        Promise.all([fetch("/api/autotune").then(r => r.json()).then(t => { TUNE.state = t; }), loadSurveyList()]).then(buildDetector);
+        buildTop(); buildGeneral(); loadPage(true);
+        Promise.all([fetch("/api/autotune").then(r => r.json()).then(t => { TUNE.state = t; }), loadSurveyList()]).then(buildGeneral);
         const t = m.status && m.status.t; if (t) fetchHistory(t - 240, t + 5);
         break;
       }
       case "config": {
         S.cfg = m.config; buildViewList(); S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
-        if (isConfView(S.view)) repaintAll();               // the candidate floor may have moved
-        buildTop(); buildMode(); if (!$("#detector").contains(document.activeElement)) buildDetector(); break;
+        buildTop(); if (!$("#general").contains(document.activeElement)) buildGeneral();
+        break;
       }
       case "reset": if (m.fmax) { S.fmin = m.fmin; S.fmax = m.fmax; } break;
       case "status": setStatus(m); break;
       case "wf": addChunk(m); break;
-      case "det": S.dets.set(m.box.id, { box: m.box, ended: false, playing: [], pcm: [] }); renderLive(); break;
-      case "det_update": { const d = S.dets.get(m.box.id); if (d) { d.box = m.box; d.ended = false; } else S.dets.set(m.box.id, { box: m.box, ended: false, playing: [], pcm: [] }); renderLive(); break; }
-      case "det_end": { const d = S.dets.get(m.box.id); if (d) { d.box = m.box; d.ended = true; } renderLive(); break; }
       case "audio": onAudio(m); break;
-      case "recording": onRecording(m.meta); break;
-      case "saved": onSaved(m); break;
       case "autotune": onTune(m); break;
       case "survey": onSurvey(m); break;
       case "mark": (S.marks = S.marks || []).push(m); break;
-      case "transcript": onTranscript(m); break;
-      case "compose": onCompose(m); break;
     }
   };
   ws.onclose = () => { setStatus({ state: "disconnected" }); setTimeout(connect, 1500); };
@@ -1742,8 +1313,9 @@ requestAnimationFrame(draw);
 $("#mapBtn").addEventListener("click", openMap);
 
 // ---------------- detection detail dialog ----------------
-// Opens from a detection row or a survey sample: full transcript, playback with waveform and
-// spectrogram (both downloadable), downloads (audio WAV, narrowband IQ), and everything measured.
+// Opens from a saved recording or a survey sample (both from before the filters were removed): transcript,
+// playback with waveform and spectrogram (both downloadable), downloads (audio WAV, narrowband IQ), and
+// what was measured then.
 var DT = { open: false, buf: null, src: null, t0: 0, off: 0, raf: 0, spec: null };
 function fftInPlace(re, im) {                             // iterative radix-2
   const n = re.length;
@@ -1772,7 +1344,7 @@ function specOf(x, rate) {                                // dB STFT, 0-4 kHz: [
   all.sort((a, b) => a - b);
   return { cols, bins, lo: all[Math.floor(all.length * 0.2)] || -100, hi: all[Math.floor(all.length * 0.998)] || 0, hop, rate };
 }
-const labelOf = id => ((S.checks || []).find(c => c.id === id) || {}).label || (ROLE[id] || [])[1] || id;
+const labelOf = id => id === "vad" ? "ML voice detector" : id;
 function closeDetail() {
   dtStop(); DT.open = false; const m = $("#detail"); if (m) m.remove();
   document.removeEventListener("keydown", dtKey, true);
@@ -1792,38 +1364,34 @@ async function openDetail(opts) {
     const { file, step: st, track: t } = opts.survey;
     info = { f: t.f, fmin: t.fmin, fmax: t.fmax, dur: t.dur ?? (t.t1 - t.t0), conf: t.conf, scores: t.scores || { vad: t.vad }, info: t.info || {},
       when: `Survey ${file ? file.replace(/\.json$/, "").replace(/_/g, " ") : ""} · step ${opts.survey.stepIndex + 1} at ${t.t0.toFixed(1)} s`,
-      extra: st.calibration ? [["Step calibration", `${st.calibration.candidates} candidates, ${st.calibration.voice_like} speech-like${st.calibration.kept_checks ? " (kept current checks)" : ""}`]] : [],
-      rx: { center: st.fc, rate: st.fs }, mode: t.mode };
+      extra: [], rx: { center: st.fc, rate: st.fs } };
     tx = t.text ? { text: t.text } : null;
     clip = t.clips && t.clips[0];
-    iqUrl = `/api/iq?survey=${encodeURIComponent(file || SV.meta.file)}&track=${t.id}`;
+    iqUrl = t.composed ? null : `/api/iq?survey=${encodeURIComponent(file || SV.meta.file)}&track=${t.id}`;
+    if (t.composed) info.composed = t.components || [];
   } else {
-    const key = opts.key || (opts.live && (opts.live.box.clips || [])[0] || "").split("key=")[1];
+    const key = opts.key;
     let meta = null;
     if (key) { try { const r = await fetch("/api/detection?key=" + encodeURIComponent(decodeURIComponent(key))); if (r.ok) meta = await r.json(); } catch (e) {} }
-    const b = opts.live ? opts.live.box : null;
     if (meta) {
       info = { f: meta.freq_hz.mean, fmin: meta.freq_hz.min, fmax: meta.freq_hz.max, dur: meta.duration_s, conf: meta.confidence.max, confFinal: meta.confidence.final,
         scores: meta.scores || {}, info: meta.info || {}, when: new Date(meta.utc_start).toLocaleString(), utc: meta.utc_start,
         hist: meta.confidence.history, rx: { center: meta.fc, rate: meta.fs, gain: meta.sdr && meta.sdr.gain_db, amp: meta.sdr && meta.sdr.amp, source: meta.sdr && meta.sdr.source },
-        extra: [["Chain / segment", `${meta.chain} / ${meta.segment}`], ["Saved", meta.saved === false ? "In memory only" : "On disk"]], mode: meta.mode };
-      tx = meta.transcript || S.tx.get(meta.id) || null;
+        extra: [["Chain / segment", `${meta.chain} / ${meta.segment}`]] };
+      tx = meta.transcript || null;
       clip = meta.clip || (meta.files && meta.files.wav ? "/rec/" + meta.files.wav : null);
       iqUrl = meta.composed ? null : "/api/iq?key=" + encodeURIComponent(meta.key);
-      if (meta.composed) { info.composed = meta.components || []; info.key = meta.key; info.extra = info.extra.filter(([k]) => k !== "Chain / segment"); }
+      if (meta.composed) { info.composed = meta.components || []; info.extra = []; }
       if (meta.epoch && Math.abs(meta.epoch - S.epoch) < 1e-3) jump = meta.stream_t1;
-    } else if (b) {
-      info = { f: (b.fmin + b.fmax) / 2, fmin: b.fmin, fmax: b.fmax, dur: b.t1 - b.t0, conf: b.conf, scores: b.scores || {}, info: b.info || {}, when: clockTime(b.t0) + " (still live)", composed: b.composed ? b.components || [] : null };
-      tx = S.tx.get(b.id) || null; jump = b.t1;
     }
   }
   if (!DT.open) return;
-  const renderBase = iqUrl ? iqUrl.split("?")[1] : info.composed && info.key ? "key=" + encodeURIComponent(info.key) : null;
+  const renderBase = iqUrl ? iqUrl.split("?")[1] : null;
   DT.clip = clip;
   // ---- header, transcript
   box.replaceChildren();
   box.append(el("div", { class: "dlghead" },
-    el("strong", { class: "num" }, info.composed ? `Composed voice (${mixLabel(info.composed)})` : fmtF(info.f || 0)), el("span", { class: "t2" }, info.when || ""),
+    el("strong", { class: "num" }, info.composed ? "Composed voice" : fmtF(info.f || 0)), el("span", { class: "t2" }, info.when || ""),
     el("span", { class: "t2 num" }, `${(info.dur || 0).toFixed(1)} s · ${Math.round((info.conf || 0) * 100)}%`),
     el("span", { style: "flex:1" }), el("button", { class: "btn", title: "Close (Esc)", onclick: closeDetail }, "Close")));
   const txText = tx && tx.text ? tx.text : null;
@@ -1837,14 +1405,13 @@ async function openDetail(opts) {
   pl.addEventListener("click", e => { if (!DT.buf) return; const r = pl.getBoundingClientRect(); dtSeek((e.clientX - r.left) / r.width * DT.buf.duration); });
   box.append(el("div", { class: "dlgplayer" }, el("div", { style: "display:flex;gap:10px;align-items:center;margin-bottom:6px" }, playBtn, time,
     el("span", { style: "flex:1" }), el("span", { class: "t3 kbdhint", style: "font-size:12px" }, "Space plays · click the plot to seek")), pl,
-    renderBase ? abControls(renderBase, clip, !!info.composed)
-      : el("div", { class: "note" }, info.composed ? "Still being recorded: the filters can re-render this mix once its piece ends (every " + ((S.cfg.compose || {}).segment_s || 8) + " s at most)." : "A/B listening needs this detection's IQ, which isn't available.")));
+    renderBase ? abControls(renderBase, clip) : ""));
   // ---- downloads and actions
   const fname = `${(info.f / 1e6).toFixed(4)}MHz_${(info.utc || "survey").slice(0, 19).replace(/[-:]/g, "").replace("T", "-")}`;
   const dl = (label, href, name, title) => el("a", { class: "btn", href, download: name, title }, label);
   const pngBtn = (label, cv, suffix) => el("button", { class: "btn", onclick: () => cv.toBlob(b => { const a = el("a", { href: URL.createObjectURL(b), download: `${fname}_${suffix}.png` }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); }) }, label);
   box.append(el("div", { class: "dlgacts" },
-    clip ? dl("Audio WAV", clip, `${fname}_audio.wav`, "Demodulated audio, 16 kHz") : null,
+    clip ? dl("Audio WAV", clip, `${fname}_audio.wav`, "The envelope as heard, 16 kHz") : null,
     iqUrl ? dl("IQ WAV", iqUrl, `${fname}_iq48k.wav`, "Raw IQ around this detection (±1 s), shifted to its frequency, 48 kHz stereo I/Q — opens in SDR#, SDR++ and similar") : null,
     pngBtn("Spectrogram PNG", spec, "spectrogram"), pngBtn("Waveform PNG", wave, "waveform"),
     el("span", { style: "flex:1" }),
@@ -1853,19 +1420,12 @@ async function openDetail(opts) {
     info.composed ? null : el("button", { class: "btn", title: "Move the receiver here", onclick: () => { closeDetail(); if (SV.open) surveyTune(info.f); else { const step = S.cfg.sdr.sample_rate * 0.8; patch({ sdr: { center_hz: Math.round(info.f), fmin_hz: Math.round(info.f - step / 2), fmax_hz: Math.round(info.f + step / 2) } }, 50); } } }, "Tune here")));
   // ---- the numbers
   const kv = [];
-  const fmtMode = m => m === 1 ? "USB" : m === -1 ? "LSB" : m === 0 ? "AM" : null;
-  if (info.composed) {
-    const by = new Map(); for (const c of info.composed) { const o = by.get(c.id) || { f: c.f, band: c.band, roles: new Set(), s: 0 }; o.roles.add(c.role); o.s += c.t1 - c.t0; by.set(c.id, o); }
-    kv.push(["Components", `${by.size} bands from ${new Set([...by.values()].map(o => Math.round(o.f))).size} channels`]);
-    for (const o of [...by.values()].sort((a, b) => a.f - b.f || b.s - a.s).slice(0, 14))
-      kv.push([fmtF(o.f) + (o.band ? " · " + o.band : ""), `${o.s.toFixed(1)} s · ${[...o.roles].map(r => (ROLE[r] || [r, r])[1]).join(", ")}`]);
-  } else kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
+  if (info.composed) kv.push(["Components", `${info.composed.length} (a composed-voice piece from before)`]);
+  else kv.push(["Frequency", `${fmtF(info.f)}${info.fmax - info.fmin > 200 ? ` (${fmtF(info.fmin)} – ${fmtF(info.fmax)}, drift ${((info.fmax - info.fmin) / 1e3).toFixed(1)} kHz)` : ""}`]);
   if (info.confFinal != null) kv.push(["Confidence", `max ${Math.round(info.conf * 100)}%, final ${Math.round(info.confFinal * 100)}%`]);
-  const I = { ...(info.info || {}), ...(info.mode != null ? { mode: info.mode } : {}) };
-  if (fmtMode(I.mode) || I.mode_name) kv.push(["Modulation", I.mode_name || fmtMode(I.mode)]);
+  const I = info.info || {};
   if (I.f0_median_hz) kv.push(["Pitch", `${Math.round(I.f0_median_hz)} Hz`]);
   if (I.voiced_frac != null) kv.push(["Voiced", `${Math.round(I.voiced_frac * 100)}% of frames`]);
-  if (I.am_phase_z != null) kv.push(["AM cross-term", `z = ${I.am_phase_z.toFixed(1)}`]);
   if (info.rx) kv.push(["Receiver", [info.rx.source, info.rx.center ? `${fmtF(info.rx.center)} centre` : "", info.rx.rate ? `${(info.rx.rate / 1e6).toFixed(1)} MS/s` : "", info.rx.gain != null ? `gain ${info.rx.gain} dB` : "", info.rx.amp ? "amp on" : ""].filter(Boolean).join(" · ")]);
   for (const e of info.extra || []) kv.push(e);
   const scores = Object.entries(info.scores || {}).filter(([, v]) => v != null).sort((a, b) => b[1] - a[1]);
@@ -1873,7 +1433,7 @@ async function openDetail(opts) {
     el("div", {}, el("h3", {}, "Details"), ...kv.map(([k, v]) => el("div", { class: "kv" }, el("span", { class: "t3" }, k), el("span", {}, v)))),
     el("div", {}, el("h3", {}, "Check scores"), ...(scores.length ? scores.map(([k, v]) => el("div", { class: "kv sc" }, el("span", { class: "t2" }, k === "vad" ? "ML voice detector" : labelOf(k)),
       el("span", { class: "bar" }, el("i", { style: `width:${Math.round(v * 100)}%` })), el("span", { class: "num" }, Math.round(v * 100)))) : [el("div", { class: "note" }, "None recorded.")]),
-      info.composed ? el("div", { class: "note" }, "Averaged over the piece. Pitch / second voice / formants / syllables are scored on the mix; the ML voice detector only listens.") : "",
+      info.composed ? el("div", { class: "note" }, "Averaged over the piece: the source's phonation, and each of F1, F2, F3 and frication as present × fit to the source (0 when none was played); the ML voice detector listens to the mix.") : "",
       info.hist && info.hist.length > 2 ? el("h3", { style: "margin-top:12px" }, "Confidence over time") : "", info.hist && info.hist.length > 2 ? confSpark(info.hist) : "")));
   // ---- load and draw the audio
   if (clip) {
@@ -1956,113 +1516,29 @@ function dtTick() {
   if (h) h.style.left = (Math.min(1, t / DT.buf.duration) * 100) + "%";
   if (tm) tm.textContent = `${t.toFixed(1)} / ${DT.buf.duration.toFixed(1)} s`;
 }
-// A/B: the same clip re-rendered from its IQ with another demodulator, noise reduction or voice band.
-function abControls(base, clip, composed) {
-  const au = S.cfg.audio;
-  DT.ab = { demod: "rec", denoise: au.denoise !== false, band: au.voice_band !== false }; DT.tunedUrl = null;
-  DT.af = DT.af && DT.af.vals ? { on: {}, vals: DT.af.vals } : { on: {}, vals: {} };   // filter values persist between dialogs
-  if (composed) {                                          // a mix: the audio as played, or its signals again without processing
-    const src = el("div", { class: "abseg" }, ...[["rec", "As played"], ["raw", "Unprocessed"]].map(([v, l]) => el("button", { class: "btn" + (v === "rec" ? " on" : ""), "data-v": v,
-      onclick: e => { DT.ab.demod = v; DT.ab.denoise = DT.ab.band = v === "rec" ? (au.denoise !== false) : false;
-        e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
-    return el("div", {}, el("div", { class: "abrow" }, el("span", { class: "t2" }, "Source"), src,
-      el("span", { id: "abNote", class: "t3", style: "font-size:12px" })),
-      el("div", { class: "note", style: "margin:4px 0 0" }, "Unprocessed: every signal in the mix demodulated again from the IQ without noise reduction or voice band, so the filters below start from the raw sound."),
-      afPanel(base, clip));
-  }
-  const seg = (items, key) => el("div", { class: "abseg" }, ...items.map(([v, l]) => el("button", { class: "btn" + (DT.ab[key] === v ? " on" : ""), "data-v": String(v),
-    onclick: e => { DT.ab[key] = v; e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
-  const note = el("span", { id: "abNote", class: "t3", style: "font-size:12px" });
-  const tuneOut = el("div", { id: "tuneOut", class: "tuneout" });
-  const tuneBtn = el("button", { class: "btn primary", onclick: () => tuneThis(base, clip, tuneBtn) }, "Tune to this detection");
-  return el("div", {}, el("div", { class: "abrow" },
-    el("span", { class: "t2" }, "Listen as"),
-    seg([["rec", "Recorded"], ["auto", "Auto"], ["envelope", "Envelope"], ["sync", "Sync AM"], ["suppressed", "No carrier"], ["sync_sb", "Sync sideband"]], "demod"),
-    el("span", { class: "t2" }, "Noise reduction"), seg([[true, "On"], [false, "Off"]], "denoise"),
-    el("span", { class: "t2" }, "Voice band"), seg([[true, "On"], [false, "Off"]], "band"), note),
-    el("div", { style: "display:flex;gap:10px;align-items:center;margin-top:10px" }, tuneBtn,
-      el("span", { class: "t3", style: "font-size:12px" }, "Finds the demodulation and filtering that make this one signal most voice-like.")),
-    tuneOut, afPanel(base, clip));
-}
-async function tuneThis(base, clip, btn) {
-  const out = $("#tuneOut"); btn.disabled = true; btn.textContent = "Tuning…";
-  out.replaceChildren(el("div", { class: "note" }, "Trying detectors, carrier fine-tuning, voice bands and noise reduction on this clip…"));
-  try {
-    const q = Object.fromEntries(new URLSearchParams(base));
-    const r = await fetch("/api/tune_audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(q) });
-    if (!r.ok) throw new Error(await r.text());
-    const res = await r.json(), b = res.best, pct = v => v < 0.01 ? "under 1%" : (v * 100).toFixed(v > 0.99 ? 2 : 0) + "%";
-    const desc = [b.label + (b.mode && b.offset ? `, carrier ${b.offset > 0 ? "+" : ""}${Math.round(b.offset)} Hz` : ""),
-      b.lo ? `voice band ${b.lo}–${b.hi} Hz` : "no band filter",
-      b.denoise ? `noise reduction ${b.strength <= 0.5 ? "gentle" : b.strength >= 1.5 ? "strong" : "normal"}` : "no noise reduction"].join(" · ");
-    DT.tunedUrl = `/api/render?${base}&demod=${b.demod}&mode=${b.mode}&offset=${b.offset}&band=${b.lo ? 1 : 0}` + (b.lo ? `&lo=${b.lo}&hi=${b.hi}` : "")
-      + `&denoise=${b.denoise ? 1 : 0}&strength=${b.strength}&floor=${b.floor}`;
-    DT.tunedApply = res.apply;
-    const onlyHere = b.mode !== 0;
-    out.replaceChildren(
-      el("div", { class: "tunebest" }, el("strong", {}, desc)),
-      el("div", { class: "note", style: "margin:2px 0 8px" }, `Voice score ${pct(res.score)} (your current settings: ${pct(res.baseline)}).`
-        + (res.score < 0.05 ? " Nothing here sounds like speech to the voice detector under any setting, so this choice is close to arbitrary." : "")
-        + (onlyHere ? ` It sounds best as ${b.mode > 0 ? "upper" : "lower"} sideband with its carrier fine-tuned, which only applies to this signal; "Use these settings" takes the filtering.` : "")),
-      el("div", { style: "display:flex;gap:8px" },
-        el("button", { class: "btn", onclick: () => { DT.ab.demod = "tuned"; document.querySelectorAll(".abseg button").forEach(x => x.classList.toggle("on", x.dataset.v === "tuned")); abLoad(base, clip); } }, "Listen"),
-        el("button", { class: "btn", onclick: e => { patch({ audio: DT.tunedApply }, 50); e.target.textContent = "Saved as your playback settings"; e.target.disabled = true; } }, "Use these settings")),
-      el("details", { style: "margin-top:8px" }, el("summary", { class: "t2" }, `All ${res.trials.length} trials`),
-        ...res.trials.map(t => el("div", { class: "kv sc" }, el("span", { class: "t2" }, `${t.stage}: ${t.label}`),
-          el("span", { class: "bar" }, el("i", { style: `width:${Math.round(t.score * 100)}%` })), el("span", { class: "num" }, (t.score * 100).toFixed(1))))));
-    const seg_ = document.querySelector(".abseg");                    // add "Tuned" to the A/B row
-    if (seg_ && !seg_.querySelector('[data-v="tuned"]')) seg_.append(el("button", { class: "btn", "data-v": "tuned", onclick: e => { DT.ab.demod = "tuned"; seg_.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === e.target)); abLoad(base, clip); } }, "Tuned"));
-  } catch (e) { out.replaceChildren(el("div", { class: "err" }, String(e.message || e).slice(0, 160))); }
-  btn.disabled = false; btn.textContent = "Tune again";
-}
-// Audio filters (listening only): a rack of optional filters applied on the server to the selected source.
-function afPanel(base, clip) {
-  const rows = (S.afilters || []).map(f => {
-    const v = DT.af.vals[f.id] ?? f.value;
-    const out = el("output", {}, fmtAf(f, v));
-    const cb = el("input", { type: "checkbox" }); cb.checked = !!DT.af.on[f.id];
-    const fixed = f.min === f.max;
-    const inp = fixed ? el("span") : el("input", { type: "range", min: f.min, max: f.max, step: f.step, value: v });
-    if (!fixed) { fillRange(inp); inp.addEventListener("input", () => { fillRange(inp); DT.af.vals[f.id] = +inp.value; out.textContent = fmtAf(f, +inp.value); if (!cb.checked) { cb.checked = true; DT.af.on[f.id] = true; } afSoon(base, clip); }); }
-    cb.addEventListener("change", () => { DT.af.on[f.id] = cb.checked; afSoon(base, clip); });
-    return el("label", { class: "afrow" }, cb, el("span", { class: "t2" }, f.label), inp, fixed ? el("span") : out);
-  });
-  const reset = el("button", { class: "btn", onclick: () => { DT.af.on = {}; document.querySelectorAll(".afrow input[type=checkbox]").forEach(c => { c.checked = false; }); abLoad(base, clip); } }, "All off");
-  return el("details", { class: "afpanel", open: true },
-    el("summary", { class: "t2" }, "Audio filters ", el("span", { class: "t3", style: "font-size:12px" }, "for listening only; detection never hears them")),
-    el("div", { class: "afgrid" }, ...rows), el("div", { style: "margin-top:6px" }, reset));
-}
-const fmtAf = (f, v) => f.unit === "Hz" ? `${Math.round(v)} Hz` : f.unit === "dB" ? `${v} dB` : f.unit === "x" ? `${(+v).toFixed(2).replace(/0$/, "")}×` : (+v).toFixed(2);
-let afTimer = null;
-function afSoon(base, clip) { clearTimeout(afTimer); afTimer = setTimeout(() => abLoad(base, clip), 350); }
-function afQuery() {
-  return (S.afilters || []).filter(f => DT.af && DT.af.on[f.id]).map(f => `&${f.id}=${DT.af.vals[f.id] ?? f.value}`).join("");
+// A/B: the clip as recorded, or its range's envelope taken again from the IQ ring.
+function abControls(base, clip) {
+  DT.ab = { src: "rec" };
+  const seg = el("div", { class: "abseg" }, ...[["rec", "Recorded"], ["iq", "From the IQ"]].map(([v, l]) => el("button", { class: "btn" + (v === "rec" ? " on" : ""), "data-v": v,
+    onclick: e => { DT.ab.src = v; e.target.parentNode.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === e.target)); abLoad(base, clip); } }, l)));
+  return el("div", { class: "abrow" }, el("span", { class: "t2" }, "Listen to"), seg, el("span", { id: "abNote", class: "t3", style: "font-size:12px" }));
 }
 async function abLoad(base, clip) {
-  const a = DT.ab, note = $("#abNote");
-  const fq = afQuery();
-  const asPlayed = a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false);
-  const radio = a.demod === "tuned" && DT.tunedUrl ? DT.tunedUrl.split("?")[1]
-    : `${base}&demod=${a.demod === "rec" || a.demod === "raw" ? "" : a.demod}&denoise=${a.denoise ? 1 : 0}&band=${a.band ? 1 : 0}`;
-  const url = fq ? (asPlayed && /(^|&)key=/.test(base) ? `/api/afilter?${base}&src=played${fq}` : `/api/afilter?${radio}${fq}`)
-    : a.demod === "tuned" && DT.tunedUrl ? DT.tunedUrl
-    : a.demod === "rec" && a.denoise === (S.cfg.audio.denoise !== false) && a.band === (S.cfg.audio.voice_band !== false) && clip ? clip
-    : `/api/render?${base}&demod=${a.demod === "rec" ? "" : a.demod}&denoise=${a.denoise ? 1 : 0}&band=${a.band ? 1 : 0}`;
-  if (note) note.textContent = "Rendering…";
+  const note = $("#abNote");
+  const url = DT.ab.src === "rec" && clip ? clip : `/api/render?${base}`;
+  if (note) note.textContent = "Loading…";
   const gen = DT.abGen = (DT.abGen || 0) + 1;
   try {
     const r = await fetch(url); if (!r.ok) throw new Error(await r.text());
     const buf = await AC.decodeAudioData(await r.arrayBuffer());
     if (gen !== DT.abGen || !DT.open) return;
     if (DT.src) dtStop();
-    DT.buf = buf; DT.spec = specOf(buf.getChannelData(0), buf.sampleRate); DT.off = 0;   // a new setting: from the top
+    DT.buf = buf; DT.spec = specOf(buf.getChannelData(0), buf.sampleRate); DT.off = 0;
     drawDetailWave(); drawDetailSpec(); dtTick();
     dtToggle();
     if (note) note.textContent = "";
-  } catch (e) { if (note && gen === DT.abGen) note.textContent = String(e.message || e).slice(0, 80); }
+  } catch (e) { if (note && gen === DT.abGen) note.textContent = String(e.message || e).slice(0, 120); }
 }
-
-// Receiver: which device (when several are connected) and a quick "is it working?" test.
 function deviceRows(sdr) {
   const sel = el("select", { class: "sel" }, el("option", { value: "" }, "First one found"));
   const out = el("div", { class: "note", style: "margin:4px 0 0" });
@@ -2103,26 +1579,24 @@ function openHelp() {
   const key = e => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
   const box = el("div", { class: "dlg help" },
     el("div", { class: "dlghead" }, el("strong", {}, "Getting started"), el("span", { style: "flex:1" }), el("button", { class: "btn", onclick: close }, "Close")),
-    p("This listens to a whole slice of the radio spectrum at once and picks out anything that sounds like a human voice. The quickest way to use it:"),
+    p("This shows a whole slice of the radio spectrum at once as a waterfall and turns it into sound. There are no filters yet: they are being added one at a time."),
     step(1, "Connect your receiver",
-      p("Plug in your HackRF or RTL-SDR, then open ", b("Settings › Receiver"), ". Choose the ", b("Receiver type"), ". If you have more than one device, pick it under ", b("Device"), ". Click ", b("Test"),
+      p("Plug in your HackRF or RTL-SDR, then open ", b("⚙ › Receiver & storage"), ". Choose the ", b("Receiver type"), ". If you have more than one device, pick it under ", b("Device"), ". Click ", b("Test"),
         ": it should say it's receiving at a good level. If it says ", b("clipping"), ", lower the Gain at the top; if it says ", b("very quiet"), ", raise it or check the antenna.")),
-    step(2, "Choose how much to listen to",
-      p("The ", b("span"), " selector at the top sets how wide a slice you hear at once (a HackRF goes up to 20 MHz, an RTL-SDR to about 2.4 MHz). Wider covers more but needs more computer; 4 MHz is a good start. Watch ", b("CPU"),
-        " at the top right: it should stay below about 70%. If it says the computer can't keep up, pick a narrower span.")),
-    step(3, "Let it calibrate itself",
-      p("Open the ", b("Detector"), " tab and make sure ", b("Recalibrate automatically"), " is on. After a couple of minutes on a band it studies what it heard, works out which of its checks pick out voices best there, and sets its thresholds. It does this again whenever you retune, and whenever it hasn't caught anything for a while.")),
-    step(4, "Listen to what it finds",
-      p("The ", b("Detections"), " tab lists everything that sounded voice-like, newest first, with a confidence. Audio plays a few seconds behind live as each detection happens; click anywhere once to switch sound on. ",
-        b("Pause"), " (or the space bar) stops live playback, and the slider next to it is the volume. The bottom of the screen shows each voice's waveform and the sound's spectrum."),
-      p("Click a detection for everything about it: the full transcript, playback with a spectrogram, different ways to demodulate it, and downloads. If one sounds like the real thing, ", b("Tune to this detection"), " finds the clearest settings for it.")),
-    step(5, "Survey a wide range",
-      p("To find where the activity is, click ", b("Map"), ", then ", b("New"), ". Enter a range (for example 0.5–30 MHz), choose ", b("1 min"), " per step, and start it. It steps across the range, calibrates on each step, and transcribes what it finds; the map fills in as it goes. With a 4 MHz span, 0.5–30 MHz is 10 steps, about 12 minutes; give it longer if your computer is slow. Zoom with the scroll wheel, click a box or a sample for details, and use ", b("Tune here"), " to listen live.")),
+    step(2, "Choose how much to see",
+      p("The ", b("span"), " selector at the top sets how wide a slice the waterfall shows (a HackRF goes up to 20 MHz, an RTL-SDR to about 2.4 MHz). Watch ", b("CPU"), " at the top right.")),
+    step(3, "Listen",
+      p("What you hear is the whole band at once: everything left after the pipeline's steps (there are none yet), its power added up moment by moment into one sound. It plays a few seconds behind live; click anywhere once to switch sound on."),
+      p(b("Pause"), " (or the space bar) stops playback and the slider next to it is the volume. Click the waterfall (or drag the playback line) to play from a little further back. The panel at the bottom shows the sound's waveform and its spectrum (audio frequency, not radio frequency).")),
+    step(4, "Survey a wide range",
+      p("Click ", b("Map"), ", then ", b("New"), ". It steps the receiver across a range and draws its power. Older surveys and their samples can still be opened.")),
+    step(5, "Saved recordings",
+      p("The ", b("Detections"), " sidebar lists recordings saved before the filters were removed. Click one for its details, playback, and its IQ.")),
     step(6, "Keep what you found",
       p("Everything is under ", code(root), ":"),
       el("ul", {},
-        el("li", {}, code("recordings/"), " — saved detections: audio (WAV) and details (JSON). Detections at least ", b(`${Math.round(((c.record || {}).min_save_conf ?? 0.7) * 100)}%`), " confident are saved automatically; for others, click the save icon in the list before closing the app (the rest live in memory only)."),
-        el("li", {}, code("live_data/surveys/"), " — your surveys, with their clips."),
+        el("li", {}, code("recordings/"), " — recordings saved before the rebuild: audio (WAV) and details (JSON)."),
+        el("li", {}, code("live_data/surveys/"), " — your surveys."),
         el("li", {}, code(((c.iq_ring || {}).dir || "iq_ring") + "/"), " — the raw radio recording. It's a rolling buffer: the oldest is deleted to make room, so download the ", b("IQ WAV"), " of anything important from its detail window."),
         el("li", {}, code("live_data/presets/"), " — settings you saved.")),
       p("To keep an investigation, copy those folders somewhere safe once you're done.")));
@@ -2132,8 +1606,8 @@ function openHelp() {
 $("#helpBtn").addEventListener("click", openHelp);
 
 // ---------------- phone ("field") layout ----------------
-// Same app, rearranged: waterfall, a "now" panel (K2-style confidence LEDs, frequency, live
-// transcript), big Pause / Mark / volume, and the detections list. Everything else lives in a menu
+// Same app, rearranged: waterfall, a "now" panel (what you hear), big Pause / Mark /
+// volume, and the recordings list. Everything else lives in a menu
 // that borrows the real controls (so they behave exactly as on the desktop) and in full-screen sheets.
 var FIELD = { on: false };
 function wantField() { const p = lsGet("gb_layout", "auto"); return p === "phone" || (p === "auto" && innerWidth <= 760); }
@@ -2141,29 +1615,14 @@ function applyLayout() {
   const on = wantField(); if (on === FIELD.on) return;
   FIELD.on = on; document.body.classList.toggle("field", on);
   if (!on) { closeSheet(); closeFieldMenu(); }
-  if (on && !$("#leds").children.length)
-    for (let i = 0; i < 12; i++) $("#leds").append(el("i", { style: `background:var(${i < 5 ? "--ok" : i < 9 ? "--mark" : "--alarm"})` }));
 }
 addEventListener("resize", applyLayout);
 function setLayoutPref(v) { lsSet("gb_layout", v); applyLayout(); }
 // the "now" panel
 setInterval(() => {
   if (!FIELD.on) return;
-  const voices = playingVoices();
-  let d = voices[0];
-  if (!d) for (const x of S.dets.values()) if (!x.ended && audible(x) && (!d || x.box.conf > d.box.conf)) d = x;
-  const conf = d ? d.box.conf : 0, lit = Math.round(conf * 12);
-  [...$("#leds").children].forEach((e, i) => e.classList.toggle("on", i < lit));
-  $("#nowFreq").textContent = d ? fmtF((d.box.fmin + d.box.fmax) / 2) : S.paused ? "Paused" : (!AC || AC.state !== "running") ? "Tap to start audio" : "Listening…";
-  $("#nowConf").textContent = d ? Math.round(conf * 100) + "%" : "";
-  const log = (S.txLog || []).slice(-3), box = $("#nowText");
-  const key = log.map(x => x.at).join();
-  if (box.dataset.k !== key) {
-    box.dataset.k = key;
-    box.replaceChildren(...log.slice(0, -1).map(x => el("span", { class: "prev" }, `“${x.text}”`)),
-      ...log.slice(-1).map(x => el("span", { class: x.doubt ? "doubt" : "" }, `“${x.text}”`)));
-  }
-}, 150);
+  $("#nowFreq").textContent = S.paused ? "Paused" : (!AC || AC.state !== "running") ? "Tap to start audio" : "The whole band, summed";
+}, 250);
 function toast(text) { const t = $("#toast") || document.body.appendChild(el("div", { id: "toast" })); t.textContent = text; t.style.display = ""; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2600); }
 async function markNow() {
   const t = S.offset === null ? undefined : playheadTime();
@@ -2173,13 +1632,6 @@ async function markNow() {
 function syncFieldMin() { const v = Math.round(S.minConf * 100); $("#fMin").value = v; fillRange($("#fMin")); $("#fMinOut").textContent = v + "%"; }
 $("#fMin").addEventListener("input", e => { setMinConf(+e.target.value / 100); syncFieldMin(); });
 syncFieldMin();
-// recalibrate on demand (the same as Detector > Recalibrate now)
-$("#fRecal").addEventListener("click", async () => {
-  const at = S.cfg.autotune, b = $("#fRecal"); b.disabled = true; b.textContent = "Calibrating…";
-  const r = await (await fetch("/api/autotune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minutes: at.minutes, per_min: at.per_min }) })).json().catch(() => ({}));
-  if (r.error) { toast(r.error); b.disabled = false; b.textContent = "Recalibrate"; }
-  FIELD.recal = true;
-});
 // touch on the waterfall: one finger scrolls through time, two fingers zoom it; taps behave as clicks
 (() => {
   let t0 = null, pinch = null;
@@ -2205,10 +1657,9 @@ $("#fRecal").addEventListener("click", async () => {
   }, { passive: false });
   cv.addEventListener("touchend", e => { if (e.touches.length < 2) pinch = null; if (!e.touches.length) t0 = null; });
 })();
-// full-screen sheets for the Detector and Settings tabs
-function openSheet(tab, title) { closeFieldMenu(); document.body.classList.add("sheet"); $("#sheetTitle").textContent = title; switchTab(tab); }
-function closeSheet() { if (!document.body.classList.contains("sheet")) return; document.body.classList.remove("sheet"); switchTab("dets"); }
-$("#sheetClose").addEventListener("click", closeSheet);
+// full-screen sheets for the settings tabs
+function openSheet(tab) { openCfg(tab); }
+function closeSheet() { closeCfg(); }
 // the menu: borrows the header's span / gain / map controls and the waterfall toolbar
 const BORROW = ["#grpRate", "#grpGain", "#wfbar", "#vol"];
 function closeFieldMenu() {
@@ -2229,8 +1680,7 @@ function openFieldMenu() {
     el("div", { class: "mbtns" },
       go("Mark this moment", () => { closeFieldMenu(); markNow(); }),
       go("Map", () => { closeFieldMenu(); openMap(); }),
-      go("Detector", () => openSheet("detector", "Detector")),
-      go("Settings", () => openSheet("sdr", "Settings")),
+      go("Settings", () => openSheet("general")),
       go("Help", () => { closeFieldMenu(); openHelp(); }),
       go("Desktop layout", () => { closeFieldMenu(); setLayoutPref("desktop"); })));
   const wrap = el("div", { id: "fieldMenu", onclick: e => { if (e.target === wrap) closeFieldMenu(); } }, box);

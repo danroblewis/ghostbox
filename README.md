@@ -1,37 +1,29 @@
 # ghostbox
 
-An SDR-native spirit box. A classic spirit box sweeps one tuner across the broadcast band and
-leaves it to the listener to hear words in the fragments. ghostbox works the other way round: it
+An SDR-native spirit box, being rebuilt from the ground up. A classic spirit box sweeps one tuner
+across the broadcast band and leaves it to the listener to hear words in the fragments. ghostbox
 takes the whole slice of spectrum a software-defined radio delivers at once (up to 20 MHz on a
-HackRF, about 2.4 MHz on an RTL-SDR), looks at every frequency in it simultaneously, and picks out
-the signals that carry something shaped like a human voice, including voices that hop between
-channels or slide in frequency. You listen to those, a few seconds behind live, in a web page.
+HackRF, about 2.4 MHz on an RTL-SDR), shows it as a live waterfall, and turns the whole of it into
+sound.
 
-It is a signal-processing tool, not an oracle. Everything it reports is a radio signal that passed
-a set of voice-likeness checks: broadcast and amateur stations, aviation, utility transmissions,
-interference, and occasionally noise that happens to look speech-like. What you make of a
-detection is up to you; the app gives you the evidence (spectrogram, check scores, audio, IQ) to
-judge it.
+**Where it stands.** Every filter and detector has been removed: the next ones are being added one
+at a time, each understood before the next. A ghost is taken to be a range of the spectrum whose
+energy rises and falls like a voice, with nothing steady under it; ghostbox never looks for, locks
+onto or uses a carrier. Right now the pipeline has no steps: what you hear is the whole band,
+summed.
 
 ## Features
 
-- **Whole-band detection** of AM (double-sideband, with or without carrier) and SSB voice directly
-  from IQ: every frequency bin is scored on every frame, no sweeping.
-- **Live web UI**: waterfall (power, combined voice score, novelty, or any single check), detection
-  list with confidence, delayed live playback locked to the waterfall, per-detection waveform and
-  spectrum.
-- **Hops and slides**: detections are tracked across frequency; a voice that jumps to another
-  channel or drifts is followed and joined into one chain.
-- **Calibration** to the band you are on, automatically or on demand, using the recorded IQ.
-- **Surveys** that step the receiver across a wide range (e.g. 0.5-30 MHz), calibrate on each
-  step, transcribe what they find and draw a map you can zoom into and replay from.
-- **Demodulators**: synchronous AM, suppressed-carrier (carrier recovery), synchronous sideband,
-  envelope, USB/LSB, plus voice band-pass, noise reduction and level control for playback.
-- **"Tune to this detection"**: searches demodulation and filtering settings for one detection.
-- **Transcription** (optional): Whisper (faster-whisper), Moonshine, wav2vec2 or Vosk, all local.
-- **Recording**: detections saved as WAV + JSON (+ narrowband IQ); an optional rolling raw-IQ
-  recording ("IQ ring") so anything can be re-analysed or exported later.
-- Presets, several themes, and replay of IQ capture files without any hardware.
+- **Live power waterfall** of the whole span, with history, zoom and colour maps.
+- **The pipeline**: the IQ goes through a chain of IQ steps (none yet), then the power of
+  everything left in the band is added up 16,000 times a second, and that is the sound, a few
+  seconds behind live. Filters will be steps in this chain; they decide what is in the sum.
+- **IQ ring**: an optional rolling raw-IQ recording, so anything can be replayed or exported later.
+- **Surveys** that step the receiver across a wide range and map its power.
+- **Saved recordings** from before the rebuild stay browsable (transcript, playback, IQ export).
+- **Transcription** engines stay installed (Whisper, Moonshine, wav2vec2, Vosk; all local) for when
+  something produces clips again.
+- Presets, several themes, a phone layout, and replay of IQ capture files without any hardware.
 
 ## Hardware
 
@@ -59,14 +51,14 @@ need the DVB kernel driver blacklisted (`dvb_usb_rtl28xxu`) and the udev rules s
 
 Requires [uv](https://docs.astral.sh/uv/) (it fetches a suitable Python itself) and the receiver
 tools above. One command installs the `ghostbox` command with everything the default settings use,
-including the ML voice detector and Whisper speech recognition:
+including Whisper speech recognition:
 
 ```sh
 uv tool install git+https://github.com/danroblewis/ghostbox.git
 ```
 
-The first install downloads about 140 MB (mostly PyTorch) and takes about 900 MB on disk; Whisper's
-speech model (about 140 MB for the default) downloads the first time something is transcribed. Then:
+Whisper's speech model (about 140 MB for the default) downloads the first time something is
+transcribed. Then:
 
 ```sh
 ghostbox --list-devices                       # what's connected
@@ -82,7 +74,6 @@ Optional extra speech engines:
 |---|---|---|
 | `transformers` | transformers | Moonshine and wav2vec2 transcription |
 | `vosk` | vosk | Vosk transcription |
-| `plots` | matplotlib | the offline analysis script `ghostbox.analyze` |
 | `all` | all of the above | |
 
 e.g. `uv tool install "ghostbox[all] @ git+https://github.com/danroblewis/ghostbox.git"`.
@@ -118,12 +109,10 @@ The original way to start it still works from a source checkout:
 ## On a phone (field use)
 
 Open the same page on a phone and it switches to a field layout: the waterfall (swipe up to go back in
-time, pinch to zoom), a confidence meter, the live transcript in large text, the min-confidence slider
-and a Recalibrate button, the audio waveform and spectrogram, and the detections list (tap one for its
-details). Pause is in the top bar; tuning, display options, volume, Mark, the map, the detector and
-settings are in the menu. **Mark** bookmarks the moment you're hearing (saved to `live_data/marks.jsonl` and drawn on the
-waterfall), so recordings can be lined up with what happened in the room afterwards. Settings ›
-Appearance can force the phone or desktop layout.
+time, pinch to zoom), what you're hearing, the audio waveform and spectrogram, and
+the saved recordings. Pause is in the top bar; tuning, display options, volume, Mark, the map and
+settings are in the menu. **Mark** bookmarks the moment you're hearing (saved to `live_data/marks.jsonl`
+and drawn on the waterfall). Settings › Appearance can force the phone or desktop layout.
 
 To keep radio quiet around other people's instruments (EMF meters react to phones), connect the phone
 by cable rather than Wi-Fi: phone in airplane mode, a USB-C Ethernet adapter to the computer's Ethernet
@@ -151,10 +140,9 @@ Bluetooth off too, and keep the antenna a few metres from both on its coax.
 
 Receiver options are **saved** into the config, exactly as if you had changed them in the page,
 so they also apply to the next start. Giving `--freq`, `--rate` or `--file` also resets the analysis range to
-the whole capture. Everything else (detector, checks, playback, transcription, storage) is set in
-the web page.
+the whole capture. Everything else (the pipeline, transcription, storage) is set in the web page.
 
-Gain: start low. Strong broadcast signals overload the front end and create false "stations";
+Gain: start low. Strong broadcast signals overload the front end and create false signals;
 the receiver test in the app reports clipping. On the FM band an RTL-SDR clips above roughly 10 dB.
 
 ## Where data goes
@@ -167,9 +155,8 @@ run from one (as `python3 -m ghostbox.live.server` always did), otherwise the cu
 | `live_data/config.json` | all settings |
 | `live_data/token` | the access key |
 | `live_data/presets/` | settings you saved |
-| `live_data/surveys/` | surveys, their maps and clips |
-| `live_data/profiles/` | learned per-band background profiles |
-| `recordings/` | saved detections: WAV audio, JSON details, narrowband IQ (capped, oldest deleted) |
+| `live_data/surveys/` | surveys and their maps |
+| `recordings/` | recordings saved before the rebuild: WAV audio, JSON details (capped, oldest deleted) |
 | `iq_ring/` | rolling raw IQ recording when enabled (capped, oldest deleted) |
 | `captures/` | IQ files you put there are offered for replay |
 
@@ -180,117 +167,40 @@ Recordings and the IQ ring can contain anything your receiver picked up; they ar
 
 The **?** button in the page shows the same steps.
 
-1. **Connect your receiver.** Open *Settings > Receiver*, choose the receiver type and, if you
+1. **Connect your receiver.** Open *⚙ › Receiver & storage*, choose the receiver type and, if you
    have several, the device. Click *Test*: it should report a good level. If it says *clipping*,
    lower the gain; if it says *very quiet*, raise it or check the antenna.
-2. **Choose how much to listen to.** The *span* selector sets how wide a slice you hear at once.
-   Wider covers more but needs more CPU; 4 MHz is a good start. Keep the CPU indicator below about
-   70%; if the app says it can't keep up, pick a narrower span.
-3. **Let it calibrate itself.** In the *Detector* tab, turn on *Recalibrate automatically*. After
-   a couple of minutes on a band it studies what it heard, works out which checks separate voices
-   best there, and sets its thresholds. It repeats this after a retune and when nothing has been
-   caught for a while.
-4. **Listen to what it finds.** The *Detections* tab lists voice-like signals, newest first, with
-   a confidence. Audio plays a few seconds behind live; click the page once to enable sound.
-   *Pause* (or space) stops live playback. Click a detection for its transcript, playback with a
-   spectrogram, other demodulations and downloads; *Tune to this detection* finds the clearest
-   settings for it.
-5. **Survey a wide range.** Click *Map*, then *New*, enter a range (e.g. 0.5-30 MHz) and a dwell
-   per step (1 min), and start. It steps across the range, calibrates and transcribes each step,
-   and fills in the map as it goes (with a 4 MHz span, 0.5-30 MHz is 10 steps, about 12 minutes).
-   Zoom with the scroll wheel, click a box for details, and use *Tune here* to listen live:
-   the live detector starts with the calibration the survey made for that step.
-6. **Keep what you found.** Detections at least 70% confident (adjustable) are saved to
-   `recordings/` automatically; save others from the list before closing. The raw IQ ring is a
-   rolling buffer, so download the *IQ WAV* of anything important from its detail window.
+2. **Choose how much to see.** The *span* selector sets how wide a slice the waterfall shows.
+3. **Listen.** What you hear is the whole band, summed (see *How it works*). Click the page once
+   to enable sound. *Pause* (or space) stops playback; click the waterfall or drag the playback
+   line to play from a little further back.
+4. **Survey a wide range.** Click *Map*, then *New*, enter a range and a dwell per step, and start.
+   It steps across the range and maps its power.
 
 ## How it works
 
-**Whole-band IQ checks (stage 1).** The IQ stream is turned into a power spectrogram (bins of
-roughly 125-250 Hz, 25 frames/s) plus a fine 25 Hz spectrum for pitch. Every bin is scored on
-every frame by a set of checks, each giving 0-1:
+**Waterfall.** The IQ stream is turned into a power spectrogram (bins of roughly 125-250 Hz,
+25 frames/s), pooled to the screen's width and sent to the page as it arrives, with history kept on
+the server so the page can scroll back.
 
-- AM structure: upper and lower sidebands that rise and fall together (*twinning*, also along
-  slanted lines for drifting voices), a mirror-image sideband spectrum, a carrier above its
-  sidebands. SSB: voice-band rhythm on one side of a (suppressed) carrier only. AM and SSB are
-  alternative families; whichever fits better counts.
-- Speech rhythm: sideband loudness pulsing at the syllable rate (2-10 Hz, with a 3-6 Hz peak and
-  little energy at 8-12 Hz), loudness range, voiced/unvoiced alternation.
-- Pitch: evenly spaced harmonic lines around a carrier at a human voice pitch, measured from the
-  raw IQ for all frequencies at once, and whether that pitch glides like speech.
-- Spectral shape: energy strongest near the carrier and falling toward 3.4 kHz.
-- Rejections: wideband FM (loudness also pulsing 4.5-8 kHz out), broadband electrical pulses.
-- Novelty and prominence: evidence is compared with each bin's running baseline and its
-  neighbours, and optionally with a learned per-band profile ("unusual for this band").
-
-The scores are combined as a weighted geometric mean. A check's weight is its only switch: at 0
-it is off and not computed at all. Candidate bins are linked over time into
-tracks that may slide in frequency or hop to another channel.
-
-**Per-detection checks (stage 2).** Each track is demodulated from the raw IQ along exactly its
-path and checked again on the audio and narrowband IQ: pitch comb and motion, voicing, rhythm,
-AM phase coherence (carrier and sidebands in phase, unlike FM or noise), cross-channel
-co-modulation (another frequency with the same syllable rhythm: one voice spread across or hopping
-between channels), hop continuity (pitch carried across a hop) and, if installed, the Silero
-neural voice-activity detector. The result is the detection's confidence.
-
-**Calibration.** There are no labelled "ghost" signals to train on, but the band's background can
-be measured. Calibration replays the last few minutes of recorded IQ through the detector with
-permissive thresholds (candidates are found with the active checks plus the defaults for any at
-0, so switched-off checks can never leave it with nothing to find), keeps every candidate with
-the scores of every check, including the ones at 0, then searches check-weight
-combinations offline, choosing the one whose top detections the ML voice detector rates most
-speech-like at the target rate (the ML check's own weight is held fixed so it can't vote for
-itself). It sets the weights and thresholds accordingly; on a quiet band that means more sensitive
-settings than the defaults.
-
-**Surveys.** The receiver records a dwell of IQ at each step across a range while a worker
-processes finished steps: replay through the detector, calibrate on that step, recompute
-confidences, transcribe what remains with Whisper tiny, and add the step to a map of power, voice
-score and every check. The receiver returns to where it was afterwards.
-
-**Composed voice (playback mode).** The waterfall bar switches between *Individual voices* (the
-above: each track that sounds like a voice on its own plays) and *Composed voice*, which plays
-several frequencies at once, chosen so that together they sound like a voice. It uses no tracks.
-*Layers*, any of the stage-1 maps plus a whole-band "two moving resonances" map, each weighted,
-give every frequency a confidence of 1 − Π(1 − weight × layer). The waterfall then shows the
-layers instead of the detector maps: *Why it plays* colours each frequency by its strongest layer,
-with brightness for confidence, and Min confidence is the cutoff for both the picture and what can
-play. Each second, the peaks of that confidence (one channel apart) are candidates, and each
-candidate's sound is read straight off the fine IQ spectrum (its sidebands, added). Starting from
-what is already playing, the candidates whose sidebands together score highest are chosen, on a
-moving pitch comb, a second comb on another note, two gliding formants and syllable rhythm. Those
-are demodulated and mixed. One station that has it all plays alone. The strongest candidates are
-also demodulated each hop just to listen: whether their audio repeats at a pitch period (measured
-on the whitened audio below 1 kHz) is the *heard pitch* part, the strongest sign of a real voice.
-Candidates are only picked, band-filtered and levelled, never shifted. The mix then goes through a
-voice shaper (`voicefx.py`, like a speech codec's postfilter), driven only by the mix's own pitch
-and spectral envelope: the pitch period it has is reinforced, its envelope peaks are sharpened like
-formants, and the hiss between voiced stretches is turned down. The same shaper is in the detail
-dialog's filter rack for any clip. The mix is recorded and transcribed in pieces like a
-detection. *Blocked frequencies* (Block button, or shift-drag on the waterfall) are ranges neither
-mode uses.
-
-**Demodulation and playback.** Playback uses synchronous AM when a carrier is present, a
-suppressed-carrier loop when not, and a product detector for SSB, followed by a steep voice
-band-pass, spectral-gating noise reduction and slow level control. The detector itself always
-judges the unprocessed demodulated audio; playback processing never changes what is detected.
-
-**Transcription.** Detections above a confidence threshold (and whole hop chains, stitched) are
-transcribed locally. Whisper is the most accurate but can invent fluent text from noise; wav2vec2
-has no language model and returns fragments rather than sentences on noise; Vosk is the lightest.
-Common filler phrases that Whisper produces from noise are filtered out.
+**The pipeline** (`pipeline.py`). Raw IQ goes through the IQ steps in order (none yet; each takes
+IQ and returns IQ of the same length), then one final step makes sound: for every audio sample
+(16,000 per second) it adds up the power of all the IQ that arrived in that sliver of time. That is
+the band's total power moment by moment (by Parseval's theorem, the same as adding up every column
+of a spectrum of that sliver). Its steady part (below 20 Hz, inaudible) is taken out and a slow
+automatic level control evens out its loudness; nothing else is done. Before the sum everything is
+in the radio domain (radio frequency on the axis); after it, in the audio domain (the panel under
+the waterfall shows the sound's own spectrum). The page plays each chunk at its stream time plus a
+delay, so the sound stays locked to its place on the waterfall.
 
 ## Repository layout
 
-- `ghostbox/live/` - the live app: `server.py` (web server and API), `engine.py` (pipeline),
-  `stage1.py` / `stage2.py` (checks), `audio.py` (demodulators, playback processing), `compose.py` / `voicefx.py` (composed voice,
-  voice shaper), `afilters.py` (listening filters),
-  `autotune.py` (calibration), `audiotune.py` (tune to a detection), `survey.py`, `asr.py` /
-  `transcribe.py` (speech recognition), `sources.py` (receivers), `config.py` (settings and
-  defaults), `static/` (web page).
+- `ghostbox/live/` - the live app: `server.py` (web server and API), `engine.py` (receiver,
+  waterfall, IQ ring), `pipeline.py` (the IQ steps and the sum into sound), `audio.py` (level and fades), `autotune.py` (calibration shell:
+  finding and replaying recorded IQ), `survey.py`, `asr.py` / `transcribe.py` (speech recognition),
+  `sources.py` (receivers), `config.py` (settings and defaults), `static/` (web page).
 - `ghostbox/cli.py` - the `ghostbox` command.
-- `ghostbox/*.py` - the offline prototype tools (IQ loading, analysis, voice injection for tests).
+- `ghostbox/maps.py`, `ghostbox/iq.py` - the power spectrogram, IQ file loading.
 
 ## License
 
