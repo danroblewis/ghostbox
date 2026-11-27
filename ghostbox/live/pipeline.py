@@ -29,57 +29,29 @@ AUDIO_FS = 16000
 
 
 # ---------------- radio steps (IQ in, IQ out) ----------------
-class Flatten:
-    """Flatten receiver (an equalizer on the IQ).
+class _Spectral:
+    """Base for radio steps that work frequency by frequency: overlapping FFT blocks (sqrt-Hann
+    windows at half overlap, which add back to exactly the input when every gain is 1), each block's
+    spectrum multiplied by a per-frequency gain (gains(), in FFT order), then back to IQ. The output is
+    delayed by one block, so it has the same length as the input. bin_hz sets the frequency resolution
+    (the block is fs / bin_hz samples, rounded up to a power of two)."""
 
-    A receiver doesn't pass every frequency in its span equally: the edges roll off and the middle
-    ripples. Signals that move in frequency (FM) then change in measured power as they move across
-    those slopes, and the sum hears them ("slope detection"). This step learns the receiver's own
-    response and evens it out:
+    bin_hz = 500.0
 
-      1. each frequency's power is averaged over the last `learn_s` seconds;
-      2. the receiver's response is taken as the noise floor under that: the 20th percentile over a
-         sliding window `window_khz` wide (several stations wide, so the gaps between stations set
-         it and stations themselves don't count), smoothed;
-      3. every frequency is boosted or cut by the difference between that response and its median,
-         times `strength` (0 = off, 1 = fully flat), never more than `max_db` either way.
-
-    Applied in the frequency domain: overlapping FFT blocks (sqrt-Hann windows, half overlap, which
-    add back to exactly the input when the gain is 1). The output is delayed by one block (about
-    2 ms), so it has the same length as the input."""
-
-    domain, label = "radio", "Flatten receiver"
-    desc = ("Learns how the receiver's sensitivity varies across the span (from the noise floor, so stations "
-            "don't count) and evens it out. Signals that move in frequency, like FM, are heard by the sum because "
-            "they move across the receiver's slopes; flattening the slopes fades them.")
-    params = [{"key": "strength", "label": "Strength", "min": 0, "max": 1, "step": 0.05, "unit": "%"},
-              {"key": "learn_s", "label": "Learn over", "min": 1, "max": 60, "step": 1, "unit": "s"},
-              {"key": "max_db", "label": "Boost / cut at most", "min": 3, "max": 30, "step": 1, "unit": "dB"},
-              {"key": "window_khz", "label": "Ignore signals narrower than", "min": 100, "max": 3000, "step": 50, "unit": "kHz"}]
-    default = {"strength": 1.0, "learn_s": 10.0, "max_db": 20.0, "window_khz": 1000.0}
-
-    def __init__(self, fs, **p):
-        self.fs = float(fs)
-        self.N = int(2 ** np.ceil(np.log2(self.fs / 500)))      # bins of ~250-500 Hz
+    def __init__(self, fs, fc=0.0):
+        self.fs, self.fc = float(fs), float(fc)
+        self.N = int(2 ** np.ceil(np.log2(self.fs / self.bin_hz)))
         self.H = self.N // 2
+        self.df = self.fs / self.N
+        self.f = np.fft.fftfreq(self.N, 1 / self.fs)            # each bin's offset from the centre (FFT order)
         self.w = np.sqrt(0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.N) / self.N)).astype(np.float32)
         self.inb = np.zeros(0, np.complex64)                    # input not yet in a full block
         self.ola = np.zeros(self.N - self.H, np.complex64)      # overlap-add carried to the next call
         self.fifo = np.zeros(self.N, np.complex64)              # output, one block behind the input
-        self.M = None                                           # per-bin average power (FFT order)
-        self.g = np.ones(self.N, np.float32)                    # per-bin amplitude gain (FFT order)
-        self.set(**p)
 
-    def set(self, strength=1.0, learn_s=10.0, max_db=20.0, window_khz=1000.0):
-        self.strength, self.learn_s, self.max_db = float(strength), float(learn_s), float(max_db)
-        self.window_khz = float(window_khz)
-
-    def response(self):
-        """The receiver's learned response in dB across the span (low to high frequency)."""
-        db = 10 * np.log10(np.fft.fftshift(self.M) + 1e-20)
-        win = max(15, int(self.window_khz * 1e3 / (self.fs / self.N)) | 1)
-        floor = percentile_filter(db, 20, size=win, mode="nearest")
-        return uniform_filter1d(floor, size=max(3, win // 4), mode="nearest")
+    def gains(self, F):
+        """Per-bin amplitude gain for these frames' spectra F [frames, N] (FFT order)."""
+        return np.ones(self.N, np.float32)
 
     def process(self, x):
         N, H = self.N, self.H
@@ -88,17 +60,7 @@ class Flatten:
         if nfr:
             frames = sliding_window_view(inb[:(nfr - 1) * H + N], N)[::H]     # views, no copy
             F = sfft.fft(frames * self.w, axis=1, workers=-1)                   # single precision, all cores
-            # learn: each frame's power folds into the running average with weight H / (learn_s * fs)
-            P = (F.real ** 2 + F.imag ** 2).mean(axis=0)
-            a = min(1.0, nfr * H / (self.learn_s * self.fs))
-            self.M = P if self.M is None else self.M + a * (P - self.M)
-            if self.strength > 0:
-                R = self.response()
-                g_db = np.clip(np.median(R) - R, -self.max_db, self.max_db) * self.strength
-                self.g = np.fft.ifftshift(10 ** (g_db / 20)).astype(np.float32)
-            else:
-                self.g = np.ones(N, np.float32)
-            F *= self.g
+            F *= self.gains(F)
             Y = sfft.ifft(F, axis=1, workers=-1, overwrite_x=True)
             Y *= self.w
             # overlap-add at half overlap: each output half-block = this frame's first half + the
@@ -114,6 +76,98 @@ class Flatten:
         if len(out) < len(x):                                    # (can't happen once running)
             out = np.concatenate([out, np.zeros(len(x) - len(out), np.complex64)])
         return out
+
+
+class Flatten(_Spectral):
+    """Flatten receiver (an equalizer on the IQ).
+
+    A receiver doesn't pass every frequency in its span equally: the edges roll off and the middle
+    ripples. Signals that move in frequency (FM) then change in measured power as they move across
+    those slopes, and the sum hears them ("slope detection"). This step learns the receiver's own
+    response and evens it out:
+
+      1. each frequency's power is averaged over the last `learn_s` seconds;
+      2. the receiver's response is taken as the noise floor under that: the 20th percentile over a
+         sliding window `window_khz` wide (several stations wide, so the gaps between stations set
+         it and stations themselves don't count), smoothed;
+      3. every frequency is boosted or cut by the difference between that response and its median,
+         times `strength` (0 = off, 1 = fully flat), never more than `max_db` either way.
+
+    Bins of ~250-500 Hz; the output is about 2 ms behind the input."""
+
+    domain, label = "radio", "Flatten receiver"
+    desc = ("Learns how the receiver's sensitivity varies across the span (from the noise floor, so stations "
+            "don't count) and evens it out. Signals that move in frequency, like FM, are heard by the sum because "
+            "they move across the receiver's slopes; flattening the slopes fades them.")
+    params = [{"key": "strength", "label": "Strength", "min": 0, "max": 1, "step": 0.05, "unit": "%"},
+              {"key": "learn_s", "label": "Learn over", "min": 1, "max": 60, "step": 1, "unit": "s"},
+              {"key": "max_db", "label": "Boost / cut at most", "min": 3, "max": 30, "step": 1, "unit": "dB"},
+              {"key": "window_khz", "label": "Ignore signals narrower than", "min": 100, "max": 3000, "step": 50, "unit": "kHz"}]
+    default = {"strength": 1.0, "learn_s": 10.0, "max_db": 20.0, "window_khz": 1000.0}
+
+    def __init__(self, fs, fc=0.0, **p):
+        super().__init__(fs, fc)
+        self.M = None                                           # per-bin average power (FFT order)
+        self.set(**p)
+
+    def set(self, strength=1.0, learn_s=10.0, max_db=20.0, window_khz=1000.0):
+        self.strength, self.learn_s, self.max_db = float(strength), float(learn_s), float(max_db)
+        self.window_khz = float(window_khz)
+
+    def response(self):
+        """The receiver's learned response in dB across the span (low to high frequency)."""
+        db = 10 * np.log10(np.fft.fftshift(self.M) + 1e-20)
+        win = max(15, int(self.window_khz * 1e3 / self.df) | 1)
+        floor = percentile_filter(db, 20, size=win, mode="nearest")
+        return uniform_filter1d(floor, size=max(3, win // 4), mode="nearest")
+
+    def gains(self, F):
+        # learn: these frames' power folds into the running average with weight (their length) / (learn_s * fs)
+        P = (F.real ** 2 + F.imag ** 2).mean(axis=0)
+        a = min(1.0, len(F) * self.H / (self.learn_s * self.fs))
+        self.M = P if self.M is None else self.M + a * (P - self.M)
+        if self.strength <= 0:
+            return np.ones(self.N, np.float32)
+        R = self.response()
+        g_db = np.clip(np.median(R) - R, -self.max_db, self.max_db) * self.strength
+        return np.fft.ifftshift(10 ** (g_db / 20)).astype(np.float32)
+
+
+class BandPass(_Spectral):
+    """Band-pass: keep one range of the spectrum, `width_hz` wide around `center_hz` (an absolute
+    frequency), and set every other frequency to zero. SUM then plays that range's power: how its
+    energy rises and falls. The edges are tapered (raised cosine, `edge_hz` each side) so they don't
+    ring. Bins of ~60-120 Hz, so even a narrow range has clean edges; the output is 15-30 ms behind
+    the input."""
+
+    domain, label = "radio", "Band-pass"
+    desc = ("Keeps one range of the spectrum and removes everything else, so the sound is that range alone. On an "
+            "AM signal it plays the voice; on the edge of an FM station it plays the station too, because the station "
+            "swings in and out of the range (slope detection); across a whole FM station it is almost silent.")
+    params = [{"key": "center_hz", "label": "Centre", "kind": "freq", "unit": "Hz"},
+              {"key": "width_hz", "label": "Width", "min": 500, "max": 50000, "step": 250, "unit": "Hz"},
+              {"key": "edge_hz", "label": "Soft edges", "min": 0, "max": 5000, "step": 50, "unit": "Hz"}]
+    default = {"center_hz": 0.0, "width_hz": 6000.0, "edge_hz": 300.0}
+    bin_hz = 100.0
+
+    def __init__(self, fs, fc=0.0, **p):
+        super().__init__(fs, fc)
+        self.key = None
+        self.set(**p)
+
+    def set(self, center_hz=0.0, width_hz=6000.0, edge_hz=300.0):
+        key = (float(center_hz), float(width_hz), float(edge_hz))
+        if key == self.key:
+            return
+        self.key = key
+        d = np.abs(self.f - (float(center_hz) - self.fc))      # each bin's distance from the centre (Hz)
+        half, edge = float(width_hz) / 2, max(float(edge_hz), self.df)
+        # 1 inside, a raised-cosine fall over `edge` outside, 0 beyond
+        t = np.clip((d - half) / edge, 0, 1)
+        self.mask = (0.5 + 0.5 * np.cos(np.pi * t)).astype(np.float32)
+
+    def gains(self, F):
+        return self.mask
 
 
 # ---------------- audio steps (sound in, sound out) ----------------
@@ -140,7 +194,7 @@ class AudioEQ:
                "min": -15, "max": 15, "step": 0.5, "unit": "dB"} for f in EQ_BANDS]
     default = {f"g{f}": 0.0 for f in EQ_BANDS}
 
-    def __init__(self, fs, **p):
+    def __init__(self, fs, fc=0.0, **p):
         self.zi = None
         self.set(**p)
 
@@ -166,7 +220,7 @@ class LowPass:
               {"key": "order", "label": "Steepness (order)", "min": 2, "max": 12, "step": 2, "unit": ""}]
     default = {"cutoff_hz": 7000.0, "order": 8}
 
-    def __init__(self, fs, **p):
+    def __init__(self, fs, fc=0.0, **p):
         self.zi, self.key = None, None
         self.set(**p)
 
@@ -184,7 +238,7 @@ class LowPass:
         return out.astype(np.float32)
 
 
-STEPS = {"flatten": Flatten, "audio_eq": AudioEQ, "lowpass": LowPass}
+STEPS = {"flatten": Flatten, "bandpass": BandPass, "audio_eq": AudioEQ, "lowpass": LowPass}
 
 
 def catalog():
@@ -285,8 +339,8 @@ class Pipeline:
     steps while running: a step of the same type in the same place keeps its state (what it has
     learned, its filters' memory) and only takes the new settings."""
 
-    def __init__(self, fs, n0=0, steps=()):
-        self.fs = float(fs)
+    def __init__(self, fs, n0=0, steps=(), fc=0.0):
+        self.fs, self.fc = float(fs), float(fc)
         self.radio, self.audio = [], []         # [(type, on, instance)]
         self.sum = SumToAudio(fs, n0)
         self.gain = SmoothGain()
@@ -307,7 +361,7 @@ class Pipeline:
                 inst = pool.pop(j)[2]
                 inst.set(**params)
             else:
-                inst = cls(self.fs, **params)
+                inst = cls(self.fs, self.fc, **params)
             new[cls.domain].append((s["type"], bool(s.get("on", True)), inst))
         self.radio, self.audio = new["radio"], new["audio"]
 

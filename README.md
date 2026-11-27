@@ -18,7 +18,7 @@ summed.
 - **The pipeline**: radio steps change the IQ of the whole band, then the power of everything left
   is added up 16,000 times a second into sound (SUM), then audio steps change the sound. It plays
   a few seconds behind live, and every step can be added, switched and adjusted while listening.
-  Steps so far: *Flatten receiver* (radio), *Audio EQ* and *Low-pass* (audio).
+  Steps so far: *Flatten receiver* and *Band-pass* (radio), *Audio EQ* and *Low-pass* (audio).
 - **IQ ring**: an optional rolling raw-IQ recording, so anything can be replayed or exported later.
 - **Surveys** that step the receiver across a wide range and map its power.
 - **Saved recordings** from before the rebuild stay browsable (transcript, playback, IQ export).
@@ -191,12 +191,21 @@ moment by moment, as 16,000 samples a second. That is
 the band's total power moment by moment (by Parseval's theorem, the same as adding up every column
 of a spectrum of that sliver). Its steady part (below 20 Hz, inaudible) is taken out.
 
+Radio steps that work frequency by frequency (Flatten receiver, Band-pass) share one mechanism:
+overlapping FFT blocks (sqrt-Hann windows at half overlap, which add back to exactly the input when
+every gain is 1), each frequency multiplied by a gain, then back to IQ.
+
 - *Flatten receiver* (radio): a receiver doesn't pass every frequency equally, so signals that move
   in frequency (FM) change in measured power as they cross its slopes, and SUM hears them ("slope
   detection"). This step learns the receiver's response from the noise floor (the 20th percentile
   of each frequency's average power over a window wider than a station, default 1 MHz) and boosts
   or cuts the IQ to flatten it, in overlapping FFT blocks. At full strength FM stations fade from
   the sum.
+- *Band-pass* (radio): keeps one range of the spectrum (a centre frequency, typed in or picked on
+  the waterfall, and a width) and sets every other frequency to zero, with tapered edges; bins of
+  ~60-120 Hz. The sound is then that range's power alone: on an AM signal, its voice; on the edge
+  of an FM station, the station (it swings in and out of the range); across a whole FM station,
+  almost nothing (FM's power is constant). The first piece of a frequency-domain mask.
 - *Audio EQ* (audio): a graphic equalizer, one peaking filter per octave from 63 Hz to 6.3 kHz.
 - *Low-pass* (audio): removes everything above a cutoff, steeply (Butterworth, order 8 by default).
 

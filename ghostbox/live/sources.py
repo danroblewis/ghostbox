@@ -47,7 +47,10 @@ class ProcSource(Source):
 
     def __init__(self, cmd, fs, fc, signed):
         self.cmd, self.fs, self.fc, self.signed = cmd, fs, fc, signed
-        self.q = queue.Queue(maxsize=400)
+        # the reader hands over pieces of ~50 ms of signal (at least 256 KB), and the queue holds ~3 s of
+        # them: few handovers between threads (each costs a GIL switch) and room for a slow second
+        self.chunk = max(1 << 18, int(2 * fs * 0.05))
+        self.q = queue.Queue(maxsize=max(20, int(3.0 * 2 * fs / self.chunk) + 1))
         self.buf = np.zeros(0, np.uint8 if not signed else np.int8)
         self.dropped = 0
         self._stop = threading.Event()
@@ -59,13 +62,21 @@ class ProcSource(Source):
     def _pump(self):
         dtype = np.int8 if self.signed else np.uint8
         while not self._stop.is_set():
-            chunk = self.proc.stdout.read(1 << 18)
-            if not chunk:
+            buf = bytearray(self.chunk)                    # fill a whole piece before handing it over
+            mv, got = memoryview(buf), 0
+            while got < self.chunk:
+                k = self.proc.stdout.readinto(mv[got:])     # (releases the GIL while it waits)
+                if not k:
+                    break
+                got += k
+            if not got:
                 break
             try:
-                self.q.put_nowait(np.frombuffer(chunk, dtype=dtype))
+                self.q.put_nowait(np.frombuffer(buf, dtype=dtype, count=got))
             except queue.Full:
-                self.dropped += len(chunk) // 2
+                self.dropped += got // 2
+            if got < self.chunk:
+                break
         if not self._stop.is_set():
             self.status = "exited"
 
@@ -82,6 +93,7 @@ class ProcSource(Source):
         parts = [self.buf]
         have = len(self.buf)
         deadline = time.time() + timeout
+        t_q = time.time()
         while have < need:
             try:
                 c = self.q.get(timeout=max(0.01, deadline - time.time()))
@@ -90,6 +102,7 @@ class ProcSource(Source):
             parts.append(c)
             have += len(c)
         t0 = time.time()
+        self.get_s = t0 - t_q                       # collecting the chunks (waiting included)
         allb = np.concatenate(parts)
         self.buf = allb[need:]
         self.last_raw = allb[:need]

@@ -119,8 +119,10 @@ function addChunk(m) {
 function repaintAll() { LUT = makeLUT(); S.lutVer++; }
 function autoScale() {                                     // follow what's on screen: noise floor (20th pct) .. peaks (99.8th)
   if (!S.autoScale || !S.visible.length) return;
+  // from the pixels that have something in them: what a radio step removed (black) doesn't count, or a
+  // band-pass would leave a floor of nothing and stretch what's left into solid colour
   const v = [];
-  for (const c of S.visible) for (let i = 0; i < c.vals.length; i += 23) v.push(c.vals[i]);
+  for (const c of S.visible) for (let i = 0; i < c.vals.length; i += 23) if (c.vals[i] > 0) v.push(c.vals[i]);
   if (v.length < 200) return;
   v.sort((a, b) => a - b);
   const lo = v[Math.floor(v.length * 0.20)], hi = Math.max(lo + 8, v[Math.floor(v.length * 0.998)]);
@@ -207,6 +209,7 @@ function draw() {
   }
   ctx.globalAlpha = 1;
   drawBlocked(H, dpr);
+  drawBands(H, dpr);
   // grid: clock times on the left, frequency across the top
   ctx.font = `${11 * dpr}px ${TH.mono}`;
   ctx.strokeStyle = TH.grid; ctx.fillStyle = TH.text; ctx.lineWidth = 1;
@@ -248,6 +251,19 @@ function draw() {
   drawScope();
   if (Math.random() < 0.01) evictChunks(top);
   updateRowProgress();
+}
+// each band-pass step's range: outlined down the waterfall, labelled at the top
+function drawBands(H, dpr) {
+  for (const it of (S.cfg && S.cfg.pipeline) || []) {
+    if (it.type !== "bandpass" || it.on === false) continue;
+    const c = (it.params || {}).center_hz, w = (it.params || {}).width_hz ?? 6000; if (!c) continue;
+    const xa = xOf(c - w / 2), xb = xOf(c + w / 2); if (xb < 0 || xa > cv.width) continue;
+    ctx.save(); ctx.strokeStyle = TH.mark; ctx.globalAlpha = 0.85; ctx.lineWidth = dpr; ctx.setLineDash([3 * dpr, 3 * dpr]);
+    for (const x of xb - xa < 3 * dpr ? [(xa + xb) / 2] : [xa, xb]) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+    ctx.setLineDash([]); ctx.font = `${11 * dpr}px ${TH.sans}`; ctx.fillStyle = TH.mark; ctx.globalAlpha = 1;
+    ctx.fillText(`Band-pass ${fmtF(c)}`, Math.min(cv.width - 150 * dpr, xb + 4 * dpr), 58 * dpr);
+    ctx.restore();
+  }
 }
 function drawBlocked(H, dpr) {
   BLK.rects = [];
@@ -322,6 +338,11 @@ window.addEventListener("mouseup", e => {
   const [x, y] = canvasPos(e); const moved = Math.hypot(x - downAt[0], y - downAt[1]); downAt = null;
   if (moved > 4) return;
   const bl = blockLabelAt(x, y); if (bl) { unblock(bl[4]); return; }
+  if (S.pick) {                                            // picking a step's frequency
+    const items = pipeItems(), it = items[S.pick.i];
+    if (it) { it.params[S.pick.key] = Math.round(fAtX(x, canvasPos(e)[2])); savePipe(items, 50); toast(`${stepType(it.type).label} at ${fmtF(it.params[S.pick.key])}`); }
+    S.pick = null; buildPipe(); return;
+  }
   const top = topTime(); if (top === null) return;          // empty spot: play from here
   setPlayhead(top - y / S.pps, y / S.pps); restartPlayback();
 });
@@ -329,7 +350,7 @@ cv.addEventListener("mousemove", e => {
   const [x, y, r] = canvasPos(e); const top = topTime(); if (top === null) return;
   if (dragging) { setPlayhead(dragTop - y / S.pps, y / S.pps); return; }
   if (BLK.drag) { BLK.drag.f1 = fAtX(x, r); }
-  if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else if (blockLabelAt(x, y)) cv.style.cursor = "pointer"; else
+  if (S.pick) cv.style.cursor = "copy"; else if (BLK.mode || e.shiftKey || BLK.drag) cv.style.cursor = "col-resize"; else if (blockLabelAt(x, y)) cv.style.cursor = "pointer"; else
   cv.style.cursor = Math.abs(y - playLineY()) < 7 ? "ns-resize" : "crosshair";
   const f = S.fmin + x / r.width * (S.fmax - S.fmin), tip = $("#tip");
   tip.style.display = "block"; tip.style.left = Math.min(x + 14, r.width - 170) + "px"; tip.style.top = (y + 14) + "px";
@@ -669,6 +690,13 @@ function buildPipe() {
     const desc = el("div", { class: "desc", hidden: true }, t.desc);
     const sliders = t.params.map(p => {
       const v = it.params[p.key] ?? t.default[p.key];
+      if (p.kind === "freq") {                             // an absolute frequency: type it in MHz, or pick it on the waterfall
+        const inp = el("input", { class: "field", type: "number", step: "0.0001", value: (v / 1e6).toFixed(4), style: "width:110px" });
+        inp.addEventListener("change", () => { it.params[p.key] = Math.round(+inp.value * 1e6); save(50, false); });
+        const pick = el("button", { class: "btn" + (S.pick && S.pick.i === i ? " on" : ""), title: "Then click the waterfall at the frequency you want",
+          onclick: () => { S.pick = { i, key: p.key }; pick.classList.add("on"); toast("Click the waterfall at the frequency you want."); } }, "Pick on waterfall");
+        return el("div", { class: "row wide" }, el("label", {}, p.label), el("span", { style: "display:flex;gap:6px;align-items:center;justify-content:flex-end" }, inp, el("span", { class: "t3" }, "MHz"), pick));
+      }
       const out = el("output", {}, fmtParam(p, v));
       const r = el("input", { type: "range", min: p.min, max: p.max, step: p.step, value: v }); fillRange(r);
       r.addEventListener("input", () => { fillRange(r); out.textContent = fmtParam(p, +r.value); it.params[p.key] = +r.value; save(120); });
@@ -687,7 +715,11 @@ function buildPipe() {
     sel.addEventListener("change", () => {
       const t = stepType(sel.value); if (!sel.value) return;
       const at = domain === "radio" ? items.filter(x => stepType(x.type).domain === "radio").length : items.length;
-      items.splice(at, 0, { type: t.type, on: true, params: { ...t.default } });
+      const params = { ...t.default };
+      for (const p of t.params) if (p.kind === "freq" && !params[p.key]) params[p.key] = Math.round(S.cfg.sdr.center_hz + (S.fmax - S.fmin) / 4);
+      items.splice(at, 0, { type: t.type, on: true, params });
+      const fp = t.params.find(p => p.kind === "freq");
+      if (fp) { S.pick = { i: at, key: fp.key }; toast("Click the waterfall at the frequency you want."); }
       save(50, true); if (domain === "radio") setView("pipe");
     });
     return sel;

@@ -91,7 +91,7 @@ def render_segments(segs, t0, t1, au, steps=()):
     if loaded is None:
         return None
     x, start, fs, fc = loaded
-    _, y = Pipeline(fs, int(round(start * fs)), steps).process(x)
+    _, y = Pipeline(fs, int(round(start * fs)), steps, fc).process(x)
     y = fade(y, AUDIO_FS, au.get("fade_s", 0.15), au.get("fade_s", 0.15))
     return (np.clip(y, -1, 1) * 32767).astype(np.int16)
 
@@ -188,8 +188,11 @@ class Engine:
                     misses = 0
                 cfg["sdr"]["center_hz"], cfg["sdr"]["sample_rate"] = self.fc, self.fs
                 n = int(self.fs * cfg["analysis"]["hop_s"]) // self.frame_len * self.frame_len
+                t_wait = time.time()
                 x = src.read(n, timeout=3.0)
                 t_got = time.time()
+                read_s, self._t_loop = t_got - t_wait, t_got - getattr(self, "_t_prev", t_got)
+                self._t_prev = t_got
                 if x is None and self.oneshot:                 # end of the recording
                     break
                 if x is None:
@@ -204,7 +207,7 @@ class Engine:
                     continue
                 misses = 0
                 self._src = src
-                self.timing = {}
+                self.timing = {"read": read_s, "loop": self._t_loop, "get": getattr(src, "get_s", 0.0), "convert": getattr(src, "convert_s", 0.0)}
                 t_a = time.time()
                 self._ingest(x, cfg)
                 self.timing["ingest"] = time.time() - t_a
@@ -272,9 +275,13 @@ class Engine:
         pad = (-K) % pool
         Pp = np.pad(P, ((0, 0), (0, pad)), constant_values=0).reshape(len(P), -1, pool).max(axis=2)
         db = 10 * np.log10(Pp + 1e-12)
-        lo = np.percentile(db, 5)
-        self.wf_lo[view] = lo if view not in self.wf_lo else 0.9 * self.wf_lo[view] + 0.1 * lo
-        q = np.clip((db - self.wf_lo[view]) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
+        if view == "power" or "power" not in self.wf_lo:
+            lo = np.percentile(db, 5)
+            self.wf_lo["power"] = lo if "power" not in self.wf_lo else 0.9 * self.wf_lo["power"] + 0.1 * lo
+        # every view uses the raw waterfall's floor: a signal is as bright after the radio steps as before
+        # them, and what a step removed is simply black (a floor taken from a mostly-removed row would sink
+        # to the silence and turn everything left into solid colour)
+        q = np.clip((db - self.wf_lo["power"]) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
         self._chunk(view, ts, q, cfg)
         if view == "power":
             self._last_q = q
@@ -312,7 +319,7 @@ class Engine:
         steps = cfg.get("pipeline") or []
         key = json.dumps(steps, sort_keys=True)
         if self.pipe is None:
-            self.pipe = Pipeline(self.fs, self._x0, steps)
+            self.pipe = Pipeline(self.fs, self._x0, steps, self.fc)
         elif key != self.pipe_key:                               # steps changed: same pipeline, new settings
             self.pipe.configure(steps)
         self.pipe_key = key
