@@ -15,9 +15,10 @@ summed.
 ## Features
 
 - **Live power waterfall** of the whole span, with history, zoom and colour maps.
-- **The pipeline**: the IQ goes through a chain of IQ steps (none yet), then the power of
-  everything left in the band is added up 16,000 times a second, and that is the sound, a few
-  seconds behind live. Filters will be steps in this chain; they decide what is in the sum.
+- **The pipeline**: radio steps change the IQ of the whole band, then the power of everything left
+  is added up 16,000 times a second into sound (SUM), then audio steps change the sound. It plays
+  a few seconds behind live, and every step can be added, switched and adjusted while listening.
+  Steps so far: *Flatten receiver* (radio), *Audio EQ* and *Low-pass* (audio).
 - **IQ ring**: an optional rolling raw-IQ recording, so anything can be replayed or exported later.
 - **Surveys** that step the receiver across a wide range and map its power.
 - **Saved recordings** from before the rebuild stay browsable (transcript, playback, IQ export).
@@ -183,12 +184,28 @@ The **?** button in the page shows the same steps.
 25 frames/s), pooled to the screen's width and sent to the page as it arrives, with history kept on
 the server so the page can scroll back.
 
-**The pipeline** (`pipeline.py`). Raw IQ goes through the IQ steps in order (none yet; each takes
-IQ and returns IQ of the same length), then one final step makes sound: for every audio sample
-(16,000 per second) it adds up the power of all the IQ that arrived in that sliver of time. That is
+**The pipeline** (`pipeline.py`). Raw IQ goes through the radio steps in order (each takes IQ and
+returns IQ of the same length), then SUM makes sound, then the audio steps (sound in, sound out)
+and a slow level control. SUM: the power of all the IQ,
+moment by moment, as 16,000 samples a second. That is
 the band's total power moment by moment (by Parseval's theorem, the same as adding up every column
-of a spectrum of that sliver). Its steady part (below 20 Hz, inaudible) is taken out and a slow
-automatic level control evens out its loudness; nothing else is done. Before the sum everything is
+of a spectrum of that sliver). Its steady part (below 20 Hz, inaudible) is taken out.
+
+- *Flatten receiver* (radio): a receiver doesn't pass every frequency equally, so signals that move
+  in frequency (FM) change in measured power as they cross its slopes, and SUM hears them ("slope
+  detection"). This step learns the receiver's response from the noise floor (the 20th percentile
+  of each frequency's average power over a window wider than a station, default 1 MHz) and boosts
+  or cuts the IQ to flatten it, in overlapping FFT blocks. At full strength FM stations fade from
+  the sum.
+- *Audio EQ* (audio): a graphic equalizer, one peaking filter per octave from 63 Hz to 6.3 kHz.
+- *Low-pass* (audio): removes everything above a cutoff, steeply (Butterworth, order 8 by default).
+
+SUM never lets fast power changes fold into the sound: two stations 40 kHz apart make the band's
+power pulse at 40 kHz, and a plain 1/16,000 s average would turn that into a tone at 8 kHz. So SUM
+averages the power in exact 1/512,000 s slices, then low-passes in two stages (512 k -> 64 k ->
+16 k samples a second): changes up to 7 kHz pass unchanged, changes above 8 kHz are removed.
+
+The waterfall shows the IQ after the radio steps; *Raw IQ* on the chain bar shows it untouched. Before the sum everything is
 in the radio domain (radio frequency on the axis); after it, in the audio domain (the panel under
 the waterfall shows the sound's own spectrum). The page plays each chunk at its stream time plus a
 delay, so the sound stays locked to its place on the waterfall.

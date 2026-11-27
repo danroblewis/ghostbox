@@ -19,6 +19,7 @@ import numpy as np
 from .config import PRESETS, VIEWS, Config
 from .autotune import AutoTune, pick_segments
 from .engine import Engine, iq_cut_wav, render_segments
+from .pipeline import catalog as step_catalog
 from .transcribe import strip_stock
 from .asr import MODELS as ASR_MODELS
 from .survey import Survey
@@ -110,7 +111,7 @@ def make_app(args):
         hub = state["hub"]
         eng = state["engine"]
         await sock.send_str(json.dumps({
-            "type": "hello", "config": config.get(), "views": VIEWS,
+            "type": "hello", "config": config.get(), "views": VIEWS, "steps": step_catalog(),
             "asr_models": [[k, v[2]] for k, v in ASR_MODELS.items()],
             "root": str(ROOT.resolve()),
             "presets": {k: v["label"] for k, v in PRESETS.items()},
@@ -119,7 +120,7 @@ def make_app(args):
                       "fmin": getattr(eng, "f_lo", 0), "fmax": getattr(eng, "f_hi", 0),
                       "frame_rate": getattr(eng, "fr", 25)},
         }, default=float))
-        hub.clients[q] = {"power"}
+        hub.clients[q] = {"pipe"}
 
         async def writer():
             while True:

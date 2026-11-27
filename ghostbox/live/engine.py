@@ -160,7 +160,7 @@ class Engine:
         self.raw_keep = int(self.fs * 8)                         # a few seconds of raw IQ in memory
         self.raw = np.zeros(self.raw_keep, np.complex64)
         self.spec, self.spec_t = [], []                          # the last few hops' power frames (survey)
-        self.wf_lo = None
+        self.wf_lo = {}                                          # per view: the waterfall's floor (dB), tracked
         self._close_iq()
         self.pipe = None                                         # rebuilt for the new rate at the next hop
         self.emit({"type": "reset", "fc": self.fc, "fs": self.fs, "fmin": self.f_lo, "fmax": self.f_hi,
@@ -262,9 +262,10 @@ class Engine:
         while len(self.spec) > 4:
             self.spec.pop(0)
             self.spec_t.pop(0)
+        self._ts = ts
         self._waterfall(P, ts, cfg)
 
-    def _waterfall(self, P, ts, cfg):
+    def _waterfall(self, P, ts, cfg, view="power"):
         width = int(cfg["display"]["width"])
         K = P.shape[1]
         pool = max(1, -(-K // width))
@@ -272,9 +273,11 @@ class Engine:
         Pp = np.pad(P, ((0, 0), (0, pad)), constant_values=0).reshape(len(P), -1, pool).max(axis=2)
         db = 10 * np.log10(Pp + 1e-12)
         lo = np.percentile(db, 5)
-        self.wf_lo = lo if self.wf_lo is None else 0.9 * self.wf_lo + 0.1 * lo
-        q = np.clip((db - self.wf_lo) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
-        self._chunk("power", ts, q, cfg)
+        self.wf_lo[view] = lo if view not in self.wf_lo else 0.9 * self.wf_lo[view] + 0.1 * lo
+        q = np.clip((db - self.wf_lo[view]) / cfg["display"]["dyn_range_db"] * 255, 0, 255).astype(np.uint8)
+        self._chunk(view, ts, q, cfg)
+        if view == "power":
+            self._last_q = q
 
     def _chunk(self, mode, ts, q, cfg, keep=True):
         """One waterfall chunk (n rows): sent to clients watching `mode` and (keep) kept as history."""
@@ -304,12 +307,22 @@ class Engine:
 
     # ---------------- the pipeline: IQ steps, then the sum of everything as audio ----------------
     def _audio(self, x, cfg):
-        """This hop's IQ through the pipeline; the audio goes to clients with its stream time."""
+        """This hop's IQ through the pipeline; the audio goes to clients with its stream time, and the
+        IQ after the radio steps becomes the "pipe" waterfall (the same as "power" with no radio step on)."""
         steps = cfg.get("pipeline") or []
         key = json.dumps(steps, sort_keys=True)
-        if self.pipe is None or key != self.pipe_key:            # (re)built: from this block on
-            self.pipe, self.pipe_key = Pipeline(self.fs, self._x0, steps), key
+        if self.pipe is None:
+            self.pipe = Pipeline(self.fs, self._x0, steps)
+        elif key != self.pipe_key:                               # steps changed: same pipeline, new settings
+            self.pipe.configure(steps)
+        self.pipe_key = key
         k0, y = self.pipe.process(x)
+        if self.pipe.radio_on:
+            iq = self.pipe.iq
+            _, _, P = power_frames(iq - iq.mean(), self.fs, self.nfft, self.fr)
+            self._waterfall(P[:, self.keep], self._ts, cfg, view="pipe")
+        else:
+            self._chunk("pipe", self._ts, self._last_q, cfg)
         if self.oneshot or not len(y):
             return
         self.emit({"type": "audio", "id": "out", "t": round(k0 / AUDIO_FS, 5), "rate": AUDIO_FS,

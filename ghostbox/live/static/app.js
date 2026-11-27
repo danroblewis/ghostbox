@@ -31,7 +31,7 @@ const S = {
   cfg: null, presets: {}, views: [], status: {},
   epoch: 0, fmin: 0, fmax: 1, fr: 25, hop: 1, lag: 2.75,
   offsets: [], offset: null,
-  view: lsGet("gb_view", "power"), chunks: new Map(),   // t0 key -> chunk (current view)
+  view: lsGet("gb_view", "pipe"), chunks: new Map(),   // t0 key -> chunk (current view)
   recs: [],
   delay: +lsGet("gb_delay", 4), pps: +lsGet("gb_pps", 25),
   follow: true, viewTop: 0,
@@ -633,6 +633,75 @@ function selectRow(label, options, value, onchange) {
   return el("div", { class: "row wide" }, el("label", {}, label), s);
 }
 
+// ---------------- the pipeline: radio steps › SUM › audio steps ----------------
+// The bar above the waterfall shows the chain; the Pipeline dialog adjusts it, live (each change goes to
+// the server, which reconfigures the running pipeline: a step keeps what it has learned).
+const stepType = t => (S.steps || []).find(x => x.type === t) || { type: t, label: t, domain: "radio", params: [], default: {}, desc: "" };
+const pipeItems = () => (S.cfg.pipeline || []).map(it => ({ ...it, params: { ...(it.params || {}) } }));
+const savePipe = (items, wait = 120) => patch({ pipeline: items }, wait);
+function fmtParam(p, v) {
+  return p.unit === "%" ? Math.round(v * 100) + "%" : p.unit === "kHz" ? (v >= 1000 ? (v / 1000).toFixed(2) + " MHz" : Math.round(v) + " kHz")
+    : p.unit === "dB" ? (v > 0 ? "+" : "") + (+v).toFixed(1) + " dB" : p.unit ? (+v) + " " + p.unit : String(+v);
+}
+function buildChain() {
+  const box = $("#pipeInfo"); if (!box || !S.cfg) return;
+  const items = S.cfg.pipeline || [], parts = [];
+  const chip = (label, cls, title, onclick) => el("button", { class: "chip " + cls, title, onclick }, label);
+  const sep = () => el("span", { class: "chipsep" }, "›");
+  parts.push(chip("Raw IQ", S.view === "power" ? "on" : "", "The receiver's IQ, untouched: click to see it on the waterfall", () => setView("power")));
+  const step = it => { const t = stepType(it.type); parts.push(sep(), chip(t.label, it.on === false ? "off" : "", t.desc, () => { if (t.domain === "radio") setView("pipe"); openPipe(); })); };
+  items.filter(it => stepType(it.type).domain === "radio").forEach(step);
+  parts.push(sep(), chip("SUM", "sum" + (S.view === "pipe" ? " on" : ""), "The power of everything left in the band, 16,000 times a second: the sound. The waterfall shows what goes into it.", () => setView("pipe")));
+  items.filter(it => stepType(it.type).domain === "audio").forEach(step);
+  parts.push(sep(), el("span", { class: "t3", style: "font-size:12px;flex:none" }, "level › speaker"));
+  box.replaceChildren(...parts);
+}
+function openPipe() { document.body.classList.add("pipeopen"); toFront("pipe"); buildPipe(); }
+function closePipe() { document.body.classList.remove("pipeopen"); }
+$("#pipeBtn").addEventListener("click", () => document.body.classList.contains("pipeopen") ? closePipe() : openPipe());
+$("#pipeClose").addEventListener("click", closePipe);
+function buildPipe() {
+  const box = $("#pipeBody"); if (!box || !S.cfg || !document.body.classList.contains("pipeopen")) return;
+  const items = pipeItems();
+  const save = (wait, redraw) => { savePipe(items, wait); if (redraw) { buildPipe(); buildChain(); } };
+  const row = (it, i) => {
+    const t = stepType(it.type), on = it.on !== false;
+    const desc = el("div", { class: "desc", hidden: true }, t.desc);
+    const sliders = t.params.map(p => {
+      const v = it.params[p.key] ?? t.default[p.key];
+      const out = el("output", {}, fmtParam(p, v));
+      const r = el("input", { type: "range", min: p.min, max: p.max, step: p.step, value: v }); fillRange(r);
+      r.addEventListener("input", () => { fillRange(r); out.textContent = fmtParam(p, +r.value); it.params[p.key] = +r.value; save(120); });
+      return el("div", { class: "row" }, el("label", { title: p.label }, p.label), r, out);
+    });
+    return el("div", { class: "pstep" + (on ? "" : " off") },
+      el("div", { class: "prow" }, toggle(on, v => { it.on = v; save(50, true); }), el("strong", {}, t.label),
+        el("button", { class: "ib", title: "What it does", onclick: () => { desc.hidden = !desc.hidden; } }, "ⓘ"),
+        el("button", { class: "ib", title: "Remove this step", onclick: () => { items.splice(i, 1); save(50, true); } }, "×")),
+      desc, ...sliders);
+  };
+  const adder = domain => {
+    const opts = (S.steps || []).filter(t => t.domain === domain);
+    const sel = el("select", { class: "sel padd" }, el("option", { value: "" }, domain === "radio" ? "+ Add a radio step…" : "+ Add an audio step…"),
+      ...opts.map(t => el("option", { value: t.type }, t.label)));
+    sel.addEventListener("change", () => {
+      const t = stepType(sel.value); if (!sel.value) return;
+      const at = domain === "radio" ? items.filter(x => stepType(x.type).domain === "radio").length : items.length;
+      items.splice(at, 0, { type: t.type, on: true, params: { ...t.default } });
+      save(50, true); if (domain === "radio") setView("pipe");
+    });
+    return sel;
+  };
+  const list = domain => items.map((it, i) => [it, i]).filter(([it]) => stepType(it.type).domain === domain).map(([it, i]) => row(it, i));
+  box.replaceChildren(
+    el("div", { class: "pdom" }, "Radio · IQ in, IQ out · the whole band"),
+    ...list("radio"), adder("radio"),
+    el("div", { class: "psum" }, "SUM: the power of everything left, 16,000 times a second, becomes the sound"),
+    el("div", { class: "pdom" }, "Audio · sound in, sound out"),
+    ...list("audio"), adder("audio"),
+    el("div", { class: "note", style: "margin-top:12px" }, "Last, always: the level is evened out slowly, so the sound stays at a comfortable loudness."));
+}
+
 // Blocked frequencies: known stations and steady lines, marked on the waterfall.
 function blockedCard() {
   const list = (S.cfg.blocked || []).map(r => ({ ...r }));
@@ -1186,7 +1255,7 @@ function setMinConf(v) {
 $("#minConf").addEventListener("input", e => setMinConf(+e.target.value / 100));
 let WS = null;
 function setView(mode) {
-  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode;
+  S.view = mode; lsSet("gb_view", mode); $("#view").value = mode; if (S.cfg) buildChain();
   // the old picture stays up until the new one's history arrives, then fades over
   if (!S.fadeFrom) S.fadeFrom = S.chunks;
   S.fadeStart = null; S.chunks = new Map(); loadScale(); LUT = makeLUT();
@@ -1201,7 +1270,7 @@ function availableViews() { return S.views || []; }
 function buildViewList() {
   const vs = availableViews(), sel = $("#view");
   sel.replaceChildren(...vs.map(v => el("option", { value: v.id }, v.label)));
-  if (!vs.some(v => v.id === S.view)) { if (S.view !== "power") setView("power"); }
+  if (!vs.some(v => v.id === S.view)) { if (S.view !== "pipe") setView("pipe"); }
   else sel.value = S.view;
 }
 
@@ -1219,7 +1288,7 @@ $("#cfgBtn").addEventListener("click", () => openCfg());
 $("#cfgClose").addEventListener("click", closeCfg);
 // both dialogs float over the waterfall (no backdrop): drag by the header, resize from the corner;
 // where each was left is remembered. The one last touched is in front.
-const toFront = id => { for (const w of document.querySelectorAll("#cfg")) w.classList.toggle("front", w.id === id); };
+const toFront = id => { for (const w of document.querySelectorAll("#cfg,#pipe")) w.classList.toggle("front", w.id === id); };
 function floating(wrap) {
   const box = wrap.firstElementChild, key = "gb_dlg_" + wrap.id;
   const place = (x, y) => {
@@ -1240,13 +1309,14 @@ function floating(wrap) {
   box.addEventListener("pointerup", () => { if (box.style.width || box.style.height) save(); });     // after a corner resize
   addEventListener("resize", () => { if (box.style.transform === "none" && box.offsetWidth) { const r = box.getBoundingClientRect(); place(r.left, r.top); } });
 }
-floating($("#cfg"));
+floating($("#cfg")); floating($("#pipe"));
 function setDets(on) { document.body.classList.toggle("nodets", !on); $("#detsBtn").classList.toggle("on", on); lsSet("gb_dets", on ? "1" : "0"); }
 $("#detsBtn").addEventListener("click", () => setDets(document.body.classList.contains("nodets")));
 setDets(lsGet("gb_dets", "1") === "1");
 addEventListener("keydown", e => {                       // Escape closes the dialog in front
   if (e.key !== "Escape") return;
-  if (document.body.classList.contains("cfgopen")) closeCfg();
+  const p = document.body.classList.contains("pipeopen"), c = document.body.classList.contains("cfgopen");
+  if (p && (!c || $("#pipe").classList.contains("front"))) closePipe(); else if (c) closeCfg();
 });
 
 // ---------------- status ----------------
@@ -1271,12 +1341,12 @@ function setStatus(s) {
 function connect() {
   const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
   WS = ws;
-  ws.onopen = () => { if (S.view !== "power") ws.send(JSON.stringify({ type: "view", mode: S.view })); };
+  ws.onopen = () => ws.send(JSON.stringify({ type: "view", mode: S.view }));
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     switch (m.type) {
       case "hello": {
-        S.cfg = m.config; S.presets = m.presets; S.views = m.views; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
+        S.cfg = m.config; S.presets = m.presets; S.views = m.views; S.steps = m.steps || []; S.epoch = m.epoch; S.asrModels = m.asr_models; S.root = m.root;
         fetch("/api/marks").then(r => r.json()).then(x => { S.marks = x; }).catch(() => {});
         S.hop = m.config.analysis.hop_s; S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         S.delay = Math.max(S.lag, S.delay); S.lineY = S.delay - S.lag;
@@ -1286,7 +1356,7 @@ function connect() {
         $("#view").value = S.view; loadScale(); LUT = makeLUT();
 
         setStatus(m.status || {});
-        buildTop(); buildGeneral(); loadPage(true);
+        buildTop(); buildGeneral(); loadPage(true); buildChain();
         Promise.all([fetch("/api/autotune").then(r => r.json()).then(t => { TUNE.state = t; }), loadSurveyList()]).then(buildGeneral);
         const t = m.status && m.status.t; if (t) fetchHistory(t - 240, t + 5);
         break;
@@ -1294,6 +1364,7 @@ function connect() {
       case "config": {
         S.cfg = m.config; buildViewList(); S.lag = m.config.analysis.settle_s + m.config.analysis.hop_s + 0.25;
         buildTop(); if (!$("#general").contains(document.activeElement)) buildGeneral();
+        buildChain(); if (!$("#pipe").contains(document.activeElement)) buildPipe();
         break;
       }
       case "reset": if (m.fmax) { S.fmin = m.fmin; S.fmax = m.fmax; } break;
@@ -1586,7 +1657,7 @@ function openHelp() {
     step(2, "Choose how much to see",
       p("The ", b("span"), " selector at the top sets how wide a slice the waterfall shows (a HackRF goes up to 20 MHz, an RTL-SDR to about 2.4 MHz). Watch ", b("CPU"), " at the top right.")),
     step(3, "Listen",
-      p("What you hear is the whole band at once: everything left after the pipeline's steps (there are none yet), its power added up moment by moment into one sound. It plays a few seconds behind live; click anywhere once to switch sound on."),
+      p("What you hear is the whole band at once: its power added up moment by moment into one sound. The bar above the waterfall is the ", b("pipeline"), ": ", b("radio steps"), " change the IQ of the whole band before it is summed (the waterfall shows the result; ", b("Raw IQ"), " shows it untouched), ", b("SUM"), " turns what's left into sound, and ", b("audio steps"), " change the sound. ", b("Pipeline…"), " adds, switches and adjusts them while you listen. It plays a few seconds behind live; click anywhere once to switch sound on."),
       p(b("Pause"), " (or the space bar) stops playback and the slider next to it is the volume. Click the waterfall (or drag the playback line) to play from a little further back. The panel at the bottom shows the sound's waveform and its spectrum (audio frequency, not radio frequency).")),
     step(4, "Survey a wide range",
       p("Click ", b("Map"), ", then ", b("New"), ". It steps the receiver across a range and draws its power. Older surveys and their samples can still be opened.")),
@@ -1680,6 +1751,7 @@ function openFieldMenu() {
     el("div", { class: "mbtns" },
       go("Mark this moment", () => { closeFieldMenu(); markNow(); }),
       go("Map", () => { closeFieldMenu(); openMap(); }),
+      go("Pipeline", () => { closeFieldMenu(); openPipe(); }),
       go("Settings", () => openSheet("general")),
       go("Help", () => { closeFieldMenu(); openHelp(); }),
       go("Desktop layout", () => { closeFieldMenu(); setLayoutPref("desktop"); })));

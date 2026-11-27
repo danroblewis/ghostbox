@@ -26,8 +26,8 @@ DEFAULT = {
                  "settle_s": 1.5},              # how far behind live the waterfall is shown (s)
     # Frequency ranges marked on the waterfall (known stations, steady lines): [{"lo": Hz, "hi": Hz, "label": ""}]
     "blocked": [],
-    # The pipeline (pipeline.py): IQ steps in order, [{"type", "on", "params"}], then the sum of everything
-    # as audio. No step types exist yet.
+    # The pipeline (pipeline.py): steps in order, [{"type", "on", "params"}]: radio steps (IQ in, IQ out),
+    # then the sum of everything into sound, then audio steps. Types: pipeline.STEPS.
     "pipeline": [],
     # What you hear: the pipeline's audio, played delay_s behind live
     "audio": {"delay_s": 4.0, "fade_s": 0.15,
@@ -53,7 +53,8 @@ DEFAULT = {
     },
 }
 
-VIEWS = [{"id": "power", "label": "Power (dB)"}]
+VIEWS = [{"id": "pipe", "label": "After the radio steps"},
+         {"id": "power", "label": "Raw IQ (before any step)"}]
 
 PRESETS = {
     "am_hackrf": {"label": "Medium wave 520-1720 kHz (HackRF)",

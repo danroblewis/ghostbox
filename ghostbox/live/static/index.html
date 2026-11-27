@@ -150,16 +150,33 @@ h2{font-size:12px;font-weight:600;color:var(--text);margin:20px 0 8px}
 .chk .ib{background:none;border:0;color:var(--text-3);cursor:pointer;font:inherit;padding:4px 0;min-height:28px}
 .chk .ib:hover,.chk .ib:focus-visible{color:var(--text)}
 /* layout: detections sidebar (collapsible), the pipeline readout, the settings dialog */
-#pipeInfo{flex:1;min-width:0;font-size:12.5px;overflow:hidden;text-overflow:ellipsis}
+#pipeInfo{display:flex;align-items:center;gap:3px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
+#pipeInfo::-webkit-scrollbar{display:none}
+.chip{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 9px;border:1px solid var(--line-strong);border-radius:13px;background:var(--field);color:var(--text-2);cursor:pointer;white-space:nowrap;font:inherit;font-size:12px;flex:none}
+.chip.on{border-color:var(--accent);color:var(--accent)}
+.chip.off{opacity:.45;text-decoration:line-through}
+.chip.sum{border-style:dashed;color:var(--text)}
+.chipsep{color:var(--text-3);font-size:11px;flex:none;padding:0 1px}
+/* the pipeline dialog */
+.pdom{font-size:11.5px;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;margin:12px 0 4px}
+.pstep{border:1px solid var(--line);border-radius:8px;padding:6px 10px 4px;margin:6px 0;background:var(--field)}
+.pstep.off>.prow~*{opacity:.5}
+.prow{display:flex;align-items:center;gap:8px;min-height:30px}
+.prow strong{font-weight:500;flex:1}
+.pstep .desc{color:var(--text-2);font-size:12px;margin:2px 0 6px}
+.psum{margin:14px 0 4px;padding:8px 10px;border-top:1px dashed var(--line-strong);border-bottom:1px dashed var(--line-strong);color:var(--text-2);font-size:12.5px;text-align:center}
+.padd{margin:4px 0 0}
 body.nodets main{grid-template-columns:minmax(0,1fr) 0}
 body.nodets #side{display:none}
 #detsBtn.on{border-color:var(--accent);color:var(--accent)}
 .pane{display:flex;flex-direction:column;overflow-y:auto;flex:1;min-height:0}
 #detMin{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line)}
 #detMin input[type=range]{width:110px}
-#cfg{position:fixed;inset:0;z-index:50;display:none;pointer-events:none}
-#cfg.front{z-index:51}
-body.cfgopen #cfg{display:block}
+#cfg,#pipe{position:fixed;inset:0;z-index:50;display:none;pointer-events:none}
+#cfg.front,#pipe.front{z-index:51}
+body.cfgopen #cfg,body.pipeopen #pipe{display:block}
+#pipe .cfgbox{width:min(460px,calc(100vw - 32px));left:auto;right:24px;transform:none;top:110px}
+#pipeBody{overflow-y:auto;padding:4px 14px 14px;flex:1;min-height:0}
 .cfgbox{position:absolute;left:50%;top:5vh;transform:translateX(-50%);pointer-events:auto;background:var(--panel);border:1px solid var(--line-strong);border-radius:10px;width:min(560px,calc(100vw - 32px));max-height:90vh;min-width:300px;min-height:160px;display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.45);resize:both;overflow:hidden}
 .cfghead{cursor:move;user-select:none;touch-action:none}
 .cfghead button,.cfghead select{cursor:pointer}
@@ -364,7 +381,8 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
 <main>
   <section id="left">
     <div id="wfbar">
-      <div id="pipeInfo" title="The pipeline: the IQ steps, in order, then the sum of everything as sound"><span class="t2">Pipeline:</span> <span class="t3">no steps</span> <span class="t2">› sum of everything › audio</span></div>
+      <div id="pipeInfo" title="The pipeline: radio steps, the sum of everything into sound, audio steps. Click a step to adjust it."></div>
+      <button id="pipeBtn" class="btn" title="Add, remove and adjust the steps">Pipeline…</button>
       <button id="blockBtn" class="btn" title="Block a frequency range (known station, steady line): drag across the waterfall. Shift-drag works too.">Block</button>
     </div>
     <div id="wfwrap">
@@ -412,6 +430,12 @@ try{var t=localStorage.getItem("gb_theme");if(GB_THEMES.some(function(x){return 
       <div class="row wide"><label>Shows</label><select id="view" class="sel" title="What the waterfall shows"></select></div>
       <div class="row wide"><label>Colour map</label><select id="cmap" class="sel" title="Colour map"><option value="rainbow">Rainbow (SDR#)</option><option value="turbo">Turbo</option><option value="inferno">Inferno</option><option value="magma">Magma</option><option value="viridis">Viridis</option><option value="gray">Greyscale</option><option value="amber">Amber phosphor</option><option value="green">Green phosphor</option><option value="red">Red (night)</option></select></div>
     </div>
+  </div>
+</div>
+<div id="pipe" role="dialog" aria-label="Pipeline">
+  <div class="cfgbox">
+    <div class="cfghead"><strong style="padding:10px 12px">Pipeline</strong><span style="flex:1"></span><button class="xbtn" id="pipeClose" title="Close (Esc)" aria-label="Close">×</button></div>
+    <div id="pipeBody"></div>
   </div>
 </div>
 <script src="/static/app.js"></script>
